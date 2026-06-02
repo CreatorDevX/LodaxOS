@@ -1,0 +1,12 @@
+target/*
+memsave.md
+*.log
+disk.img
+kernel.elf
+sr.elf
+serial_out.txt
+serial_output.txt
+qemu_log.txt
+efi/*
+esp/*
+*.pyc

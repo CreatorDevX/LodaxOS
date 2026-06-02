@@ -1,0 +1,11 @@
+[package]
+name = "lodaxos-boot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lodaxos-system = { path = "../system" }
+lodaxos-core = { path = "../shared" }
+uefi = { version = "0.37", default-features = false, features = ["alloc"] }
+log = "0.4"
+ext4-view = "0.9"

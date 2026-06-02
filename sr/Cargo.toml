@@ -1,0 +1,7 @@
+[package]
+name = "lodaxos-sr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lodaxos-system = { path = "../system" }

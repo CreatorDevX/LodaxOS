@@ -1,0 +1,5 @@
+[build]
+target = "kernel/target.json"
+
+[target.'cfg(target_os = "none")']
+rustflags = ["-C", "no-redzone=yes"]
