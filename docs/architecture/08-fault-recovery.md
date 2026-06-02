@@ -36,9 +36,10 @@ A soft fault is handled by Secure Runtime (SR). The kernel is not involved.
 Each boot stage has its own panic handler:
 
 **Chainloader** (`chain/src/main.rs`):
-- Writes `"PANIC: "` to serial with polling timeout (100K retries per byte)
+- Writes `"PANIC"` to serial with polling timeout (100K retries per byte)
+- Formats and writes the location (file name + line number) when `info.location()` is available
+- Writes the panic message body
 - Halts: `cli; hlt` loop
-- No location information (the UEFI runtime may not have a stable stack for panic formatting)
 
 **Bootloader** (`boot/src/main.rs`):
 - Writes `"PANIC"` to serial

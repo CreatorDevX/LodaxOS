@@ -26,7 +26,7 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 
 ### What Exists Today
 
-- 5-crate Rust workspace producing UEFI-compatible binaries
+- 6-crate Rust workspace producing UEFI-compatible binaries
 - Two-stage UEFI boot chain (chainloader â†’ bootloader â†’ kernel)
 - Bare-metal x86-64 kernel with full interrupt handling
 - 4-level page tables with higher-half mapping
@@ -34,9 +34,10 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 - SLUB-style slab heap allocator with demand-paged VMA support
 - LAPIC/IOAPIC interrupt controller drivers
 - ACPI RSDP/MADT/XSDT discovery and parsing
-- Preemptive round-robin task scheduler with syscall interface
+- Preemptive CFS (Completely Fair Scheduler) task scheduler with syscall interface
 - Self-contained ext4 filesystem reader (bootloader only)
 - UEFI GOP framebuffer with bitmap font rendering
+- Secure Runtime (`sr`) stub binary loaded into a higher-half address (entry parsed, never jumped to)
 
 ### What Is Planned (see 08-future-architecture.md)
 
@@ -110,11 +111,11 @@ All kernel implementation lives in `src/` at the workspace root. The `shared/` c
 
 ## Workspace Topology
 
-The workspace `Cargo.toml` at root defines five members with resolver version 2:
+The workspace `Cargo.toml` at root defines six members with resolver version 2:
 
 ```toml
 [workspace]
-members = ["system", "shared", "chain", "boot", "kernel"]
+members = ["system", "shared", "chain", "boot", "kernel", "sr"]
 resolver = "2"
 ```
 
@@ -130,9 +131,12 @@ lodaxos-kernel  (depends on lodaxos-core, lodaxos-system)
 lodaxos-boot    (depends on lodaxos-core, lodaxos-system)
       â†“
 lodaxos-chain   (depends on lodaxos-system)
+lodaxos-sr      (depends on lodaxos-system)
 ```
 
 `lodaxos-chain` depends only on `lodaxos-system` (not `lodaxos-core`) because the chainloader has its own inline serial driver â€” it does not need the full shared subsystem library.
+
+`lodaxos-sr` is the Secure Runtime stub. It is built as a bare-metal `x86_64-unknown-none` ELF (custom `sr/target.json`, base `0xFFFF_9000_0000_0000`, code-model=large) and is loaded by the kernel into a higher-half staging buffer. The current implementation is a `loop { hlt }` placeholder that logs its own entry point and never executes.
 
 ## Crate Purposes
 
@@ -189,7 +193,7 @@ lodaxos-chain   (depends on lodaxos-system)
 8. Jumps to the kernel entry point
 
 **Key design choices**:
-- Self-contained ext4 parser â€” no external crate dependency for filesystem reading (the `ext4-view` crate is declared but unused)
+- Self-contained ext4 parser â€” no external crate dependency for filesystem reading
 - Must capture RSDP *before* `exit_boot_services` â€” after that, UEFI runtime services are gone
 - Must `cli` immediately after `exit_boot_services` â€” stale UEFI timer interrupts would triple-fault without our IDT
 
@@ -275,9 +279,10 @@ LodaxOS uses a four-tier memory model:
 |---|---|---|
 | `0x0000_0000` | Null guard | Rust UB on null pointer dereference |
 | `0x0000_1000` | BootInfo handoff pointer | Inter-stage communication (8 bytes) |
+| `boot_info_phys` page(s) | Dynamically-allocated `BootInfo` struct | The chainloader writes this address into `0x1000`; the buddy allocator reserves it during `init_from_regions` so it can never be re-issued |
 | Buddy-allocated | All dynamic allocations | Pages acquired from buddy allocator |
 
-The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel.
+The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel. The kernel's `phys::init_from_regions` receives the pointer as its `boot_info_phys` argument and reserves the page(s) covering it from the buddy free lists; the same range is also checked by `is_reserved_page` on free paths.
 
 ## Physical Page Allocator â€” Buddy System (`src/mm/phys.rs`)
 
@@ -340,7 +345,7 @@ Each `FreeBlock` is stored inline within free pages (zero metadata overhead). Th
 1. Compute buddy address: `addr ^ (1 << (n + 12))` (XOR bit n in the page-number space).
 2. If the buddy is also free and at order n, remove it from `free_lists[n]` and recurse at order n+1 (coalesce).
 3. Otherwise, insert the current block into `free_lists[n]`.
-4. Refuse to free reserved pages (0 and 0x1000).
+4. Refuse to free reserved pages (0, 0x1000, and the dynamically-allocated `BootInfo` page(s) recorded in `BOOTINFO_RESERVED_BASE` / `BOOTINFO_RESERVED_PAGES`).
 
 ### Thread Safety
 
@@ -494,22 +499,22 @@ Each `KmemCache` has its own `SpinLock`. The `GlobalAllocator` dispatches to the
 
 ### Radix Tree
 
-The VMA tree uses a 4-level radix tree covering bits 12â€“51 of the virtual address (40 bits = 1 TB addressable per tree). Each level indexes 10 bits:
+The VMA tree uses a 4-level radix tree covering bits 12â€“51 of the virtual address (40 bits = 1 TB addressable per tree). Each level indexes 10 bits. The implementation labels levels from the leaf upward, matching the `radix_shift` formula `PAGE_SHIFT + level * RADIX_BITS`:
 
 ```
-Level 0 (bits 51:42) â†’ Level 1 (bits 41:32) â†’ Level 2 (bits 31:22) â†’ Level 3 (bits 21:12)
+Level 0 (bits 21:12) â†’ Level 1 (bits 31:22) â†’ Level 2 (bits 41:32) â†’ Level 3 (bits 51:42)
 ```
 
-Each node is a `VmaNode` holding a tagged union: either a slab node (slot array of 1024 `Option<Box<VmaNode>>`) or a leaf node (slot array of 1024 `Option<Box<Vma>>`).
+Each node is a `RadixNode` with 1024 8-byte entries (8 KB per node). A `RadixEntry` is a tagged union: an interior entry is a `*mut RadixNode` (child), a leaf entry is a `*mut Vma`.
 
 ### VMA Struct
 
-```c
+```rust
 struct Vma {
     start: u64,         // virtual start address (page-aligned)
     end: u64,           // virtual end address (exclusive, page-aligned)
-    perm: u8,           // permission bits (Read, Write, Execute)
-    flags: u8,          // VMA flags (Kernel, User, Guard, etc.)
+    perm: VmaPerm,      // permission bits (None, Read, Write, Execute, â€¦)
+    flags: u64,         // VMA flags (reserved for future Kernel/User/Guard)
 }
 ```
 
@@ -517,11 +522,11 @@ struct Vma {
 
 | Operation | Description |
 |---|---|
-| `insert(vma)` | Walk the 4-level tree, allocate leaf/tree nodes as needed, insert VMA into the correct leaf slot. |
-| `remove(start)` | Walk the tree to the leaf slot covering `start`, remove the VMA, and clean up empty nodes. |
-| `find_covering(addr)` | Walk the tree to the leaf slot, scan up to 1024 VMAs for one covering `addr`. |
-| `find(start, end)` | Walk the tree to the leaf slot, scan for a VMA at exact `start..end`. |
-| `visit_all(f)` | Recursively traverse all leaf slots, apply `f` to each VMA. |
+| `insert(vma)` | Walk the 4-level tree from level 3 down to level 1, allocate interior nodes as needed, then store the VMA pointer in the level-0 leaf slot. |
+| `lookup(addr)` | Walk the tree to the level-0 leaf slot, return the VMA if the entry is non-null. |
+| `find_covering(addr)` | Visit all VMAs in the tree (linear scan via `visit_all`) and return the first one where `addr âˆˆ [start, end)`. |
+| `remove(start)` | Walk to the level-0 leaf slot for `start`, null out the entry, return the previous VMA pointer. |
+| `visit_all(f)` | Recursively traverse all leaf slots, apply `f` to each VMA until it returns `Some`. |
 
 `find_covering` does a linear scan of up to 1024 VMA entries in the target leaf. With <100 VMAs per process in practice, this is fast enough. The tree structure makes it O(1) to locate the correct leaf slot.
 
@@ -786,7 +791,7 @@ The timer IRQ handler (vector 32) is where preemptive multitasking happens:
 1. Increment global tick counter
 2. Call `task::schedule(&mut frame)`
 3. `schedule()` saves the current task's register state into its `Task` struct (copies `TrapFrame` + corrects RSP)
-4. Finds the next ready task (round-robin)
+4. Finds the next ready task (CFS: minimum `vruntime`)
 5. Overwrites `frame` with the next task's saved `TrapFrame`
 6. Returns `true` indicating a switch was made
 7. The handler executes `mov rsp, frame.rsp; push frame.cs; push frame.rip; push frame.rflags; popfq; retfq`
@@ -850,7 +855,16 @@ NMIs come through the LAPIC's LINT1 or via the IOAPIC as NMI delivery mode. The 
 
 ## Overview
 
-LodaxOS implements preemptive multitasking with a round-robin scheduler. The scheduler is invoked from the LAPIC timer interrupt (vector 32, fired every 1 ms). Each task gets its own 8 KB kernel stack and runs in ring 0. There is no userspace isolation yet â€” all tasks run at the highest privilege level.
+LodaxOS implements preemptive multitasking with a **CFS (Completely Fair Scheduler)** style virtual-runtime scheduler. The scheduler is invoked from the LAPIC timer interrupt (vector 32, fired every 1 ms). Each task gets its own 8 KB kernel stack and runs in ring 0. There is no userspace isolation yet â€” all tasks run at the highest privilege level.
+
+## CFS Constants
+
+```rust
+const VRUNTIME_TICK: u64 = 20;   // vruntime added per timer tick (~1 ms)
+const VRUNTIME_BIAS: u64 = 8;    // subtracted from min vruntime for new tasks
+```
+
+All tasks are equal weight, so the `vruntime` field tracks the total time the task has spent on the CPU. `pick_next_ready` selects the task with the smallest `vruntime`, which approximates the Linux CFS "leftmost task" rule in the absence of nice values.
 
 ## Data Structures
 
@@ -884,6 +898,7 @@ pub struct Task {
     pub saved_frame: TrapFrame,      // snapshot of registers when not running
     pub kernel_stack_base: u64,      // bottom of allocated 8 KB stack
     pub state: TaskState,            // Ready or Blocked
+    pub vruntime: u64,               // CFS virtual runtime (lower = scheduled sooner)
 }
 ```
 
@@ -939,6 +954,8 @@ loop {
 }
 ```
 
+Blocking task 0 is explicitly refused by `block_current` (logged as an error) â€” if no other task is ready and the running task is task 0, the scheduler leaves it in place rather than halting the system.
+
 ## Task Creation
 
 `task::create_task(entry: u64) -> Option<usize>`
@@ -955,8 +972,9 @@ loop {
    - RFLAGS = 0x202 (IF = 1, always reserved)
    - RSP = address of iretq frame
    - SS = 0x10 (kernel data segment)
-7. Store the task in the task manager
-8. Return the new task ID
+7. Compute the new task's `vruntime` as `min(current vruntime) - VRUNTIME_BIAS`, giving newly-created tasks a small startup boost.
+8. Store the task in the task manager
+9. Return the new task ID
 
 ## Preemptive Scheduling
 
@@ -971,7 +989,7 @@ loop {
    b. Increments global tick counter (`TICKS.fetch_add(1, Relaxed)`)
    c. Calls `task::schedule(frame)`
 
-### Schedule Algorithm
+### Schedule Algorithm (CFS)
 
 ```rust
 pub fn schedule(frame: &mut TrapFrame) -> bool {
@@ -981,16 +999,15 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
     let cur = current;
     tasks[cur].saved_frame = *frame;
     tasks[cur].saved_frame.rsp = frame_addr + 0xA0;  // correct RSP
+    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
 
-    // 2. Find next ready task (round-robin)
-    let mut next = cur;
-    loop {
-        next = (next + 1) % count;
-        if tasks[next].state == Ready { break; }
-        if next == cur { return false; }  // no other ready task
-    }
+    // 2. Find the next ready task with the smallest vruntime.
+    let next = pick_next_ready(&*m, cur);
 
-    // 3. Restore next task's state
+    // 3. If no other ready task exists, leave the current task in place.
+    if next == cur { return false; }
+
+    // 4. Restore next task's state and switch to it.
     *frame = tasks[next].saved_frame;
     current = next;
     true
@@ -1022,6 +1039,10 @@ A task can block itself via syscall 1 (`exit`):
 
 ```rust
 pub fn block_current(frame: &mut TrapFrame) {
+    if current == 0 {
+        log::error!("task: refused to block task 0 (idle/main)");
+        return;
+    }
     tasks[current].state = Blocked;
     schedule(frame);  // immediately reschedule
 }
@@ -1045,13 +1066,12 @@ pub fn wake(task_id: usize) {
 
 ## Future Development
 
-### Priority Scheduling
+### Priority / Nice Levels
 
-The current round-robin gives every task equal CPU time. A priority-based extension would:
-- Add a `priority` field to `Task`
-- Maintain a per-priority run queue
-- Scheduling picks the highest-priority ready task
-- Round-robin within same priority
+The current CFS implementation gives every task equal weight. A priority extension would:
+- Add a `weight` / `nice` field to `Task`
+- Scale the per-tick `vruntime` increment by `1024 / weight` (Linux-style)
+- Pick the task with the minimum `vruntime` (the existing comparison is unchanged)
 
 ### SMP Scheduling
 
@@ -1102,12 +1122,14 @@ pub struct BootInfo {
     memory_regions: [MemoryRegion; 128],   // free memory descriptors
     memory_region_count: usize,            // number of valid entries
     framebuffer: FramebufferInfo,          // GOP framebuffer details
-    partition_zero_lba: u64,               // ext4 partition LBA (unused currently)
+    partition_zero_lba: u64,               // ext4 partition LBA
     partition_zero_size: u64,              // ext4 partition size
     kernel_image_addr: u64,                // physical addr of kernel ELF buffer
     kernel_image_size: u64,                // size of kernel ELF buffer
     rsdp_addr: u64,                        // ACPI RSDP physical address
     madt_addr: u64,                        // MADT physical address
+    sr_image_addr: u64,                    // physical addr of Secure Runtime ELF buffer
+    sr_image_size: u64,                    // size of SR ELF buffer
 }
 ```
 
@@ -1178,7 +1200,7 @@ The ELF loader in `boot/src/load_kernel.rs` performs these steps:
 
 ## Bootloader Ext4 Parser
 
-The ext4 filesystem reader in `boot/src/load_kernel.rs` is a complete, self-contained implementation. It does NOT use the `ext4-view` crate (which is a declared dependency but unused).
+The ext4 filesystem reader in `boot/src/load_kernel.rs` is a complete, self-contained implementation. It does not depend on any external ext4 crate.
 
 ### Design
 
@@ -1288,8 +1310,10 @@ Kernel reads RSDP address from BootInfo
 
 ## RSDP (Root System Description Pointer)
 
-The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure found by scanning:
-1. UEFI configuration table (most reliable on UEFI systems)
+The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The chainloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
+
+Scanned regions, in order:
+1. The hint from `BootInfo.rsdp_addr` (validated by signature and checksum)
 2. EBDA (Extended BIOS Data Area) â€” word at `0x40E` points to segment
 3. Standard BIOS ROM area (`0xE0000â€“0xFFFFF`)
 4. OVMF/UEFI firmware area (`0xFEFF_0000â€“0xFF00_0000`)
@@ -1419,7 +1443,7 @@ Each step maps through a table:
 
 ## Non-MADT Tables (Future)
 
-The ACPI subsystem can be extended to parse additional tables:
+The ACPI subsystem can be extended to parse additional tables. The codebase currently keeps the `XSDT_SIG` and `MADT_SIG` signature constants; other signatures (`"FACP"`, `"MCFG"`, `"HPET"`, `"DSDT"`, `"SSDT"`) are not declared and must be added when the corresponding parsers are written.
 
 ### FADT (Fixed ACPI Description Table)
 
@@ -1499,7 +1523,8 @@ Source code (Rust nightly)
   â”‚
   â”œâ”€ cargo build -p lodaxos-system       â†’ system/target/ (library)
   â”œâ”€ cargo build -p lodaxos-core         â†’ shared/target/ (library)
-  â”œâ”€ cargo build -p lodaxos-kernel       â†’ kernel.elf (custom target)
+  â”œâ”€ cargo build -p lodaxos-kernel       â†’ kernel.elf (custom x86_64-unknown-none)
+  â”œâ”€ cargo build -p lodaxos-sr           â†’ sr.elf (custom x86_64-unknown-none, large code-model)
   â”œâ”€ cargo build -p lodaxos-boot         â†’ lodaxos-boot.efi (x86_64-unknown-uefi)
   â””â”€ cargo build -p lodaxos-chain        â†’ lodaxos-chain.efi (x86_64-unknown-uefi)
                                               â”‚
@@ -1515,13 +1540,16 @@ Source code (Rust nightly)
 ```bat
 cargo +nightly build -p lodaxos-system
 cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zbuild-std=core,alloc
+cargo +nightly build -p lodaxos-sr --target sr/target.json -Zbuild-std=core
 cargo +nightly build -p lodaxos-boot --target x86_64-unknown-uefi
 cargo +nightly build -p lodaxos-chain --target x86_64-unknown-uefi
 copy target\target\debug\deps\lodaxos_kernel-* kernel.elf
+copy target\target\debug\deps\lodaxos_sr-* sr.elf
 ```
 
 Key points:
 - Kernel uses `-Zbuild-std=core,alloc` to build Rust's core and alloc libraries from source for the custom target
+- SR uses `-Zbuild-std=core` only â€” it has no `alloc` dependency
 - `-Zbuild-std-features=compiler-builtins-mem` enables compiler memory intrinsics (memcpy, memset, memcmp)
 - `-Zjson-target-spec` allows using the JSON target specification without installing it globally
 - The kernel.elf is found by wildcard in `target/target/` (the subdirectory name matches the target filename)
@@ -1531,6 +1559,7 @@ Key points:
 | Build Artifact | File | Size |
 |---|---|---|
 | lodaxos-kernel | `kernel.elf` | ~3.9 MB |
+| lodaxos-sr | `sr.elf` | small (stub) |
 | lodaxos-boot | `target/x86_64-unknown-uefi/debug/lodaxos-boot.efi` | ~493 KB |
 | lodaxos-chain | `target/x86_64-unknown-uefi/debug/lodaxos-chain.efi` | ~386 KB |
 
@@ -1552,7 +1581,7 @@ LBA 1181696â€“1228799: Backup GPT
 
 - **Type GUID**: `0FC63DAF-8483-4772-8E79-3D69D8477DE4` (Linux filesystem)
 - **Label**: "LodaxOS"
-- **Contents**: `Bootloader.efi`, `kernel.elf`
+- **Contents**: `Bootloader.efi`, `kernel.elf`, `sr.elf`
 - **Size**: 512 MB
 
 Created via `mke2fs -d` which populates the filesystem from a staging directory without requiring loop device mounting. This is critical because WSL2 does not support loop devices.
@@ -1561,6 +1590,7 @@ Created via `mke2fs -d` which populates the filesystem from a staging directory 
 dd if=/dev/zero of=ext4_part.img bs=1M count=512
 mkdir -p /tmp/lodaxos_staging
 cp kernel.elf /tmp/lodaxos_staging/
+cp sr.elf /tmp/lodaxos_staging/
 cp lodaxos-boot.efi /tmp/lodaxos_staging/Bootloader.efi
 mke2fs -t ext4 -d /tmp/lodaxos_staging -L LodaxOS ext4_part.img
 ```
@@ -1710,9 +1740,10 @@ A soft fault is handled by Secure Runtime (SR). The kernel is not involved.
 Each boot stage has its own panic handler:
 
 **Chainloader** (`chain/src/main.rs`):
-- Writes `"PANIC: "` to serial with polling timeout (100K retries per byte)
+- Writes `"PANIC"` to serial with polling timeout (100K retries per byte)
+- Formats and writes the location (file name + line number) when `info.location()` is available
+- Writes the panic message body
 - Halts: `cli; hlt` loop
-- No location information (the UEFI runtime may not have a stable stack for panic formatting)
 
 **Bootloader** (`boot/src/main.rs`):
 - Writes `"PANIC"` to serial
@@ -2018,7 +2049,6 @@ pub fn map_region_higher_half(pml4, phys, size, flags);
 
 ```rust
 pub fn init();
-pub fn heap_size() -> usize;
 
 // Via GlobalAlloc impl:
 #[global_allocator]
@@ -2028,10 +2058,11 @@ static ALLOCATOR: GlobalAllocator;
 ### Interface Contract
 
 - `init` must be called after page table init
-- Uses `linked_list_allocator::Heap` internally
-- Thread-safe via spinlock
-- First-fit allocation strategy
-- Max size: 64 MB at `0xFFFF_8080_0000_0000`
+- SLUB-style: 9 caches, object sizes 32 B, 64 B, 128 B, 256 B, 512 B, 1 KB, 2 KB, 4 KB, 8 KB
+- Each cache has its own spinlock; large allocations (> 8 KB) fall back to `phys::alloc_order`
+- Caches derive their per-slab `order` and `objs_per_slab` from the actual `obj_size` at init time, so each cache uses the smallest buddy order that can hold at least one object
+- Thread-safe via per-cache spinlock
+- The virtual arena is a contiguous 64 MB region starting at `0xFFFF_8080_0000_0000`; each new slab maps the freshly-allocated buddy pages into that arena
 
 ### Dependents
 
@@ -2043,9 +2074,13 @@ static ALLOCATOR: GlobalAllocator;
 ### Public API
 
 ```rust
-pub fn init() -> AcpiContext;
+pub fn init(hint: Option<u64>) -> AcpiContext;
+pub fn find_rsdp(hint: Option<u64>) -> Option<u64>;
 pub fn find_sdt(xsdt_addr: u64, signature: &[u8; 4]) -> Option<u64>;
 pub fn validate_table(addr: u64) -> bool;
+
+pub const XSDT_SIG: [u8; 4];
+pub const MADT_SIG: [u8; 4];
 
 pub struct AcpiContext {
     pub revision: u8,
@@ -2058,12 +2093,12 @@ pub struct AcpiContext {
 ### Interface Contract
 
 - Kernel ACPI init must happen before page table switch (identity map needed) OR after with physical addresses
-- The bootloader's RSDP capture uses a different path (UEFI config table) than the kernel's fallback path (EBDA/BIOS ROM scan)
-- Currently only MADT is parsed; FADT, MCFG, HPET are identified but not used
+- `init(hint)` first validates the optional `hint` (typically `BootInfo.rsdp_addr`); if the hint is missing or invalid, it falls back to scanning EBDA, BIOS ROM area, and the OVMF region
+- Currently only MADT is parsed; FADT, MCFG, HPET, DSDT, SSDT signatures are not declared in the kernel and must be added when the corresponding parsers are written
 
 ### Dependents
 
-- Kernel main: calls `acpi::init()` â†’ parses MADT â†’ configures IOAPICs and interrupt routing
+- Kernel main: calls `acpi::init(info.rsdp_addr)` â†’ parses MADT â†’ configures IOAPICs and interrupt routing
 - MADT parser: called by ACPI subsystem with physical address
 
 ## Interrupt Routing (`src/intr/mod.rs`)
@@ -2078,8 +2113,8 @@ pub fn lookup_gsi(gsi: u32) -> Option<&'static IrqRoute>;
 pub fn lookup_vector_isa(vector: u8) -> Option<u8>;
 pub fn install_route(route: &IrqRoute);
 pub fn enable_route(route: &IrqRoute);
-pub fn install_all_routes();     // install all, masked
-pub fn install_and_enable_all() -> usize;
+pub fn install_all_routes();         // install all routes, leave masked
+pub fn install_all_masked() -> usize;  // returns count of programmed pins
 ```
 
 ### Data Flows
@@ -2162,8 +2197,8 @@ pub const KERNEL_CODE_SEL: u16 = 0x08;
 
 ### Dependents
 
-- Kernel main: calls `load`, then `set_ist1` after IDT init
-- IDT init: calls `set_ist1` to set up IST1 pointer for double fault handler
+- Kernel main: calls `load` (which also calls `set_ist1` from the IDT's perspective; `gdt::load` does not call it)
+- IDT init: calls `set_ist1` to wire the double-fault IST1 stack into the TSS
 - Task creation: uses `KERNEL_CODE_SEL` (0x08) for task CS
 
 ## IDT Subsystem (`src/arch/idt.rs`)
@@ -2186,8 +2221,9 @@ pub fn key_scancode() -> u16;
 - `TrapFrame` struct shared with task manager (defines register save layout)
 - `interrupt_dispatcher` called by all stubs, dispatches by vector
 - `irq_handler` sends EOI, handles timer/PIT/keyboard, calls scheduler
-- `exception_handler` logs details, halts on unrecoverable
+- `exception_handler` logs details, halts on unrecoverable, attempts to resolve #PF via `mm::vma::handle_page_fault`
 - `syscall_handler` dispatches syscalls by number
+- `mask_pic` is the single point that disables the legacy 8259 PIC. `arch::apic::enable` does not call it; the kernel main loop invokes it once before the LAPIC is enabled.
 
 ### Dependents
 
@@ -2221,7 +2257,7 @@ Timer IRQ (vector 32)
   â†’ irq_handler()
     â†’ task::schedule(&mut TrapFrame)
       â†’ saves current task state in Task.saved_frame
-      â†’ finds next ready task (round-robin)
+      â†’ finds next ready task (CFS: minimum `vruntime`)
       â†’ overwrites TrapFrame with next task's state
       â†’ returns true
     â†’ context switch via mov rsp + popfq/retfq
@@ -2257,7 +2293,7 @@ impl Framebuffer {
 }
 ```
 
-(Framebuffer is not a separate module â€” it is defined inline in `kernel/src/main.rs` and `src/main.rs`. A bootloader Framebuffer is similar but uses `Framebuffer::new(gop)` instead of `from_info`.)
+(Framebuffer is not a separate module â€” it is defined inline in `kernel/src/main.rs`. The earlier `src/main.rs` UEFI-app stub that mirrored this API was a dead artifact and has been removed.)
 
 ### Interface Contract
 
@@ -2595,9 +2631,10 @@ struct DriverService {
 Partition Zero (ext4, 512 MB):
   /kernel.elf                    â€” current kernel binary
   /Bootloader.efi                â€” current bootloader
+  /sr.elf                        â€” current Secure Runtime stub
   /SecureRuntime/
     â”œâ”€â”€ bin/
-    â”‚   â”œâ”€â”€ sr.elf               â€” Secure Runtime binary
+    â”‚   â”œâ”€â”€ sr.elf               â€” Secure Runtime binary (future)
     â”‚   â”œâ”€â”€ fsd.elf              â€” filesystem daemon
     â”‚   â”œâ”€â”€ pci.elf              â€” PCI manager
     â”‚   â””â”€â”€ ...
@@ -2701,5 +2738,5 @@ This is softer than hard revocation (which would immediately fail the next memor
 
 ---
 
-*Generated from 11 module files - 2671 total lines*
+*Generated from 11 module files - 2708 total lines*
 

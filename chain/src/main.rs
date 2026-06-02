@@ -166,9 +166,39 @@ fn serial_init() {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // Write panic to serial
-    for b in b"PANIC: " {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    serial_write_str("PANIC");
+    if let Some(loc) = info.location() {
+        serial_write_str(" at ");
+        serial_write_str(loc.file());
+        serial_write_str(":");
+        let mut line_buf = [0u8; 10];
+        let mut val = loc.line();
+        let mut i = 0;
+        if val == 0 {
+            line_buf[0] = b'0';
+            i = 1;
+        } else {
+            while val > 0 {
+                line_buf[i] = b'0' + (val % 10) as u8;
+                val /= 10;
+                i += 1;
+            }
+        }
+        for &b in line_buf[..i].iter().rev() {
+            serial_write_str(core::str::from_utf8(&[b]).unwrap_or("?"));
+        }
+    }
+    serial_write_str(" — ");
+    serial_write_str(info.message().as_str().unwrap_or("(non-utf8 message)"));
+    serial_write_str("\n");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+fn serial_write_str(s: &str) {
+    for b in s.bytes() {
         unsafe {
             let mut r = 100_000u32;
             loop {
@@ -179,10 +209,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
                 }
                 r -= 1;
             }
-            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") *b);
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
         }
-    }
-    loop {
-        unsafe { core::arch::asm!("cli; hlt") };
     }
 }

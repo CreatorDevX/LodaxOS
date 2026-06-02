@@ -17,8 +17,10 @@ Kernel reads RSDP address from BootInfo
 
 ## RSDP (Root System Description Pointer)
 
-The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure found by scanning:
-1. UEFI configuration table (most reliable on UEFI systems)
+The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The chainloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
+
+Scanned regions, in order:
+1. The hint from `BootInfo.rsdp_addr` (validated by signature and checksum)
 2. EBDA (Extended BIOS Data Area) — word at `0x40E` points to segment
 3. Standard BIOS ROM area (`0xE0000–0xFFFFF`)
 4. OVMF/UEFI firmware area (`0xFEFF_0000–0xFF00_0000`)
@@ -148,7 +150,7 @@ Each step maps through a table:
 
 ## Non-MADT Tables (Future)
 
-The ACPI subsystem can be extended to parse additional tables:
+The ACPI subsystem can be extended to parse additional tables. The codebase currently keeps the `XSDT_SIG` and `MADT_SIG` signature constants; other signatures (`"FACP"`, `"MCFG"`, `"HPET"`, `"DSDT"`, `"SSDT"`) are not declared and must be added when the corresponding parsers are written.
 
 ### FADT (Fixed ACPI Description Table)
 

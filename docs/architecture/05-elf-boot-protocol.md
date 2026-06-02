@@ -22,12 +22,14 @@ pub struct BootInfo {
     memory_regions: [MemoryRegion; 128],   // free memory descriptors
     memory_region_count: usize,            // number of valid entries
     framebuffer: FramebufferInfo,          // GOP framebuffer details
-    partition_zero_lba: u64,               // ext4 partition LBA (unused currently)
+    partition_zero_lba: u64,               // ext4 partition LBA
     partition_zero_size: u64,              // ext4 partition size
     kernel_image_addr: u64,                // physical addr of kernel ELF buffer
     kernel_image_size: u64,                // size of kernel ELF buffer
     rsdp_addr: u64,                        // ACPI RSDP physical address
     madt_addr: u64,                        // MADT physical address
+    sr_image_addr: u64,                    // physical addr of Secure Runtime ELF buffer
+    sr_image_size: u64,                    // size of SR ELF buffer
 }
 ```
 
@@ -98,7 +100,7 @@ The ELF loader in `boot/src/load_kernel.rs` performs these steps:
 
 ## Bootloader Ext4 Parser
 
-The ext4 filesystem reader in `boot/src/load_kernel.rs` is a complete, self-contained implementation. It does NOT use the `ext4-view` crate (which is a declared dependency but unused).
+The ext4 filesystem reader in `boot/src/load_kernel.rs` is a complete, self-contained implementation. It does not depend on any external ext4 crate.
 
 ### Design
 

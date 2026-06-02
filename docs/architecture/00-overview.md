@@ -16,7 +16,7 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 
 ### What Exists Today
 
-- 5-crate Rust workspace producing UEFI-compatible binaries
+- 6-crate Rust workspace producing UEFI-compatible binaries
 - Two-stage UEFI boot chain (chainloader → bootloader → kernel)
 - Bare-metal x86-64 kernel with full interrupt handling
 - 4-level page tables with higher-half mapping
@@ -24,9 +24,10 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 - SLUB-style slab heap allocator with demand-paged VMA support
 - LAPIC/IOAPIC interrupt controller drivers
 - ACPI RSDP/MADT/XSDT discovery and parsing
-- Preemptive round-robin task scheduler with syscall interface
+- Preemptive CFS (Completely Fair Scheduler) task scheduler with syscall interface
 - Self-contained ext4 filesystem reader (bootloader only)
 - UEFI GOP framebuffer with bitmap font rendering
+- Secure Runtime (`sr`) stub binary loaded into a higher-half address (entry parsed, never jumped to)
 
 ### What Is Planned (see 08-future-architecture.md)
 

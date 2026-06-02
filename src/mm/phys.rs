@@ -59,7 +59,13 @@ static mut ZONE: Zone = Zone {
 static LOCK: SpinLock = SpinLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-const BOOTINFO_PAGE: u64 = 0x1000;
+const BOOTINFO_HANDOFF_PAGE: u64 = 0x1000;
+
+/// Physical base of the dynamically-allocated BootInfo struct.  Set by
+/// `init_from_regions`; checked by `is_reserved_page` to prevent double-free
+/// of the BootInfo page(s) the caller did not include in its free-memory list.
+static mut BOOTINFO_RESERVED_BASE: u64 = 0;
+static mut BOOTINFO_RESERVED_PAGES: u64 = 0;
 
 fn block_size(order: usize) -> u64 {
     (1u64 << order) * PAGE_SIZE
@@ -109,7 +115,15 @@ unsafe fn split_and_enqueue(zone: &mut Zone, addr: u64, high_order: usize, targe
 }
 
 fn is_reserved_page(page: u64) -> bool {
-    page == 0 || page == BOOTINFO_PAGE
+    if page == 0 || page == BOOTINFO_HANDOFF_PAGE / PAGE_SIZE {
+        return true;
+    }
+    let base = unsafe { BOOTINFO_RESERVED_BASE };
+    let pages = unsafe { BOOTINFO_RESERVED_PAGES };
+    if pages == 0 {
+        return false;
+    }
+    page >= base / PAGE_SIZE && page < (base / PAGE_SIZE) + pages
 }
 
 /// Reserve a single 4 KB page so the buddy allocator will never hand it out.
@@ -172,13 +186,15 @@ fn carve_blocks(zone: &mut Zone, mut start: u64, size: u64) -> usize {
         start = PAGE_SIZE;
     }
 
-    // Handle BootInfo handoff page at 0x1000
-    if start == BOOTINFO_PAGE {
-        start = BOOTINFO_PAGE + PAGE_SIZE;
+    // Handle BootInfo handoff page at 0x1000 (the chainloader leaves the
+    // 8-byte pointer to the dynamically-allocated BootInfo struct at this
+    // fixed address; the actual struct lives elsewhere).
+    if start == BOOTINFO_HANDOFF_PAGE {
+        start = BOOTINFO_HANDOFF_PAGE + PAGE_SIZE;
     }
-    if start < BOOTINFO_PAGE && end > BOOTINFO_PAGE {
-        carve_blocks(zone, start, BOOTINFO_PAGE - start);
-        start = BOOTINFO_PAGE + PAGE_SIZE;
+    if start < BOOTINFO_HANDOFF_PAGE && end > BOOTINFO_HANDOFF_PAGE {
+        carve_blocks(zone, start, BOOTINFO_HANDOFF_PAGE - start);
+        start = BOOTINFO_HANDOFF_PAGE + PAGE_SIZE;
     }
 
     // Carve remaining range into maximal buddy blocks.
@@ -250,6 +266,10 @@ pub unsafe fn init_from_regions(regions: &[(u64, u64)], boot_info_phys: u64) {
         unsafe { reserve_one_page(&mut *zone_ptr(), addr) };
     }
     total_pages = total_pages.saturating_sub(bootinfo_pages);
+    unsafe {
+        BOOTINFO_RESERVED_BASE = bootinfo_base;
+        BOOTINFO_RESERVED_PAGES = bootinfo_pages as u64;
+    }
 
     unsafe {
         (*zp).total_pages.store(total_pages, Ordering::Relaxed);

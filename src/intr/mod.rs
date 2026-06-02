@@ -250,8 +250,11 @@ pub fn install_all_routes() {
     }
 }
 
-/// Install all entries and return count of programmed pins.
-pub fn install_and_enable_all() -> usize {
+/// Install all routes into their respective IOAPICs, leaving every entry
+/// masked.  Callers must explicitly enable individual routes with
+/// `enable_route` (e.g. once the device driver is ready to handle IRQs).
+/// Returns the count of programmed pins.
+pub fn install_all_masked() -> usize {
     let table = unsafe { &*TABLE.0.get() };
     let mut count = 0;
     for i in 0..table.count {

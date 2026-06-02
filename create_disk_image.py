@@ -140,7 +140,7 @@ def main():
     with open(ext4_part, "rb") as f:
         ext4_data = f.read(ext4_sectors * SECTOR)
     disk[ext4_first * SECTOR: ext4_first * SECTOR + len(ext4_data)] = ext4_data
-    os.remove(ext4_part)
+    
     print(f"  ext4: {len(ext4_data) // 1024} KB written")
 
     print("Formatting ESP...")
@@ -163,7 +163,7 @@ def main():
     with open(esp_part, "rb") as f:
         esp_data = f.read(esp_sectors * SECTOR)
     disk[esp_first * SECTOR: esp_first * SECTOR + len(esp_data)] = esp_data
-    os.remove(esp_part)
+    
     print(f"  ESP: {len(esp_data) // 1024} KB written")
 
     with open(disk_path, "wb") as f:

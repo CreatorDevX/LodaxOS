@@ -30,9 +30,10 @@ LodaxOS uses a four-tier memory model:
 |---|---|---|
 | `0x0000_0000` | Null guard | Rust UB on null pointer dereference |
 | `0x0000_1000` | BootInfo handoff pointer | Inter-stage communication (8 bytes) |
+| `boot_info_phys` page(s) | Dynamically-allocated `BootInfo` struct | The chainloader writes this address into `0x1000`; the buddy allocator reserves it during `init_from_regions` so it can never be re-issued |
 | Buddy-allocated | All dynamic allocations | Pages acquired from buddy allocator |
 
-The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel.
+The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel. The kernel's `phys::init_from_regions` receives the pointer as its `boot_info_phys` argument and reserves the page(s) covering it from the buddy free lists; the same range is also checked by `is_reserved_page` on free paths.
 
 ## Physical Page Allocator — Buddy System (`src/mm/phys.rs`)
 
@@ -95,7 +96,7 @@ Each `FreeBlock` is stored inline within free pages (zero metadata overhead). Th
 1. Compute buddy address: `addr ^ (1 << (n + 12))` (XOR bit n in the page-number space).
 2. If the buddy is also free and at order n, remove it from `free_lists[n]` and recurse at order n+1 (coalesce).
 3. Otherwise, insert the current block into `free_lists[n]`.
-4. Refuse to free reserved pages (0 and 0x1000).
+4. Refuse to free reserved pages (0, 0x1000, and the dynamically-allocated `BootInfo` page(s) recorded in `BOOTINFO_RESERVED_BASE` / `BOOTINFO_RESERVED_PAGES`).
 
 ### Thread Safety
 
@@ -249,22 +250,22 @@ Each `KmemCache` has its own `SpinLock`. The `GlobalAllocator` dispatches to the
 
 ### Radix Tree
 
-The VMA tree uses a 4-level radix tree covering bits 12–51 of the virtual address (40 bits = 1 TB addressable per tree). Each level indexes 10 bits:
+The VMA tree uses a 4-level radix tree covering bits 12–51 of the virtual address (40 bits = 1 TB addressable per tree). Each level indexes 10 bits. The implementation labels levels from the leaf upward, matching the `radix_shift` formula `PAGE_SHIFT + level * RADIX_BITS`:
 
 ```
-Level 0 (bits 51:42) → Level 1 (bits 41:32) → Level 2 (bits 31:22) → Level 3 (bits 21:12)
+Level 0 (bits 21:12) → Level 1 (bits 31:22) → Level 2 (bits 41:32) → Level 3 (bits 51:42)
 ```
 
-Each node is a `VmaNode` holding a tagged union: either a slab node (slot array of 1024 `Option<Box<VmaNode>>`) or a leaf node (slot array of 1024 `Option<Box<Vma>>`).
+Each node is a `RadixNode` with 1024 8-byte entries (8 KB per node). A `RadixEntry` is a tagged union: an interior entry is a `*mut RadixNode` (child), a leaf entry is a `*mut Vma`.
 
 ### VMA Struct
 
-```c
+```rust
 struct Vma {
     start: u64,         // virtual start address (page-aligned)
     end: u64,           // virtual end address (exclusive, page-aligned)
-    perm: u8,           // permission bits (Read, Write, Execute)
-    flags: u8,          // VMA flags (Kernel, User, Guard, etc.)
+    perm: VmaPerm,      // permission bits (None, Read, Write, Execute, …)
+    flags: u64,         // VMA flags (reserved for future Kernel/User/Guard)
 }
 ```
 
@@ -272,11 +273,11 @@ struct Vma {
 
 | Operation | Description |
 |---|---|
-| `insert(vma)` | Walk the 4-level tree, allocate leaf/tree nodes as needed, insert VMA into the correct leaf slot. |
-| `remove(start)` | Walk the tree to the leaf slot covering `start`, remove the VMA, and clean up empty nodes. |
-| `find_covering(addr)` | Walk the tree to the leaf slot, scan up to 1024 VMAs for one covering `addr`. |
-| `find(start, end)` | Walk the tree to the leaf slot, scan for a VMA at exact `start..end`. |
-| `visit_all(f)` | Recursively traverse all leaf slots, apply `f` to each VMA. |
+| `insert(vma)` | Walk the 4-level tree from level 3 down to level 1, allocate interior nodes as needed, then store the VMA pointer in the level-0 leaf slot. |
+| `lookup(addr)` | Walk the tree to the level-0 leaf slot, return the VMA if the entry is non-null. |
+| `find_covering(addr)` | Visit all VMAs in the tree (linear scan via `visit_all`) and return the first one where `addr ∈ [start, end)`. |
+| `remove(start)` | Walk to the level-0 leaf slot for `start`, null out the entry, return the previous VMA pointer. |
+| `visit_all(f)` | Recursively traverse all leaf slots, apply `f` to each VMA until it returns `Some`. |
 
 `find_covering` does a linear scan of up to 1024 VMA entries in the target leaf. With <100 VMAs per process in practice, this is fast enough. The tree structure makes it O(1) to locate the correct leaf slot.
 

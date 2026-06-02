@@ -334,7 +334,7 @@ let kernel_elf_data = match load_kernel::load_kernel_from_ext4() {
 boot_info.kernel_image_addr = kernel_elf_data.as_ptr() as u64;
 boot_info.kernel_image_size = kernel_elf_data.len() as u64;
 ```
-This is the most complex operation in the bootloader. The `load_kernel_from_ext4()` function at `boot/src/load_kernel.rs:671-823` performs full ext4 filesystem traversal over raw UEFI Block I/O. It does NOT use the `ext4-view` crate (which is declared as a dependency but unused in the bootloader — it is used only in the chainloader for reference).
+This is the most complex operation in the bootloader. The `load_kernel_from_ext4()` function at `boot/src/load_kernel.rs:672-825` performs full ext4 filesystem traversal over raw UEFI Block I/O. It does not depend on any external ext4 crate.
 
 **Step 5a: Find ext4 partition via GPT** (`boot/src/load_kernel.rs:306-360`)
 
@@ -788,7 +788,7 @@ Each task gets its own 8 KB kernel stack with a synthetic `TrapFrame` at the bot
 
 **Phase 3E: Install IOAPIC routes** (`kernel/src/main.rs:351-355`)
 ```rust
-let routes = intr::install_and_enable_all();
+let routes = intr::install_all_masked();
 ```
 All routes in the interrupt routing table are programmed into their respective IOAPIC redirection entries. All are initially masked.
 
@@ -1145,14 +1145,14 @@ The kernel VMA tree is initialized once during boot and currently has no concurr
 
 ### 7.6 ACPI Sub-system (`src/acpi/mod.rs`)
 
-**RSDP Discovery** (`acpi.rs:102-144`):
-`find_rsdp()` scans in order:
-1. UEFI configuration table (`find_rsdp_from_uefi()` — uses `uefi::system::with_config_table` to find `ACPI2_GUID` entry)
+**RSDP Discovery** (`acpi.rs:96-144`):
+`find_rsdp(hint)` scans in order:
+1. The hint from `BootInfo.rsdp_addr` (validated by signature and checksum)
 2. EBDA (Extended BIOS Data Area): reads word at `0x40E` as a segment pointer, scans 1 KB from `segment << 4`
 3. BIOS ROM area: scans `0xE_0000` to `0x10_0000` (128 KB)
 4. OVMF/UEFI firmware area: scans `0xFEFF_0000` to `0xFF00_0000` (64 KB)
 
-Each candidate location checks for the `"RSD PTR "` signature at 16-byte-aligned addresses.
+Each candidate location checks for the `"RSD PTR "` signature at 16-byte-aligned addresses. The chainloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`, so the kernel prefers that hint. (The earlier `find_rsdp_from_uefi` helper that walked `uefi::system::with_config_table` is no longer reachable from the kernel — the UEFI runtime is gone by the time the kernel calls into `acpi::init`.)
 
 **RSDP Validation** (`acpi.rs:50-58`):
 `rsdp_checksum_valid(rsdp)`: sums all bytes of the RSDP structure (20 bytes for v1, 36 bytes for v2+), must equal 0.
@@ -1297,7 +1297,7 @@ Vectors 33 through 63 (31 vectors total) are available for device IRQs. Vector 3
 **Route Assignment** (`intr.rs:214-263`):
 - `install_route(route)`: programs the IOAPIC redirection entry (masked)
 - `enable_route(route)`: unmasks the IOAPIC entry
-- `install_and_enable_all()`: installs all routes (returns count)
+- `install_all_masked()`: installs all routes, returns count of programmed pins (the legacy `install_and_enable_all` name was renamed to make the "still masked" semantics explicit)
 
 **Lookups:**
 - `lookup_isa(isa_irq)` → `Option<&IrqRoute>`
@@ -1487,15 +1487,17 @@ struct TaskManager {
 5. Builds a TrapFrame at the stack bottom with RSP pointing to the iretq frame
 6. Registers the task as "Ready" and returns its ID
 
-**Scheduler** (`task.rs:197-245`):
+**Scheduler** (`task.rs:201-282`):
 `schedule(frame: &mut TrapFrame) -> bool`:
-Called from the LAPIC timer IRQ handler:
+Called from the LAPIC timer IRQ handler. Implements a CFS-style virtual-runtime scheduler (Linux-style "leftmost task"):
 1. If fewer than 2 tasks, returns false (nothing to switch to)
 2. Computes the real interrupted RSP: `(frame_address + 0xA0)` — this is where the CPU pushed return RIP, CS, RFLAGS
-3. Saves the current task's full register state (including corrected RSP)
-4. Scans for the next READY task using round-robin (wraps around)
-5. If found, overwrites the interrupt stack's TrapFrame with the next task's saved state
+3. Saves the current task's full register state (including corrected RSP) and advances its `vruntime` by `VRUNTIME_TICK` (20)
+4. Scans all tasks for the READY one with the smallest `vruntime`; if no other ready task exists, leaves the current task in place
+5. If a different task is picked, overwrites the interrupt stack's TrapFrame with that task's saved state
 6. When the IRQ stub returns via iretq/popfq+retfq, it restores the new task's state
+
+`VRUNTIME_BIAS` (8) is subtracted from the minimum vruntime when creating a new task, giving it a small startup boost.
 
 **The popfq+retfq workaround** (`kernel/src/main.rs:553-571`):
 Instead of `iretq`, the scheduler uses:

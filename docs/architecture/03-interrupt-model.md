@@ -171,7 +171,7 @@ The timer IRQ handler (vector 32) is where preemptive multitasking happens:
 1. Increment global tick counter
 2. Call `task::schedule(&mut frame)`
 3. `schedule()` saves the current task's register state into its `Task` struct (copies `TrapFrame` + corrects RSP)
-4. Finds the next ready task (round-robin)
+4. Finds the next ready task (CFS: minimum `vruntime`)
 5. Overwrites `frame` with the next task's saved `TrapFrame`
 6. Returns `true` indicating a switch was made
 7. The handler executes `mov rsp, frame.rsp; push frame.cs; push frame.rip; push frame.rflags; popfq; retfq`

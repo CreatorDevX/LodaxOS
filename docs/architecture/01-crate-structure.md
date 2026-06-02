@@ -2,11 +2,11 @@
 
 ## Workspace Topology
 
-The workspace `Cargo.toml` at root defines five members with resolver version 2:
+The workspace `Cargo.toml` at root defines six members with resolver version 2:
 
 ```toml
 [workspace]
-members = ["system", "shared", "chain", "boot", "kernel"]
+members = ["system", "shared", "chain", "boot", "kernel", "sr"]
 resolver = "2"
 ```
 
@@ -22,9 +22,12 @@ lodaxos-kernel  (depends on lodaxos-core, lodaxos-system)
 lodaxos-boot    (depends on lodaxos-core, lodaxos-system)
       ↓
 lodaxos-chain   (depends on lodaxos-system)
+lodaxos-sr      (depends on lodaxos-system)
 ```
 
 `lodaxos-chain` depends only on `lodaxos-system` (not `lodaxos-core`) because the chainloader has its own inline serial driver — it does not need the full shared subsystem library.
+
+`lodaxos-sr` is the Secure Runtime stub. It is built as a bare-metal `x86_64-unknown-none` ELF (custom `sr/target.json`, base `0xFFFF_9000_0000_0000`, code-model=large) and is loaded by the kernel into a higher-half staging buffer. The current implementation is a `loop { hlt }` placeholder that logs its own entry point and never executes.
 
 ## Crate Purposes
 
@@ -81,7 +84,7 @@ lodaxos-chain   (depends on lodaxos-system)
 8. Jumps to the kernel entry point
 
 **Key design choices**:
-- Self-contained ext4 parser — no external crate dependency for filesystem reading (the `ext4-view` crate is declared but unused)
+- Self-contained ext4 parser — no external crate dependency for filesystem reading
 - Must capture RSDP *before* `exit_boot_services` — after that, UEFI runtime services are gone
 - Must `cli` immediately after `exit_boot_services` — stale UEFI timer interrupts would triple-fault without our IDT
 

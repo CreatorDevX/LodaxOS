@@ -7,9 +7,6 @@ use crate::mm::virt;
 /// IA32_APIC_BASE MSR — bits 12–35 are the LAPIC base, bit 11 is global enable.
 const IA32_APIC_BASE: u32 = 0x1B;
 
-/// Default LAPIC physical address (typical on x86-64).
-const LAPIC_PHYS: u64 = 0xFEE0_0000;
-
 /// LAPIC MMIO register offsets.
 const APIC_ID: usize = 0x20;
 const APIC_LVR: usize = 0x30;
@@ -117,15 +114,12 @@ pub fn init_mmio() {
 const APIC_LVT_ERROR: usize = 0x370;
 
 /// Enable the LAPIC and mask LINT0/LINT1 (required in symmetric mode).
+///
+/// The legacy 8259 PIC is masked separately by `arch::idt::mask_pic` —
+/// callers should invoke that once before configuring the IOAPIC, so we
+/// do not repeat the I/O here.
 pub fn enable() {
     unsafe {
-        // Disable the legacy 8259 PIC — all interrupts go through the I/O APIC.
-        // UEFI may have left the PIC active with unknown vector mappings; if the
-        // PIT (or any ISA device) fires, the PIC sends an extINT to LINT0 with
-        // whatever vector UEFI programmed (possibly 0 in some configurations).
-        asm!("out 0x21, al", in("al") 0xFFu8); // Master PIC: mask all IRQs
-        asm!("out 0xA1, al", in("al") 0xFFu8); // Slave  PIC: mask all IRQs
-
         // Mask LINT0 and LINT1 — prevents spurious vector delivery issues
         // when the LAPIC is not yet fully configured for external interrupts.
         write32(APIC_LVT_LINT0, APIC_LVT_MASKED);

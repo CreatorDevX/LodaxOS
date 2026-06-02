@@ -13,10 +13,6 @@ const VRUNTIME_TICK: u64 = 20;
 /// scheduling advantage so they start promptly.
 const VRUNTIME_BIAS: u64 = 8;
 
-/// Maximum vruntime delta before we risk overflow in signed comparisons.
-/// If the gap exceeds this, we clamp to avoid pathological starvation.
-const MAX_VRUNTIME_DELTA: u64 = 1_000_000;
-
 // ---- Task states ----
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -287,6 +283,13 @@ pub fn block_current(frame: &mut TrapFrame) {
     let m = manager_ptr();
     unsafe {
         let cur = (*m).current;
+        // Blocking the idle/main task (task 0) would leave no eligible
+        // candidate for the scheduler; refuse and return so the caller can
+        // log or panic instead of hanging the entire system.
+        if cur == 0 {
+            log::error!("task: refused to block task 0 (idle/main)");
+            return;
+        }
         if let Some(task) = &mut (*m).tasks[cur] {
             task.state = TaskState::Blocked;
             log::trace!("task {} blocked (vruntime={})", cur, task.vruntime);

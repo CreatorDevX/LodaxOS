@@ -6,7 +6,6 @@ use uefi::boot::ScopedProtocol;
 use uefi::proto::media::block::BlockIO;
 
 const SECTOR_SIZE: usize = 512;
-const MAX_SECTOR_READ: usize = 128;
 
 /// ext4 partition type GUID (Linux filesystem: 0FC63DAF-8483-4772-8E79-3D69D8477DE4).
 const EXT4_GUID: [u16; 8] = [
@@ -379,7 +378,10 @@ fn read_ext4_sectors(
     if block_size == SECTOR_SIZE as u64 {
         let aligned = (bytes_needed + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;
         let mut aligned_buf = alloc::vec![0u8; aligned];
-        aligned_buf[..bytes_needed].copy_from_slice(&buf[..bytes_needed]);
+        // Do NOT pre-fill aligned_buf from `buf` — the buffer is a destination,
+        // not a source. The UEFI Block I/O read populates aligned_buf directly;
+        // copying from the uninitialised destination would only seed it with
+        // zeros at best, and would let stale call-site data leak into the read.
         if reader.proto.read_blocks(reader.media_id, start_block, &mut aligned_buf).is_err() {
             log::error!("read_ext4_sectors: read_blocks failed at LBA {} size {}", start_block, aligned);
             return None;
@@ -793,18 +795,24 @@ fn load_file_from_ext4(filename: &[u8]) -> Option<Vec<u8>> {
             file_type: root_data[dir_off + 7],
         };
 
-        if entry.inode == 0 || entry.rec_len == 0 {
+        // rec_len == 0 means a corrupt entry; we cannot advance safely. Stop
+        // the walk to avoid infinite loops.  An entry with inode == 0 and a
+        // non-zero rec_len is an unused/deleted slot — skip it.
+        if entry.rec_len == 0 {
+            log::warn!("Root directory walk: zero rec_len at offset {}, stopping", dir_off);
             break;
         }
 
-        let name_start = dir_off + 8;
-        let name_end = name_start + entry.name_len as usize;
-        if name_end <= root_data.len() {
-            let name = &root_data[name_start..name_end];
-            if name == filename {
-                file_inode_num = entry.inode;
-                log::info!("Found {} (inode {})", filename_str, file_inode_num);
-                break;
+        if entry.inode != 0 {
+            let name_start = dir_off + 8;
+            let name_end = name_start + entry.name_len as usize;
+            if name_end <= root_data.len() {
+                let name = &root_data[name_start..name_end];
+                if name == filename {
+                    file_inode_num = entry.inode;
+                    log::info!("Found {} (inode {})", filename_str, file_inode_num);
+                    break;
+                }
             }
         }
         dir_off += entry.rec_len as usize;

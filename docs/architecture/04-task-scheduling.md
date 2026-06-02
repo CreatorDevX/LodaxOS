@@ -2,7 +2,16 @@
 
 ## Overview
 
-LodaxOS implements preemptive multitasking with a round-robin scheduler. The scheduler is invoked from the LAPIC timer interrupt (vector 32, fired every 1 ms). Each task gets its own 8 KB kernel stack and runs in ring 0. There is no userspace isolation yet — all tasks run at the highest privilege level.
+LodaxOS implements preemptive multitasking with a **CFS (Completely Fair Scheduler)** style virtual-runtime scheduler. The scheduler is invoked from the LAPIC timer interrupt (vector 32, fired every 1 ms). Each task gets its own 8 KB kernel stack and runs in ring 0. There is no userspace isolation yet — all tasks run at the highest privilege level.
+
+## CFS Constants
+
+```rust
+const VRUNTIME_TICK: u64 = 20;   // vruntime added per timer tick (~1 ms)
+const VRUNTIME_BIAS: u64 = 8;    // subtracted from min vruntime for new tasks
+```
+
+All tasks are equal weight, so the `vruntime` field tracks the total time the task has spent on the CPU. `pick_next_ready` selects the task with the smallest `vruntime`, which approximates the Linux CFS "leftmost task" rule in the absence of nice values.
 
 ## Data Structures
 
@@ -36,6 +45,7 @@ pub struct Task {
     pub saved_frame: TrapFrame,      // snapshot of registers when not running
     pub kernel_stack_base: u64,      // bottom of allocated 8 KB stack
     pub state: TaskState,            // Ready or Blocked
+    pub vruntime: u64,               // CFS virtual runtime (lower = scheduled sooner)
 }
 ```
 
@@ -91,6 +101,8 @@ loop {
 }
 ```
 
+Blocking task 0 is explicitly refused by `block_current` (logged as an error) — if no other task is ready and the running task is task 0, the scheduler leaves it in place rather than halting the system.
+
 ## Task Creation
 
 `task::create_task(entry: u64) -> Option<usize>`
@@ -107,8 +119,9 @@ loop {
    - RFLAGS = 0x202 (IF = 1, always reserved)
    - RSP = address of iretq frame
    - SS = 0x10 (kernel data segment)
-7. Store the task in the task manager
-8. Return the new task ID
+7. Compute the new task's `vruntime` as `min(current vruntime) - VRUNTIME_BIAS`, giving newly-created tasks a small startup boost.
+8. Store the task in the task manager
+9. Return the new task ID
 
 ## Preemptive Scheduling
 
@@ -123,7 +136,7 @@ loop {
    b. Increments global tick counter (`TICKS.fetch_add(1, Relaxed)`)
    c. Calls `task::schedule(frame)`
 
-### Schedule Algorithm
+### Schedule Algorithm (CFS)
 
 ```rust
 pub fn schedule(frame: &mut TrapFrame) -> bool {
@@ -133,16 +146,15 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
     let cur = current;
     tasks[cur].saved_frame = *frame;
     tasks[cur].saved_frame.rsp = frame_addr + 0xA0;  // correct RSP
+    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
 
-    // 2. Find next ready task (round-robin)
-    let mut next = cur;
-    loop {
-        next = (next + 1) % count;
-        if tasks[next].state == Ready { break; }
-        if next == cur { return false; }  // no other ready task
-    }
+    // 2. Find the next ready task with the smallest vruntime.
+    let next = pick_next_ready(&*m, cur);
 
-    // 3. Restore next task's state
+    // 3. If no other ready task exists, leave the current task in place.
+    if next == cur { return false; }
+
+    // 4. Restore next task's state and switch to it.
     *frame = tasks[next].saved_frame;
     current = next;
     true
@@ -174,6 +186,10 @@ A task can block itself via syscall 1 (`exit`):
 
 ```rust
 pub fn block_current(frame: &mut TrapFrame) {
+    if current == 0 {
+        log::error!("task: refused to block task 0 (idle/main)");
+        return;
+    }
     tasks[current].state = Blocked;
     schedule(frame);  // immediately reschedule
 }
@@ -197,13 +213,12 @@ pub fn wake(task_id: usize) {
 
 ## Future Development
 
-### Priority Scheduling
+### Priority / Nice Levels
 
-The current round-robin gives every task equal CPU time. A priority-based extension would:
-- Add a `priority` field to `Task`
-- Maintain a per-priority run queue
-- Scheduling picks the highest-priority ready task
-- Round-robin within same priority
+The current CFS implementation gives every task equal weight. A priority extension would:
+- Add a `weight` / `nice` field to `Task`
+- Scale the per-tick `vruntime` increment by `1024 / weight` (Linux-style)
+- Pick the task with the minimum `vruntime` (the existing comparison is unchanged)
 
 ### SMP Scheduling
 

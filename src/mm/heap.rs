@@ -4,8 +4,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::phys;
 
-const SMALLEST_CACHE: usize = 32;
-
 struct SpinLock {
     locked: AtomicBool,
 }

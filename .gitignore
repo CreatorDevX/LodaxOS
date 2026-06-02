@@ -1,7 +1,7 @@
 target/*
 memsave.md
 *.log
-disk.img
+*.img
 kernel.elf
 sr.elf
 serial_out.txt

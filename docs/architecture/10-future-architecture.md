@@ -288,9 +288,10 @@ struct DriverService {
 Partition Zero (ext4, 512 MB):
   /kernel.elf                    — current kernel binary
   /Bootloader.efi                — current bootloader
+  /sr.elf                        — current Secure Runtime stub
   /SecureRuntime/
     ├── bin/
-    │   ├── sr.elf               — Secure Runtime binary
+    │   ├── sr.elf               — Secure Runtime binary (future)
     │   ├── fsd.elf              — filesystem daemon
     │   ├── pci.elf              — PCI manager
     │   └── ...

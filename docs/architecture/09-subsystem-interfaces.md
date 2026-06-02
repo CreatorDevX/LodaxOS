@@ -146,7 +146,6 @@ pub fn map_region_higher_half(pml4, phys, size, flags);
 
 ```rust
 pub fn init();
-pub fn heap_size() -> usize;
 
 // Via GlobalAlloc impl:
 #[global_allocator]
@@ -156,10 +155,11 @@ static ALLOCATOR: GlobalAllocator;
 ### Interface Contract
 
 - `init` must be called after page table init
-- Uses `linked_list_allocator::Heap` internally
-- Thread-safe via spinlock
-- First-fit allocation strategy
-- Max size: 64 MB at `0xFFFF_8080_0000_0000`
+- SLUB-style: 9 caches, object sizes 32 B, 64 B, 128 B, 256 B, 512 B, 1 KB, 2 KB, 4 KB, 8 KB
+- Each cache has its own spinlock; large allocations (> 8 KB) fall back to `phys::alloc_order`
+- Caches derive their per-slab `order` and `objs_per_slab` from the actual `obj_size` at init time, so each cache uses the smallest buddy order that can hold at least one object
+- Thread-safe via per-cache spinlock
+- The virtual arena is a contiguous 64 MB region starting at `0xFFFF_8080_0000_0000`; each new slab maps the freshly-allocated buddy pages into that arena
 
 ### Dependents
 
@@ -171,9 +171,13 @@ static ALLOCATOR: GlobalAllocator;
 ### Public API
 
 ```rust
-pub fn init() -> AcpiContext;
+pub fn init(hint: Option<u64>) -> AcpiContext;
+pub fn find_rsdp(hint: Option<u64>) -> Option<u64>;
 pub fn find_sdt(xsdt_addr: u64, signature: &[u8; 4]) -> Option<u64>;
 pub fn validate_table(addr: u64) -> bool;
+
+pub const XSDT_SIG: [u8; 4];
+pub const MADT_SIG: [u8; 4];
 
 pub struct AcpiContext {
     pub revision: u8,
@@ -186,12 +190,12 @@ pub struct AcpiContext {
 ### Interface Contract
 
 - Kernel ACPI init must happen before page table switch (identity map needed) OR after with physical addresses
-- The bootloader's RSDP capture uses a different path (UEFI config table) than the kernel's fallback path (EBDA/BIOS ROM scan)
-- Currently only MADT is parsed; FADT, MCFG, HPET are identified but not used
+- `init(hint)` first validates the optional `hint` (typically `BootInfo.rsdp_addr`); if the hint is missing or invalid, it falls back to scanning EBDA, BIOS ROM area, and the OVMF region
+- Currently only MADT is parsed; FADT, MCFG, HPET, DSDT, SSDT signatures are not declared in the kernel and must be added when the corresponding parsers are written
 
 ### Dependents
 
-- Kernel main: calls `acpi::init()` → parses MADT → configures IOAPICs and interrupt routing
+- Kernel main: calls `acpi::init(info.rsdp_addr)` → parses MADT → configures IOAPICs and interrupt routing
 - MADT parser: called by ACPI subsystem with physical address
 
 ## Interrupt Routing (`src/intr/mod.rs`)
@@ -206,8 +210,8 @@ pub fn lookup_gsi(gsi: u32) -> Option<&'static IrqRoute>;
 pub fn lookup_vector_isa(vector: u8) -> Option<u8>;
 pub fn install_route(route: &IrqRoute);
 pub fn enable_route(route: &IrqRoute);
-pub fn install_all_routes();     // install all, masked
-pub fn install_and_enable_all() -> usize;
+pub fn install_all_routes();         // install all routes, leave masked
+pub fn install_all_masked() -> usize;  // returns count of programmed pins
 ```
 
 ### Data Flows
@@ -290,8 +294,8 @@ pub const KERNEL_CODE_SEL: u16 = 0x08;
 
 ### Dependents
 
-- Kernel main: calls `load`, then `set_ist1` after IDT init
-- IDT init: calls `set_ist1` to set up IST1 pointer for double fault handler
+- Kernel main: calls `load` (which also calls `set_ist1` from the IDT's perspective; `gdt::load` does not call it)
+- IDT init: calls `set_ist1` to wire the double-fault IST1 stack into the TSS
 - Task creation: uses `KERNEL_CODE_SEL` (0x08) for task CS
 
 ## IDT Subsystem (`src/arch/idt.rs`)
@@ -314,8 +318,9 @@ pub fn key_scancode() -> u16;
 - `TrapFrame` struct shared with task manager (defines register save layout)
 - `interrupt_dispatcher` called by all stubs, dispatches by vector
 - `irq_handler` sends EOI, handles timer/PIT/keyboard, calls scheduler
-- `exception_handler` logs details, halts on unrecoverable
+- `exception_handler` logs details, halts on unrecoverable, attempts to resolve #PF via `mm::vma::handle_page_fault`
 - `syscall_handler` dispatches syscalls by number
+- `mask_pic` is the single point that disables the legacy 8259 PIC. `arch::apic::enable` does not call it; the kernel main loop invokes it once before the LAPIC is enabled.
 
 ### Dependents
 
@@ -349,7 +354,7 @@ Timer IRQ (vector 32)
   → irq_handler()
     → task::schedule(&mut TrapFrame)
       → saves current task state in Task.saved_frame
-      → finds next ready task (round-robin)
+      → finds next ready task (CFS: minimum `vruntime`)
       → overwrites TrapFrame with next task's state
       → returns true
     → context switch via mov rsp + popfq/retfq
@@ -385,7 +390,7 @@ impl Framebuffer {
 }
 ```
 
-(Framebuffer is not a separate module — it is defined inline in `kernel/src/main.rs` and `src/main.rs`. A bootloader Framebuffer is similar but uses `Framebuffer::new(gop)` instead of `from_info`.)
+(Framebuffer is not a separate module — it is defined inline in `kernel/src/main.rs`. The earlier `src/main.rs` UEFI-app stub that mirrored this API was a dead artifact and has been removed.)
 
 ### Interface Contract
 

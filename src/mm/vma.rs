@@ -346,8 +346,12 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
                 Some(p) => p,
                 None => return false,
             };
-            let cr3: u64;
+            // Zero the freshly-allocated page so the kernel never sees
+            // stale (and possibly sensitive) physical-memory contents through
+            // a new VMA mapping.
             unsafe {
+                core::ptr::write_bytes(phys_page as *mut u8, 0, phys::PAGE_SIZE as usize);
+                let cr3: u64;
                 core::arch::asm!("mov {}, cr3", out(reg) cr3);
                 super::virt::map_page_explicit(
                     cr3 & !0xFFF,

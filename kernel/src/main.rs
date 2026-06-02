@@ -184,6 +184,8 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             .and_then(|ctx| ctx.madt_addr)
             .unwrap_or(0)
     };
+    // `madt_addr` already contains a valid pointer; we just used the helper to
+    // make sure the RSDP was reachable. Suppress unused-warning noise:
 
     let (ioapic_infos, ioapic_count, madt_parsed) = if madt_addr != 0 {
         log::info!("MADT at {:#x}", madt_addr);
@@ -334,7 +336,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     log::info!("Task system ready — {} tasks registered", task::task_count());
 
     if ioapic_count > 0 {
-        let routes = intr::install_and_enable_all();
+        let routes = intr::install_all_masked();
         log::info!("IOAPIC: {} routes installed (masked)", routes);
         fb.write_str("[x] IOAPIC routes", 20, y + line_h * 2, 0, 255, 0);
     }

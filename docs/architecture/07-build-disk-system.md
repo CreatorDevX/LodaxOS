@@ -11,7 +11,8 @@ Source code (Rust nightly)
   │
   ├─ cargo build -p lodaxos-system       → system/target/ (library)
   ├─ cargo build -p lodaxos-core         → shared/target/ (library)
-  ├─ cargo build -p lodaxos-kernel       → kernel.elf (custom target)
+  ├─ cargo build -p lodaxos-kernel       → kernel.elf (custom x86_64-unknown-none)
+  ├─ cargo build -p lodaxos-sr           → sr.elf (custom x86_64-unknown-none, large code-model)
   ├─ cargo build -p lodaxos-boot         → lodaxos-boot.efi (x86_64-unknown-uefi)
   └─ cargo build -p lodaxos-chain        → lodaxos-chain.efi (x86_64-unknown-uefi)
                                               │
@@ -27,13 +28,16 @@ Source code (Rust nightly)
 ```bat
 cargo +nightly build -p lodaxos-system
 cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zbuild-std=core,alloc
+cargo +nightly build -p lodaxos-sr --target sr/target.json -Zbuild-std=core
 cargo +nightly build -p lodaxos-boot --target x86_64-unknown-uefi
 cargo +nightly build -p lodaxos-chain --target x86_64-unknown-uefi
 copy target\target\debug\deps\lodaxos_kernel-* kernel.elf
+copy target\target\debug\deps\lodaxos_sr-* sr.elf
 ```
 
 Key points:
 - Kernel uses `-Zbuild-std=core,alloc` to build Rust's core and alloc libraries from source for the custom target
+- SR uses `-Zbuild-std=core` only — it has no `alloc` dependency
 - `-Zbuild-std-features=compiler-builtins-mem` enables compiler memory intrinsics (memcpy, memset, memcmp)
 - `-Zjson-target-spec` allows using the JSON target specification without installing it globally
 - The kernel.elf is found by wildcard in `target/target/` (the subdirectory name matches the target filename)
@@ -43,6 +47,7 @@ Key points:
 | Build Artifact | File | Size |
 |---|---|---|
 | lodaxos-kernel | `kernel.elf` | ~3.9 MB |
+| lodaxos-sr | `sr.elf` | small (stub) |
 | lodaxos-boot | `target/x86_64-unknown-uefi/debug/lodaxos-boot.efi` | ~493 KB |
 | lodaxos-chain | `target/x86_64-unknown-uefi/debug/lodaxos-chain.efi` | ~386 KB |
 
@@ -64,7 +69,7 @@ LBA 1181696–1228799: Backup GPT
 
 - **Type GUID**: `0FC63DAF-8483-4772-8E79-3D69D8477DE4` (Linux filesystem)
 - **Label**: "LodaxOS"
-- **Contents**: `Bootloader.efi`, `kernel.elf`
+- **Contents**: `Bootloader.efi`, `kernel.elf`, `sr.elf`
 - **Size**: 512 MB
 
 Created via `mke2fs -d` which populates the filesystem from a staging directory without requiring loop device mounting. This is critical because WSL2 does not support loop devices.
@@ -73,6 +78,7 @@ Created via `mke2fs -d` which populates the filesystem from a staging directory 
 dd if=/dev/zero of=ext4_part.img bs=1M count=512
 mkdir -p /tmp/lodaxos_staging
 cp kernel.elf /tmp/lodaxos_staging/
+cp sr.elf /tmp/lodaxos_staging/
 cp lodaxos-boot.efi /tmp/lodaxos_staging/Bootloader.efi
 mke2fs -t ext4 -d /tmp/lodaxos_staging -L LodaxOS ext4_part.img
 ```
