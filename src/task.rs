@@ -1,5 +1,6 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+
+use lodaxos_system::Caps;
 
 use crate::arch::idt::TrapFrame;
 use crate::mm::{phys, virt};
@@ -28,8 +29,20 @@ pub struct Task {
     pub id: usize,
     pub saved_frame: TrapFrame,
     pub kernel_stack_base: u64,
+    /// Top of the kernel stack (initial RSP value when this task is
+    /// switched to). For task 0 this is its existing stack; for
+    /// spawned tasks (e.g. ExRun) the loader allocates a fresh
+    /// 16 KiB stack and records the top here.
+    pub kernel_stack_top: u64,
+    /// Physical address of this task's PML4. The scheduler switches
+    /// CR3 to this on every context switch. For task 0 (= kernel
+    /// "main"), this is the kernel's PML4.
+    pub pml4: u64,
     pub state: TaskState,
     pub vruntime: u64,
+    /// Capability bitfield. See `src/cap.rs`. Read/written via the
+    /// `cap::grant_caps` / `cap::revoke_caps` API (which does the lock).
+    pub caps: Caps,
 }
 
 // ---- Global task manager ----
@@ -53,10 +66,6 @@ static mut MANAGER: TaskManager = TaskManager {
     count: 0,
     initialized: false,
 };
-
-/// Holds the top of task 0's allocated kernel stack so that
-/// `enter_task0_stack()` can switch to it.
-static TASK0_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     unsafe {
@@ -88,8 +97,6 @@ pub fn init_main_task() {
     let stack_top = stack_base + KERNEL_STACK_SIZE;
     unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE as usize) };
 
-    TASK0_STACK_TOP.store(stack_top, Ordering::Release);
-
     let current_rsp: u64;
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) current_rsp) };
 
@@ -108,17 +115,16 @@ pub fn init_main_task() {
             id: 0,
             saved_frame: dummy,
             kernel_stack_base: stack_base,
+            kernel_stack_top: stack_top,
+            pml4: virt::pml4_address(),
             state: TaskState::Ready,
             vruntime: 0,
+            caps: Caps::all(),
         });
         (*m).current = 0;
         (*m).count = 1;
-        log::info!("task: main task registered as task 0 (vruntime=0)");
+        log::info!("task: main task registered as task 0 (caps=all) pml4={:#x}", virt::pml4_address());
     }
-}
-
-pub fn task0_stack_top() -> u64 {
-    TASK0_STACK_TOP.load(Ordering::Acquire)
 }
 
 pub fn is_initialized() -> bool {
@@ -140,6 +146,32 @@ const IRETQ_FRAME_SIZE: u64 = 24;
 const RFLAGS_IF: u64 = 0x202;
 
 pub fn create_task(entry: u64) -> Option<usize> {
+    // Default: spawn in the kernel's current PML4. The caller can use
+    // `create_task_in` to spawn in a forked PML4.
+    create_task_in(entry, 0, virt::pml4_address())
+}
+
+/// Create a task in a specific PML4. `arg` is passed in `RDI` when the
+/// task starts. `pml4_phys` is the physical address of the task's
+/// PML4 (use `virt::pml4_address()` for tasks in the kernel's
+/// address space). `kernel_stack_pages` is the number of 4 KiB pages
+/// to allocate for the kernel stack (default 4 = 16 KiB if 0).
+pub fn create_task_in(
+    entry: u64,
+    arg: u64,
+    pml4_phys: u64,
+) -> Option<usize> {
+    use lodaxos_system::{CapOp, Caps};
+    use crate::cap;
+
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        Caps::CAP_TASK_CREATE,
+        CapOp::TaskCreate { parent: Some(cap::current_subject()) },
+    ) {
+        log::warn!("task::create_task_in: cap denied: {:?}", e);
+        return None;
+    }
     let m = manager_ptr();
     unsafe {
         if (*m).count >= MAX_TASKS {
@@ -162,7 +194,7 @@ pub fn create_task(entry: u64) -> Option<usize> {
             r15: 0, r14: 0, r13: 0, r12: 0,
             r11: 0, r10: 0, r9: 0, r8: 0,
             rax: 0, rbx: 0, rcx: 0, rdx: 0,
-            rbp: 0, rsi: 0, rdi: 0,
+            rbp: 0, rsi: 0, rdi: arg,
             vector: 0,
             error_code: 0,
             rip: entry,
@@ -183,13 +215,18 @@ pub fn create_task(entry: u64) -> Option<usize> {
             id: task_id,
             saved_frame: frame,
             kernel_stack_base: stack_base,
+            kernel_stack_top: stack_top,
+            pml4: pml4_phys,
             state: TaskState::Ready,
             vruntime: new_vruntime,
+            caps: Caps::empty(),
         });
         (*m).count += 1;
 
-        log::info!("task: created task {} entry={:#x} stack={:#x} vruntime={}",
-            task_id, entry, stack_base, new_vruntime);
+        log::info!(
+            "task: created task {} entry={:#x} arg={:#x} stack={:#x} pml4={:#x} vruntime={}",
+            task_id, entry, arg, stack_base, pml4_phys, new_vruntime
+        );
         Some(task_id)
     }
 }
@@ -231,7 +268,8 @@ unsafe fn pick_next_ready(m: &TaskManager, current: usize) -> Option<usize> {
 /// CFS behaviour:
 ///   1. Advance the current task's vruntime by VRUNTIME_TICK.
 ///   2. Pick the ready task with the smallest vruntime.
-///   3. If it's different from the current task, perform a context switch.
+///   3. If it's different from the current task, perform a context
+///      switch (CR3 + RSP + RIP via the modified TrapFrame).
 ///
 /// Returns true if a switch occurred.
 pub fn schedule(frame: &mut TrapFrame) -> bool {
@@ -249,10 +287,6 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
         if let Some(task) = &mut (*m).tasks[cur] {
             task.saved_frame = *frame;
             task.saved_frame.rsp = original_rsp;
-
-            // Advance vruntime
-            let old = task.vruntime;
-            task.vruntime = old.saturating_add(VRUNTIME_TICK);
         }
 
         // ---- Pick next task (CFS: minimum vruntime) ----
@@ -265,13 +299,44 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
             return false;
         }
 
+        // ---- Advance current task's vruntime only when we actually switch
+        //      away from it. Advancing before the pick (the previous behaviour)
+        //      double-credits the current task whenever schedule() is called
+        //      and we stay on it: once on the no-switch path, and again on the
+        //      next tick that does switch. See audit A5.
+        if let Some(task) = &mut (*m).tasks[cur] {
+            let old = task.vruntime;
+            task.vruntime = old.saturating_add(VRUNTIME_TICK);
+        }
+
         // ---- Switch to next task ----
+        let next_pml4 = (*m).tasks[next].map(|t| t.pml4).unwrap_or(0);
+        let next_stack_top = (*m).tasks[next].map(|t| t.kernel_stack_top).unwrap_or(0);
         if let Some(task) = &(*m).tasks[next] {
             *frame = task.saved_frame;
         }
         (*m).current = next;
 
-        log::trace!("sched: {} → {} (vruntime {})", cur, next,
+        // Point TSS.rsp0 at the new task's kernel stack so ring-0 IRQs
+        // taken while the new task is running push their iretq frame
+        // onto the new task's stack, not the 4 KiB boot DUMMY_STACK.
+        if next_stack_top != 0 {
+            crate::arch::gdt::tss_set_rsp0(next_stack_top);
+        }
+
+        // Switch PML4 if the next task has a different one. The new
+        // PML4 must already include the kernel's higher-half code/data
+        // (it's a fork of the kernel PML4), so the IDT handler's
+        // iretq can complete normally.
+        let cur_pml4 = virt::pml4_address();
+        if next_pml4 != cur_pml4 && next_pml4 != 0 {
+            log::trace!("sched: switch PML4 {:#x} → {:#x}", cur_pml4, next_pml4);
+            virt::switch_pml4(next_pml4);
+        }
+
+        log::info!("sched: task {} → {} (vruntime {} → {})",
+            cur, next,
+            if let Some(t) = &(*m).tasks[cur] { t.vruntime } else { 0 },
             if let Some(t) = &(*m).tasks[next] { t.vruntime } else { 0 });
         true
     }
@@ -299,6 +364,23 @@ pub fn block_current(frame: &mut TrapFrame) {
 }
 
 pub fn wake(task_id: usize) {
+    use lodaxos_system::{CapOp, Caps};
+    use crate::cap;
+
+    let caller = cap::current_subject();
+    let required = if (task_id as u32) == caller {
+        Caps::CAP_TASK_SCHED
+    } else {
+        Caps::CAP_TASK_WAKE_OTHER
+    };
+    if let Err(e) = cap::check_and_authorize(
+        caller,
+        required,
+        CapOp::CapGrant { target: task_id as u32, cap: 0 },
+    ) {
+        log::warn!("task::wake: cap denied: {:?}", e);
+        return;
+    }
     let m = manager_ptr();
     unsafe {
         if task_id < (*m).count {
@@ -310,6 +392,48 @@ pub fn wake(task_id: usize) {
             }
         }
     }
+}
+
+// ---- Capability accessors (used by `src/cap.rs`) ----
+//
+// These run on BSP only for now; SMP will wrap them in `SpinLockIrq`.
+
+/// Read the cap set of `task_id`. Returns `None` if out of range.
+pub fn task_caps(task_id: usize) -> Option<Caps> {
+    let m = manager_ptr();
+    unsafe {
+        if task_id < (*m).count {
+            (*m).tasks[task_id].map(|t| t.caps)
+        } else {
+            None
+        }
+    }
+}
+
+/// Replace the cap set of `task_id` (used by tests and by the cap system
+/// when applying a new default cap set). Returns `false` if out of range.
+pub fn set_task_caps(task_id: usize, caps: Caps) -> bool {
+    let m = manager_ptr();
+    unsafe {
+        if task_id < (*m).count {
+            if let Some(t) = &mut (*m).tasks[task_id] {
+                t.caps = caps;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Atomically OR `add` into the cap set of `task_id` (within the BSP
+/// critical section; with SMP this becomes `fetch_or` under a lock).
+pub fn grant_task_caps(task_id: usize, add: Caps) -> bool {
+    set_task_caps(task_id, task_caps(task_id).unwrap_or(Caps::empty()) | add)
+}
+
+/// Atomically AND-NOT `remove` from the cap set of `task_id`.
+pub fn revoke_task_caps(task_id: usize, remove: Caps) -> bool {
+    set_task_caps(task_id, task_caps(task_id).unwrap_or(Caps::empty()) & !remove)
 }
 
 // ---- Yield (cooperative) ----

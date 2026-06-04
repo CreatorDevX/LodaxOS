@@ -15,7 +15,10 @@ const MADT_IOAPIC_NMI: u8 = 6;
 // ---- Capacity limits ----
 pub const MAX_IOAPICS: usize = 16;
 pub const MAX_ISOS: usize = 32;
-pub const MAX_CPUS: usize = 32;
+// Re-export the system-wide limit so the MADT array cannot diverge
+// from the kernel's actual CPU capacity (lodaxos-system's MAX_CPUS
+// is what `percpu` and `ap_start` use to size the per-CPU table).
+pub use lodaxos_system::MAX_CPUS;
 
 // ---- Parsed structures ----
 

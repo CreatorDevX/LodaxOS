@@ -21,6 +21,7 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
 
     serial_init();
+    let _ = log::set_logger(&SerialLogger).map(|()| log::set_max_level(log::LevelFilter::Info));
     log::info!("LodaxOS chainloader starting");
 
     // Dynamically allocate BootInfo, store pointer at handoff address
@@ -41,8 +42,13 @@ fn main() -> Status {
         kernel_image_size: 0,
         rsdp_addr: 0,
         madt_addr: 0,
-        sr_image_addr: 0,
-        sr_image_size: 0,
+        exrun_image_addr: 0,
+        exrun_image_size: 0,
+        max_cpus: lodaxos_system::MAX_CPUS as u32,
+        bsp_apic_id: 0,
+        ap_count: 0,
+        ap_apic_ids: [0u32; lodaxos_system::MAX_CPUS],
+        ap_arg_phys: [0u64; lodaxos_system::MAX_CPUS],
     });
     let boot_info_ptr = alloc::boxed::Box::into_raw(boot_info) as *mut BootInfo;
     let boot_info_phys = boot_info_ptr as u64;
@@ -212,4 +218,25 @@ fn serial_write_str(s: &str) {
             core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
         }
     }
+}
+
+struct SerialLogger;
+
+impl log::Log for SerialLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        serial_write_str("[");
+        serial_write_str(record.level().as_str());
+        serial_write_str("] ");
+        serial_write_str(record.target());
+        serial_write_str(": ");
+        serial_write_str(record.args().as_str().unwrap_or("(non-utf8)"));
+        serial_write_str("\n");
+    }
+    fn flush(&self) {}
 }

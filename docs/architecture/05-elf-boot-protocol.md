@@ -8,30 +8,50 @@ The boot protocol defines how control and data pass between the three boot stage
 
 ### Location
 
-Physical address `0x1000` (page 1). This address was chosen because:
-- It is page-aligned (must be for the kernel to map it into page tables if needed)
+Physical address `0x1000` (page 1) holds an **8-byte pointer** to a
+dynamically-allocated `BootInfo` (chainloader `Box::new`s the struct
+and writes the pointer at `0x1000`). The kernel reads the pointer,
+then dereferences it. This removes the fixed-address constraint on
+BootInfo itself (which is ~2 KB) — only the 8-byte pointer occupies
+`0x1000`. The address was chosen because:
+- It is page-aligned (must be for the kernel to read the pointer
+  with a single 8-byte load after the page-table switch)
 - It is not page 0 (which would trigger Rust null-pointer UB)
-- It is within the first 4 GB (always identity-mapped by the kernel's page tables)
+- It is within the first 4 GB (always identity-mapped by the
+  kernel's page tables)
 - It survives `exit_boot_services` (it is in conventional memory)
+- The chainloader reserves the page at `0x1000` so the buddy
+  allocator does not hand it out
 
-### Struct Definition
+### Struct Definition (`system/src/lib.rs`)
 
 ```rust
 #[repr(C)]
 pub struct BootInfo {
-    memory_regions: [MemoryRegion; 128],   // free memory descriptors
-    memory_region_count: usize,            // number of valid entries
-    framebuffer: FramebufferInfo,          // GOP framebuffer details
-    partition_zero_lba: u64,               // ext4 partition LBA
-    partition_zero_size: u64,              // ext4 partition size
-    kernel_image_addr: u64,                // physical addr of kernel ELF buffer
-    kernel_image_size: u64,                // size of kernel ELF buffer
-    rsdp_addr: u64,                        // ACPI RSDP physical address
-    madt_addr: u64,                        // MADT physical address
-    sr_image_addr: u64,                    // physical addr of Secure Runtime ELF buffer
-    sr_image_size: u64,                    // size of SR ELF buffer
+    pub memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS], // 128 free memory descriptors
+    pub memory_region_count: usize,         // number of valid entries
+    pub framebuffer: FramebufferInfo,       // GOP framebuffer details
+    pub partition_zero_lba: u64,            // ext4 partition LBA
+    pub partition_zero_size: u64,           // ext4 partition size
+    pub kernel_image_addr: u64,             // physical addr of kernel ELF buffer
+    pub kernel_image_size: u64,             // size of kernel ELF buffer
+    pub rsdp_addr: u64,                     // ACPI RSDP physical address
+    pub madt_addr: u64,                     // MADT physical address
+    pub exrun_image_addr: u64,              // physical addr of Executive Runtime ELF buffer
+    pub exrun_image_size: u64,              // size of ExRun ELF buffer
+    pub max_cpus: u32,                      // MAX_CPUS (= 4)
+    pub bsp_apic_id: u32,                   // BSP LAPIC ID
+    pub ap_count: u32,                      // number of APs (0..MAX_CPUS)
+    pub ap_apic_ids: [u32; MAX_CPUS],       // LAPIC ID of each AP
+    pub ap_arg_phys: [u64; MAX_CPUS],       // physical addr of each ApArg
 }
 ```
+
+The SMP handoff fields (`max_cpus`, `bsp_apic_id`, `ap_count`,
+`ap_apic_ids`, `ap_arg_phys`) are populated by the bootloader
+after `StartupThisAP` brings the APs up but before
+`exit_boot_services`. The kernel uses them in the BSP release
+loop to set each AP's `go = 1`.
 
 ### Lifecycle
 

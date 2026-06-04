@@ -2,7 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::phys;
+use super::{phys, virt};
 
 struct SpinLock {
     locked: AtomicBool,
@@ -157,11 +157,28 @@ impl KmemCache {
         }
 
         // Allocate new slab
-        let Some(page_addr) = phys::alloc_order(self.slab_order as usize) else {
+        let Some(phys_addr) = phys::alloc_order(self.slab_order as usize) else {
             self.lock.unlock();
             return ptr::null_mut();
         };
-        let slab = Slab::init(page_addr as *mut u8, self.slab_order, self.obj_size);
+        // Map the slab's phys pages into the higher-half at
+        // HIGHER_HALF + phys_addr. Without this explicit mapping, the
+        // first dereference of the returned pointer would #PF, the
+        // demand pager (vma::handle_page_fault) would allocate a
+        // *different* phys page, and the slab's free-list pointer
+        // (which lives in the original phys page) would be silently
+        // corrupted on the first cross-page allocation. This bug
+        // made the heap unsafe to use; see audit S3.
+        let num_pages = 1usize << self.slab_order;
+        let virt_base = virt::HIGHER_HALF + phys_addr;
+        virt::map_contiguous(
+            virt::pml4_address(),
+            virt_base,
+            phys_addr,
+            num_pages as u64,
+            virt::DATA,
+        );
+        let slab = Slab::init(virt_base as *mut u8, self.slab_order, self.obj_size);
         let obj = (*slab).alloc_obj();
         let is_full = (*slab).is_full();
         if is_full {
@@ -391,7 +408,19 @@ impl CacheAllocator {
                     if o > 10 { return ptr::null_mut(); }
                     o
                 };
-                phys::alloc_order(order).map(|addr| addr as *mut u8).unwrap_or(ptr::null_mut())
+                let Some(phys_addr) = phys::alloc_order(order) else {
+                    return ptr::null_mut();
+                };
+                // Map into higher-half (see comment in KmemCache::alloc).
+                let virt_base = virt::HIGHER_HALF + phys_addr;
+                virt::map_contiguous(
+                    virt::pml4_address(),
+                    virt_base,
+                    phys_addr,
+                    pages as u64,
+                    virt::DATA,
+                );
+                virt_base as *mut u8
             }
         }
     }
@@ -405,7 +434,10 @@ impl CacheAllocator {
                 // (We don't track the order, so free as order-0 pages)
                 let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
                 for i in 0..pages {
-                    phys::free_page(ptr as u64 + i as u64 * phys::PAGE_SIZE);
+                    // ptr is the higher-half virt (HIGHER_HALF + phys); convert back.
+                    let phys_addr = (ptr as u64) - virt::HIGHER_HALF
+                        + (i as u64) * phys::PAGE_SIZE;
+                    phys::free_page(phys_addr);
                 }
             }
         }

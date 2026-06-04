@@ -22,12 +22,12 @@ lodaxos-kernel  (depends on lodaxos-core, lodaxos-system)
 lodaxos-boot    (depends on lodaxos-core, lodaxos-system)
       ↓
 lodaxos-chain   (depends on lodaxos-system)
-lodaxos-sr      (depends on lodaxos-system)
+lodaxos-exrun   (depends on lodaxos-system)
 ```
 
 `lodaxos-chain` depends only on `lodaxos-system` (not `lodaxos-core`) because the chainloader has its own inline serial driver — it does not need the full shared subsystem library.
 
-`lodaxos-sr` is the Secure Runtime stub. It is built as a bare-metal `x86_64-unknown-none` ELF (custom `sr/target.json`, base `0xFFFF_9000_0000_0000`, code-model=large) and is loaded by the kernel into a higher-half staging buffer. The current implementation is a `loop { hlt }` placeholder that logs its own entry point and never executes.
+`lodaxos-exrun` is the Executive Runtime stub. It is built as a bare-metal `x86_64-unknown-none` ELF (custom `exrun/target.json`, base `0xFFFF_9000_0000_0000`, code-model=large) and is loaded by the kernel into a higher-half staging buffer. The current implementation is a `loop { hlt }` placeholder that receives the shared mailbox's virtual address in `RDI` and never executes user code. See `kernel/src/exec.rs` for the loader contract.
 
 ## Crate Purposes
 
@@ -36,10 +36,13 @@ lodaxos-sr      (depends on lodaxos-system)
 **Purpose**: Pure type definitions shared across all boot stages. Zero dependencies, `#![no_std]`.
 
 **Contents**:
-- `BootInfo` struct — the inter-stage communication structure at physical address `0x1000`
+- `BootInfo` struct — the inter-stage communication structure (dynamically allocated; 8-byte pointer at `0x1000` = `BOOT_INFO_HANDOFF_ADDR`)
 - `FramebufferInfo` — GOP framebuffer metadata (address, resolution, stride, pixel format)
 - `MemoryRegion` — (phys_start, size) pair for free memory regions
-- Constants: `BOOT_INFO_ADDR` (`0x1000`), `MAX_MEMORY_REGIONS` (`128`)
+- `ApArg` — per-AP handoff block for SMP bring-up
+- `Caps` / `CapOp` / `CapError` / `CapResponse` / `CapRequest` — capability-system types
+- `Mailbox` — kernel ↔ ExRun shared 4 KiB page
+- Constants: `BOOT_INFO_HANDOFF_ADDR` (`0x1000`), `MAX_MEMORY_REGIONS` (`128`), `MAX_CPUS` (`4`)
 
 **Rationale**: Separating types into their own crate avoids circular dependencies and ensures that every boot stage agrees on the exact memory layout of the handoff struct. A single-byte misalignment between chainloader and kernel would cause silent data corruption.
 
@@ -47,17 +50,18 @@ lodaxos-sr      (depends on lodaxos-system)
 
 **Purpose**: Canonical implementation of all kernel subsystems, re-exported for use by both the kernel and the bootloader.
 
-**Contents**: Re-exports via one-liner wrappers:
-- `serial.rs` — `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/serial.rs"));`
-- `logger.rs` — thin wrapper re-exporting `src/logger.rs`
-- `task.rs` — `include!()` macro includes `src/task.rs` directly
-- `font.rs` — thin wrapper
-- `arch/` module — re-exports `src/arch/*`
-- `acpi/` module — re-exports `src/acpi/*`
-- `mm/` module — re-exports `src/mm/*`
-- `intr/` module — re-exports `src/intr/*`
+**Contents**: Re-exports via `#[path]` shims (no `include!`):
+- `serial.rs` — `#[path]` shim over `src/serial.rs`
+- `logger.rs` — `#[path]` shim over `src/logger.rs`
+- `task.rs` — `#[path]` shim over `src/task.rs`
+- `cap.rs` — `#[path]` shim over `src/cap.rs`
+- `font.rs` — `#[path]` shim over `src/font.rs`
+- `arch/` module — `#[path]` shims over `src/arch/*`
+- `acpi/` module — `#[path]` shims over `src/acpi/*`
+- `mm/` module — `#[path]` shims over `src/mm/*` (declared in `mm/mod.rs`)
+- `intr/` module — `#[path]` shims over `src/intr/*`
 
-**Rationale**: The bootloader and kernel need the same serial driver, the same logger, the same memory allocators. Rather than compile the same code twice (or worse, maintain two copies), the shared crate uses `include!` to pull in the canonical source. Each target crate then re-exports from `lodaxos_core::*`.
+**Rationale**: The bootloader and kernel need the same serial driver, the same logger, the same memory allocators. Rather than compile the same code twice (or worse, maintain two copies), the shared crate uses `#[path]` to pull in the canonical source. Each target crate then re-exports from `lodaxos_core::*`.
 
 ### `lodaxos-chain` (`chain/`)
 

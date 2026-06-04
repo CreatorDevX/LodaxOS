@@ -8,6 +8,7 @@ extern crate alloc;
 use lodaxos_system::{BootInfo, BOOT_INFO_HANDOFF_ADDR, MAX_MEMORY_REGIONS, MemoryRegion, FramebufferInfo};
 
 mod load_kernel;
+mod mp;
 mod serial;
 mod logger;
 
@@ -97,19 +98,19 @@ fn main() -> Status {
     boot_info.kernel_image_addr = kernel_elf_data.as_ptr() as u64;
     boot_info.kernel_image_size = kernel_elf_data.len() as u64;
 
-    // --- Load SR ELF from ext4 partition ---
-    log::info!("Loading sr.elf from ext4 partition");
-    let sr_elf_data = match load_kernel::load_sr_from_ext4() {
+    // --- Load ExRun ELF from ext4 partition ---
+    log::info!("Loading exrun.elf from ext4 partition");
+    let exrun_elf_data = match load_kernel::load_exrun_from_ext4() {
         Some(data) => data,
         None => {
-            log::warn!("sr.elf not found; continuing without Secure Runtime");
+            log::warn!("exrun.elf not found; continuing without Executive Runtime");
             alloc::vec::Vec::new()
         }
     };
-    if !sr_elf_data.is_empty() {
-        boot_info.sr_image_addr = sr_elf_data.as_ptr() as u64;
-        boot_info.sr_image_size = sr_elf_data.len() as u64;
-        log::info!("sr.elf: {} bytes, at {:#x}", sr_elf_data.len(), boot_info.sr_image_addr);
+    if !exrun_elf_data.is_empty() {
+        boot_info.exrun_image_addr = exrun_elf_data.as_ptr() as u64;
+        boot_info.exrun_image_size = exrun_elf_data.len() as u64;
+        log::info!("exrun.elf: {} bytes, at {:#x}", exrun_elf_data.len(), boot_info.exrun_image_addr);
     }
 
     // --- Capture RSDP from UEFI config table (before exit_boot_services — UEFI addresses valid) ---
@@ -135,6 +136,22 @@ fn main() -> Status {
         (*boot_info_ptr) = boot_info;
     }
     log::info!("BootInfo updated at {:#x}", boot_info_addr);
+
+    // --- Bring up APs via UEFI MP Services (BEFORE exit_boot_services) ---
+    //
+    // MP Services survives the call to ExitBootServices in the sense that
+    // the protocol interface remains mapped, but the proper sequence is to
+    // call StartupThisAP first, then ExitBootServices. The trampoline
+    // installed on each AP will spin on `go` in ApArg until the kernel
+    // releases it.
+    log::info!("Bringing up APs via UEFI MP Services");
+    if let Err(e) = mp::bring_up_aps(&mut boot_info) {
+        log::warn!("MP Services bring-up failed: {:?} (continuing with BSP only)", e.status());
+    }
+    unsafe {
+        (*boot_info_ptr) = boot_info;
+    }
+    log::info!("BootInfo updated with AP info: {} APs", boot_info.ap_count);
 
     // --- Exit boot services ---
     log::warn!("Exiting UEFI boot services");

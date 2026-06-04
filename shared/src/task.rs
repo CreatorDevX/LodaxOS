@@ -1,1 +1,1 @@
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/task.rs"));
+// intentionally empty — module body lives in src/task.rs (see lib.rs)

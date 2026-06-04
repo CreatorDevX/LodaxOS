@@ -8,31 +8,44 @@
 - **Panic strategy**: Abort
 - **Entry**: `chain/src/main.rs` `#[entry] fn main()` → chains to `boot/src/main.rs` → ELF-loaded `kernel/src/main.rs` `_start(boot_info)`
 
+## Deferred Work (DO NOT IMPLEMENT YET)
+- **IPC** (inter-process communication): ExRun is loaded as a separate ring-0
+  process with its own PML4 and a single shared mailbox page, but the IPC
+  protocol (mailbox message format, IPI wake-up, reply wait) is **deferred**.
+  For v1, the mailbox page is allocated and mapped in both PML4s, but the
+  kernel does **not** read or write it. Cap checks are static-only (cap bit
+  + early-init bypass). ExRun's `_start` is a HLT stub. When IPC is
+  implemented: define `CapRequest`/`CapResponse` in `shared::ipc::Mailbox`,
+  wire `cap::ask_policy` to write the request and spin on `response_ready`,
+  set up an IPI or scheduler wake from kernel to ExRun. **No mailbox I/O in
+  v1.** Tracked for Phase 6.
+- **Ring 3 + syscalls**: deferred (see `task.md`).
+- **CFS/EEVDF scheduler**: **implemented** (v1: single-CPU, min-vruntime, `VRUNTIME_TICK = 20` per 1 ms tick, new-task startup bias). See `src/task.rs`.
+
 ## Build State
-All crates compile. `disk.img` can be built with `create_disk_image.py` (requires WSL for ext4). QEMU boot not yet re-verified with latest ESP handoff changes.
+All 6 crates compile cleanly. `disk.img` can be built with `create_disk_image.py` (requires WSL for ext4). QEMU boot not yet re-verified with latest ESP handoff changes.
 
 ## Workspace Structure
 | Crate | Target | Role |
 |---|---|---|
-| `system/` (lodaxos-system) | library | Pure type defs: `BootInfo`, `FramebufferInfo`, `MemoryRegion`, `BOOT_INFO_HANDOFF_ADDR` |
-| `shared/` (lodaxos-core) | library | Re-exports canonical `src/` implementations (`include!` for `task.rs`, wrappers for others) |
+| `system/` (lodaxos-system) | library | Pure type defs: `BootInfo`, `FramebufferInfo`, `MemoryRegion`, `BOOT_INFO_HANDOFF_ADDR`, `MAX_CPUS` |
+| `shared/` (lodaxos-core) | library | Re-exports canonical `src/` implementations via `#[path]` shims |
 | `chain/` (lodaxos-chain) | `x86_64-unknown-uefi` | First-stage chainloader → `EFI/BOOT/BOOTX64.EFI` |
 | `boot/` (lodaxos-boot) | `x86_64-unknown-uefi` | Second-stage bootloader → `Bootloader.efi` |
 | `kernel/` (lodaxos-kernel) | `kernel/target.json` (custom) | Bare-metal kernel → `kernel.elf` |
-| `sr/` (lodaxos-sr) | `sr/target.json` (custom) | Secure Runtime stub → `sr.elf` (loaded, never jumped to) |
+| `exrun/` (lodaxos-exrun) | `exrun/target.json` (custom) | Executive Runtime (ring-0 policy stub) → `exrun.elf` |
 
 ## Boot Chain
 1. **OVMF** loads `ESP/EFI/BOOT/BOOTX64.EFI` (chainloader)
 2. **Chainloader**: dynamically allocates BootInfo via `Box::new(BootInfo)`, stores pointer at `0x1000`, collects memory map & framebuffer, reads `Bootloader.efi` from ESP root, calls `load_image`/`start_image`
 3. **Bootloader**: refines GOP, re-collects memory map, loads `kernel.elf` from ext4 partition via self-contained ext4 parser, captures RSDP from UEFI config table, exits boot services, loads ELF segments, jumps to kernel with `BootInfo*` in RDI
-4. **Kernel**: serial → logger → framebuffer → physical allocator (buddy, reserves BootInfo page) → ACPI/MADT → page tables (4-level, higher-half `0xFFFF_8000_0000_0000`) → heap (SLUB slab) → kernel VMA tree → load `sr.elf` into staging buffer → cli + mask PIC → LAPIC MMIO → IOAPIC → GDT/TSS → IDT (256 vectors) → task scheduler (CFS) → install IOAPIC routes (masked) → LAPIC enable + timer calibration → PIT periodic → sti → idle hlt loop
+4. **Kernel**: serial → logger → framebuffer → physical allocator (buddy, reserves BootInfo page) → ACPI/MADT → page tables (4-level, higher-half `0xFFFF_8000_0000_0000`) → heap (SLUB slab) → kernel VMA tree → load `exrun.elf` into staging buffer (parse ELF segments, fork PML4, map shared 4 KiB mailbox, create ExRun task) → cli + mask PIC → LAPIC MMIO → IOAPIC → GDT/TSS → IDT (256 vectors, syscall vector 0x80) → task scheduler (CFS) → install IOAPIC routes (masked) → LAPIC enable + timer calibration → PIT periodic → release APs → sti → idle hlt loop
 
 ## Disk Image (`create_disk_image.py`)
 - **Size**: 600 MB GPT disk
-- **Partition 0** (ext4, 512 MB): `Bootloader.efi` + `kernel.elf` + `sr.elf`
+- **Partition 0** (ext4, 512 MB): `Bootloader.efi` + `kernel.elf` + `exrun.elf`
 - **Partition 1** (FAT32 ESP, 64 MB): `EFI/BOOT/BOOTX64.EFI` (chainloader)
 - Uses WSL + `mke2fs -d` for ext4; Python minimal FAT32 creator for ESP (no mtools available)
-- ESP root also carries legacy copies of `Bootloader.efi` + `kernel.elf` for temporary boot test
 
 ## Key Source Files (`src/` — canonical implementations)
 
@@ -49,7 +62,7 @@ All crates compile. `disk.img` can be built with `create_disk_image.py` (require
 - **`vma.rs`**: 4-level radix tree (8 KB nodes, levels 0=bits 21:12 .. 3=bits 51:42) with kernel heap VMA and demand-paged #PF resolution
 
 ### ACPI (`src/acpi/`)
-- **`mod.rs`**: RSDP discovery (`find_rsdp(hint)` prefers `BootInfo.rsdp_addr`, falls back to EBDA → BIOS ROM → OVMF), XSDT/RSDT parsing, table checksum validation. Only `XSDT_SIG` and `MADT_SIG` are declared.
+- **`mod.rs`**: RSDP discovery (`find_rsdp()` — scans EBDA → BIOS ROM → OVMF; signature `RSDP_SIG`), XSDT/RSDT parsing (signatures `XSDT_SIG`, `FADT_SIG`, `MCFG_SIG`, `MADT_SIG`), table checksum validation. `init(rsdp_addr: Option<u64>) -> Option<AcpiContext>` is graceful (returns `None` + logs if RSDP not found).
 - **`madt.rs`**: MADT parser — CPUs, IOAPICs, ISOs, NMI, APIC addr override, GSI → IOAPIC lookup
 
 ### Interrupt Routing (`src/intr/`)
@@ -75,16 +88,16 @@ All crates compile. `disk.img` can be built with `create_disk_image.py` (require
 | `lodaxos-chain` | `uefi 0.37`, `lodaxos-system`, `log 0.4` |
 | `lodaxos-boot` | `uefi 0.37`, `lodaxos-core`, `lodaxos-system`, `log 0.4` |
 | `lodaxos-kernel` | `lodaxos-core`, `lodaxos-system`, `log 0.4` |
-| `lodaxos-sr` | `lodaxos-system` |
+| `lodaxos-exrun` | `lodaxos-system` |
 
 ## Build Commands
-- `build.bat` — builds all 6 crates, copies kernel + SR ELF to root
+- `build.bat` — builds all 6 crates, copies kernel + ExRun ELF to root
 - `run.bat` — QEMU with OVMF (WHPX accel, 512 MB, 2 cores)
 - `create_disk_image.py` — builds GPT disk image via WSL
 - `clean.bat` — cargo clean
 
 ## Architecture Vision (`idea.md`)
-Microkernel design: Kernel (Ring 0) → Secure Runtime (service manager, policy engine) → PyI (JIT Python/WASM userspace) → Apps. Agent-based security, full REPL system, emergency mode with 7 commands, layered recovery (app → PyI → Agent → SR → kernel). Driver services (not kernel modules) for devices.
+Microkernel design: Kernel (Ring 0) → Executive Runtime (service manager, policy engine) → PyI (JIT Python/WASM userspace) → Apps. Agent-based security, full REPL system, emergency mode with 7 commands, layered recovery (app → PyI → Agent → ExRun → kernel). Driver services (not kernel modules) for devices.
 
 ## Remaining Work
 - [ ] PS/2 controller initialization + full keyboard driver

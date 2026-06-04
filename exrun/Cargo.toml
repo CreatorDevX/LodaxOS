@@ -1,7 +1,8 @@
 [package]
-name = "lodaxos-sr"
+name = "lodaxos-exrun"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 lodaxos-system = { path = "../system" }
+log = "0.4"

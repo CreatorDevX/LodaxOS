@@ -1,5 +1,7 @@
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use lodaxos_system::{CapOp, Caps};
+use crate::cap;
 
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -288,6 +290,14 @@ pub fn alloc_order(order: usize) -> Option<u64> {
     if order > MAX_ORDER {
         return None;
     }
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        Caps::CAP_MM_ALLOC,
+        CapOp::MmAlloc { frames: 1 << order },
+    ) {
+        log::warn!("phys::alloc_order: cap denied: {:?}", e);
+        return None;
+    }
 
     LOCK.lock();
     let result = {
@@ -322,6 +332,14 @@ pub fn free_order(addr: u64, order: usize) {
         return;
     }
     if is_reserved_page(addr / PAGE_SIZE) {
+        return;
+    }
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        Caps::CAP_MM_ALLOC,
+        CapOp::MmAlloc { frames: 1 << order },
+    ) {
+        log::warn!("phys::free_order: cap denied: {:?}", e);
         return;
     }
 

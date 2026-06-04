@@ -1,5 +1,5 @@
 [workspace]
-members = ["system", "shared", "chain", "boot", "kernel", "sr"]
+members = ["system", "shared", "chain", "boot", "kernel", "exrun"]
 resolver = "2"
 
 [profile.dev]

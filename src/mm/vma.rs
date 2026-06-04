@@ -319,6 +319,9 @@ pub fn init_kernel_vmas() {
 }
 
 pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
+    use lodaxos_system::{CapOp, Caps};
+    use crate::cap;
+
     let _is_write = error_code & (1 << 1) != 0;
     let is_user = error_code & (1 << 2) != 0;
     let is_present = error_code & 1 != 0;
@@ -335,6 +338,14 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
     }
 
     // Kernel-mode fault — check kernel VMA tree
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        if fault_addr >= 0xFFFF_8000_0000_0000 { Caps::CAP_MM_MAP_KERNEL } else { Caps::CAP_MM_MAP },
+        CapOp::MmMap { vaddr: fault_addr, paddr: 0, flags: 0, kernel_half: fault_addr >= 0xFFFF_8000_0000_0000 },
+    ) {
+        log::warn!("vma::handle_page_fault: cap denied: {:?}", e);
+        return false;
+    }
     let result = unsafe {
         (*kernel_vma_ptr()).find_covering(fault_addr)
     };

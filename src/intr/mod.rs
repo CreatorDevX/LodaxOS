@@ -2,9 +2,11 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use lodaxos_system::{CapOp, Caps};
 
 use crate::acpi::madt::{self, MadtInfo};
 use crate::arch::ioapic;
+use crate::cap;
 
 // ---- Vector allocation ----
 // Vectors 32 = LAPIC timer, 33..63 = device IRQs via IOAPIC.
@@ -213,6 +215,14 @@ pub fn lookup_vector_isa(vector: u8) -> Option<u8> {
 
 /// Program an IOAPIC entry for a route (still masked by default).
 pub fn install_route(route: &IrqRoute) {
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        Caps::CAP_INTR_INSTALL,
+        CapOp::IntrInstall { vector: route.vector },
+    ) {
+        log::warn!("intr::install_route: cap denied: {:?}", e);
+        return;
+    }
     if let Some(ioapic) = ioapic::get(route.ioapic_index) {
         let low = ioapic::IoApic::make_redir_low(route.vector, route.flags, true);
         let high = ioapic::IoApic::make_redir_high(0); // BSP APIC ID = 0

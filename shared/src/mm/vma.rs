@@ -1,1 +1,1 @@
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/mm/vma.rs"));
+// intentionally empty — module body lives in src/mm/vma.rs (see mod.rs)

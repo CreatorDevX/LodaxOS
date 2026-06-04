@@ -21,6 +21,15 @@ const ELFCLASS64: u8 = 2;
 const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
 
+/// Maximum physical address the bootloader is willing to place a
+/// `PT_LOAD` segment at. The bootloader runs in UEFI with the
+/// identity map active, so segments must land in the first 4 GiB of
+/// physical memory. 128 MiB is more than enough for the current
+/// debug kernel (linked at 0x100000) but leaves plenty of room
+/// below for the bootloader itself, the staging buffer, and any
+/// UEFI allocations. Increase if the kernel image grows.
+const KERNEL_LOAD_PHYS_LIMIT: u64 = 0x0800_0000; // 128 MiB
+
 const E_IDENT: usize = 0;
 const E_TYPE: usize = 16;
 const E_ENTRY: usize = 24;
@@ -97,8 +106,12 @@ pub fn load_elf(data: &[u8]) -> Option<u64> {
             i, paddr, vaddr, filesz, memsz, flags
         );
 
-        if paddr as usize + memsz > 0x800_0000 {
-            log::error!("ELF: segment at {:#x} exceeds 2 GB limit", paddr);
+        if paddr + memsz as u64 > KERNEL_LOAD_PHYS_LIMIT {
+            log::error!(
+                "ELF: segment at {:#x} (end {:#x}) exceeds physical load limit {:#x} ({} MiB)",
+                paddr, paddr + memsz as u64, KERNEL_LOAD_PHYS_LIMIT,
+                KERNEL_LOAD_PHYS_LIMIT / (1024 * 1024)
+            );
             return None;
         }
 
@@ -836,6 +849,6 @@ pub fn load_kernel_from_ext4() -> Option<Vec<u8>> {
     load_file_from_ext4(b"kernel.elf")
 }
 
-pub fn load_sr_from_ext4() -> Option<Vec<u8>> {
-    load_file_from_ext4(b"sr.elf")
+pub fn load_exrun_from_ext4() -> Option<Vec<u8>> {
+    load_file_from_ext4(b"exrun.elf")
 }

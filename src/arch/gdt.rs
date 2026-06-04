@@ -161,6 +161,12 @@ static mut GDT_PTR: GdtPtr = GdtPtr {
     base: 0,
 };
 
+/// Return the higher-half virtual address of the GDT pointer. Used by
+/// the SMP bring-up code to write `target_gdt_ptr` into each AP's ApArg.
+pub fn gdt_pointer_address() -> u64 {
+    &raw const GDT_PTR as u64
+}
+
 /// Write a single byte to COM1 for debug tracing.
 /// Returns false if the transmit buffer never becomes ready (timeout).
 #[inline(always)]
@@ -242,4 +248,18 @@ pub fn set_ist1(addr: u64) {
     unsafe {
         TSS.ist1 = addr;
     }
+}
+
+/// Update TSS.rsp0 to the top of the current task's kernel stack.
+/// Called by the scheduler on every context switch so that ring-0
+/// interrupts taken while the new task is running push their iretq
+/// frame onto the new task's kernel stack (not the 4 KiB boot
+/// `DUMMY_STACK`, which is only safe during the brief window before
+/// the scheduler is initialised).
+///
+/// # Safety
+/// Caller must be running with interrupts disabled (the update to
+/// the TSS is not atomic w.r.t. interrupt delivery).
+pub unsafe fn tss_set_rsp0(rsp0: u64) {
+    TSS.rsp0 = rsp0;
 }

@@ -133,8 +133,15 @@ Blocking task 0 is explicitly refused by `block_current` (logged as an error) �
 4. Dispatcher calls `irq_handler(frame, 32)`
 5. `irq_handler`:
    a. Sends EOI to LAPIC
-   b. Increments global tick counter (`TICKS.fetch_add(1, Relaxed)`)
-   c. Calls `task::schedule(frame)`
+   b. Increments the global tick counter via `crate::percpu::tick()`
+      (which funnels into `arch::idt::tick()` — a single source of
+      truth shared by BSP and AP idle logs and the `get_ticks`
+      syscall 4)
+   c. If this is the BSP and the task manager is initialised,
+      calls `task::schedule(frame)`; the return path restores the
+      next task's full GPR set (rdi, rsi, rbp, rbx, r12–r15) and
+      uses `popfq + retfq` (not `iretq`) to avoid CS-descriptor
+      checks rejecting the synthetic 0x08 selector. See audit S2.
 
 ### Schedule Algorithm (CFS)
 
@@ -146,16 +153,28 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
     let cur = current;
     tasks[cur].saved_frame = *frame;
     tasks[cur].saved_frame.rsp = frame_addr + 0xA0;  // correct RSP
-    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
 
     // 2. Find the next ready task with the smallest vruntime.
     let next = pick_next_ready(&*m, cur);
 
-    // 3. If no other ready task exists, leave the current task in place.
+    // 3. If no other ready task exists, leave the current task in place
+    //    (vruntime is NOT advanced — see audit A5).
     if next == cur { return false; }
 
-    // 4. Restore next task's state and switch to it.
+    // 4. Advance the current task's vruntime only when we actually
+    //    switch away. Updating it before the pick used to double-credit
+    //    the current task on every no-switch tick.
+    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
+
+    // 5. Restore next task's state and switch to it. Update TSS.RSP0
+    //    to the next task's kernel stack top (S1) so ring-0 IRQs
+    //    taken while the new task is running push their iretq frame
+    //    onto the new task's stack, not the 4 KiB boot DUMMY_STACK.
     *frame = tasks[next].saved_frame;
+    let next_stack_top = tasks[next].kernel_stack_top;
+    if next_stack_top != 0 {
+        crate::arch::gdt::tss_set_rsp0(next_stack_top);
+    }
     current = next;
     true
 }

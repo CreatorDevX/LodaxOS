@@ -1,6 +1,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
+use lodaxos_system::{CapOp, Caps};
 
 use super::phys;
+use crate::cap;
 
 const PAGE_SIZE: u64 = 0x1000;
 
@@ -31,7 +33,14 @@ fn phys_to_virtual(phys: u64) -> *mut PageTable {
     (HIGHER_HALF + phys) as *mut PageTable
 }
 
-fn ensure_table(entry: &mut u64, flags: u64) -> u64 {
+/// Ensure `entry` points to a page table. Returns the physical address of
+/// the table. If the entry is a huge page (PS bit set), splits it into
+/// sub-entries so the caller can create finer-grained mappings.
+///
+/// `level` is the PML4 walk depth: 3=PML4, 2=PDP, 1=PD, 0=PT.
+/// - level 2: 1GB huge page → split into 512 × 2MB entries (PS set).
+/// - level 1: 2MB huge page → split into 512 × 4KB entries (PS clear).
+fn ensure_table(entry: &mut u64, flags: u64, level: usize) -> u64 {
     if *entry & PRESENT == 0 {
         let page = phys::alloc_page().expect("out of memory for page tables");
         let virt = phys_to_virtual(page);
@@ -40,6 +49,48 @@ fn ensure_table(entry: &mut u64, flags: u64) -> u64 {
         }
         *entry = page | flags | PRESENT;
     }
+
+    // Split huge pages so the caller can map at a finer granularity.
+    if *entry & (1 << 7) != 0 {
+        let orig_flags = *entry & !(PRESENT | (1 << 7)); // strip present + PS
+
+        let new_page = phys::alloc_page().expect("out of memory for page table split");
+        let new_table = phys_to_virtual(new_page);
+        unsafe { (*new_table) = PageTable::new_zeroed(); }
+
+        match level {
+            2 => {
+                // 1 GB → 512 × 2 MB entries (each with PS bit set).
+                let base = *entry & 0x000F_FFFF_FFC0_0000; // 1 GB aligned
+                for i in 0..512usize {
+                    let entry_phys = base + (i as u64) * 0x20_0000;
+                    unsafe {
+                        (*new_table).0[i] = entry_phys | orig_flags | (1 << 7);
+                    }
+                }
+            }
+            1 => {
+                // 2 MB → 512 × 4 KB entries (PS clear, normal PT entries).
+                let base = *entry & 0x000F_FFFF_FFFF_0000; // 2 MB aligned
+                for i in 0..512usize {
+                    let entry_phys = base + (i as u64) * 0x1000;
+                    unsafe {
+                        (*new_table).0[i] = entry_phys | orig_flags;
+                    }
+                }
+            }
+            _ => {
+                panic!(
+                    "ensure_table: huge page at unexpected level {} (entry={:#x})",
+                    level, *entry
+                );
+            }
+        }
+
+        // Point the parent entry to the new table (preserve caller's flags).
+        *entry = new_page | flags | PRESENT;
+    }
+
     *entry & !0xFFF
 }
 
@@ -198,13 +249,15 @@ fn map_page(pml4: *mut PageTable, virt: u64, phys: u64, flags: u64) {
     let pd_idx = index_for_addr(virt, 1);
     let pt_idx = index_for_addr(virt, 0);
 
-    let pdp_phys = ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE);
+    // Level 2: PDP→PD — may hit 1 GB huge pages (from identity map).
+    let pdp_phys = ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE, 2);
     let pdp = phys_to_virtual(pdp_phys);
 
-    let pd_phys = ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE);
+    // Level 1: PD→PT — may hit 2 MB huge pages (from identity map).
+    let pd_phys = ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE, 1);
     let pd = phys_to_virtual(pd_phys);
 
-    let pt_phys = ensure_table(unsafe { &mut (*pd).0[pd_idx] }, WRITABLE);
+    let pt_phys = ensure_table(unsafe { &mut (*pd).0[pd_idx] }, WRITABLE, 0);
     let pt = phys_to_virtual(pt_phys);
 
     unsafe {
@@ -266,6 +319,14 @@ pub fn unmap(virt: u64) {
     if !PT_INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        if virt >= HIGHER_HALF { Caps::CAP_MM_MAP_KERNEL } else { Caps::CAP_MM_MAP },
+        CapOp::MmUnmap { vaddr: virt },
+    ) {
+        log::warn!("virt::unmap: cap denied: {:?}", e);
+        return;
+    }
 
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
@@ -316,6 +377,94 @@ pub fn pml4_address() -> u64 {
     cr3 & !0xFFF
 }
 
+/// Switch the active PML4 (write CR3). The new PML4 must already be
+/// populated — this only updates the hardware register. The caller
+/// is responsible for ensuring the new PML4 maps everything the new
+/// context will need (kernel code, IDT handler code, stack, etc.).
+#[inline]
+pub fn switch_pml4(pml4_phys: u64) {
+    // Memory fence: ensure all prior stores to the new PML4's page
+    // tables are visible before CR3 is loaded.
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+        core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack, preserves_flags));
+    }
+}
+
+// ---- PML4 deep-copy (for per-task address spaces) ----
+
+/// Recursive helper: deep-copy a 4-level page table subtree.
+/// `src_phys` is the physical address of the source table (PML4, PDP, PD, or PT).
+/// `level` is 3 (PML4), 2 (PDP), 1 (PD), or 0 (PT).
+/// Returns the physical address of the new copy, or `None` on OOM.
+fn copy_table_recursive(src_phys: u64, level: usize) -> Option<u64> {
+    let src = src_phys as *const PageTable;
+    let new_phys = phys::alloc_page()?;
+    let new = new_phys as *mut PageTable;
+    unsafe {
+        (*new) = PageTable::new_zeroed();
+    }
+    for i in 0..512usize {
+        let entry = unsafe { (*src).0[i] };
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        if level == 0 {
+            // PT level — entries are leaves, just copy.
+            unsafe { (*new).0[i] = entry };
+        } else if entry & (1 << 7) != 0 {
+            // 1GB (level 2) or 2MB (level 1) huge page — leaf, just copy.
+            unsafe { (*new).0[i] = entry };
+        } else {
+            // Points to a sub-table — recurse.
+            let child_src = entry & !0xFFF;
+            let child_dst = copy_table_recursive(child_src, level - 1)?;
+            unsafe {
+                (*new).0[i] = child_dst | (entry & 0xFFF);
+            }
+        }
+    }
+    Some(new_phys)
+}
+
+/// Deep-copy a PML4 (the entire 4-level page-table hierarchy) and
+/// return the physical address of the new PML4. All page-table
+/// pages are freshly allocated from the physical allocator. The
+/// physical pages they point to (kernel code/data, MMIO, etc.) are
+/// **shared** with the source PML4 — only the table structure is
+/// copied. To map a new physical page in the new PML4, call
+/// `map_page_explicit` with the new PML4's physical address.
+///
+/// The caller can then modify the new PML4 (e.g. add ELF segments)
+/// without affecting the source. When the new PML4 is no longer
+/// needed, call `free_pml4`.
+pub fn fork_pml4(src_phys: u64) -> Option<u64> {
+    copy_table_recursive(src_phys, 3)
+}
+
+/// Free a PML4 and all its sub-tables. Does NOT free the physical
+/// pages the PML4 points to (those are owned by whoever mapped them).
+/// Only frees the page-table structure pages themselves.
+pub fn free_pml4(pml4_phys: u64) {
+    free_table_recursive(pml4_phys, 3);
+}
+
+fn free_table_recursive(table_phys: u64, level: usize) {
+    let table = table_phys as *const PageTable;
+    for i in 0..512usize {
+        let entry = unsafe { (*table).0[i] };
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        if level > 0 && entry & (1 << 7) == 0 {
+            // Points to a sub-table — recurse.
+            let child_phys = entry & !0xFFF;
+            free_table_recursive(child_phys, level - 1);
+        }
+    }
+    phys::free_page(table_phys);
+}
+
 /// Map `num_pages` physical pages (allocated individually) to a contiguous
 /// virtual range starting at `virt_start`. Returns the number of pages
 /// successfully mapped.
@@ -356,11 +505,11 @@ pub unsafe fn map_contiguous(
         let pdp_idx = index_for_addr(virt, 2);
         let pd_idx = index_for_addr(virt, 1);
 
-        let pdp_phys = ensure_table(&mut (*pml4).0[pml4_idx], WRITABLE);
+        let pdp_phys = ensure_table(&mut (*pml4).0[pml4_idx], WRITABLE, 2);
         let pdp = phys_to_virtual(pdp_phys);
-        let pd_phys = ensure_table(&mut (*pdp).0[pdp_idx], WRITABLE);
+        let pd_phys = ensure_table(&mut (*pdp).0[pdp_idx], WRITABLE, 1);
         let pd = phys_to_virtual(pd_phys);
-        let pt_phys = ensure_table(&mut (*pd).0[pd_idx], WRITABLE);
+        let pt_phys = ensure_table(&mut (*pd).0[pd_idx], WRITABLE, 0);
         let pt = phys_to_virtual(pt_phys);
 
         for i in 0..batch {
@@ -400,6 +549,14 @@ pub fn map_region_higher_half(pml4_phys: u64, phys_start: u64, size: u64, flags:
 
 /// Explicitly map a single 4KB page (public wrapper).
 pub fn map_page_explicit(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
+    if let Err(e) = cap::check_and_authorize(
+        cap::current_subject(),
+        if virt >= HIGHER_HALF { Caps::CAP_MM_MAP_KERNEL } else { Caps::CAP_MM_MAP },
+        CapOp::MmMap { vaddr: virt, paddr: phys, flags: flags as u32, kernel_half: virt >= HIGHER_HALF },
+    ) {
+        log::warn!("virt::map_page_explicit: cap denied: {:?}", e);
+        return;
+    }
     let pml4 = phys_to_virtual(pml4_phys);
     map_page(pml4, virt, phys, flags);
 }

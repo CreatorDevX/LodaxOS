@@ -292,6 +292,12 @@ static mut IDTR: Idtr = Idtr {
     base: 0,
 };
 
+/// Return the higher-half virtual address of the IDT pointer. Used by
+/// the SMP bring-up code to write `target_idt_ptr` into each AP's ApArg.
+pub fn idt_pointer_address() -> u64 {
+    &raw const IDTR as u64
+}
+
 // ---- IST1 stack for double faults ----
 
 #[repr(C, align(16))]
@@ -306,9 +312,19 @@ static PIT_TICKS: AtomicU64 = AtomicU64::new(0);
 static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEY_SCANCODE: AtomicU16 = AtomicU16::new(0);
 
+/// Debug counter for verifying the timer ISR fires after context switches.
+static TIMER_FIRED_ON_BSP: AtomicU64 = AtomicU64::new(0);
+
 /// Read the current LAPIC timer tick count (safe from any context).
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Increment the LAPIC timer tick counter. Returns the new value.
+/// Used by the per-CPU wrapper in `src/percpu.rs` to funnel all
+/// increments through this single source of truth.
+pub fn tick() -> u64 {
+    TICKS.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Read the current PIT interrupt count (safe from any context).
@@ -543,40 +559,76 @@ fn exception_handler(frame: &mut TrapFrame, vector: u64) {
 // ---- IRQ handler (called from interrupt_dispatcher) ----
 
 fn irq_handler(frame: &mut TrapFrame, vector: u64) {
+    // RAW COM1 write: prove ISR is entered at all after context switch.
+    // Wait for THR empty so the byte is not lost to UART FIFO contention
+    // when the serial driver (log::info!) is mid-write.
+    unsafe {
+        // Wait for THR empty (bit 5 of LSR at 0x3FD)
+        loop {
+            let status: u8;
+            core::arch::asm!("in al, dx", in("dx") 0x3FDu16, out("al") status, options(nomem, nostack));
+            if status & 0x20 != 0 { break; }
+        }
+        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b'I', options(nomem, nostack));
+    }
+
     if super::apic::is_initialized() {
         super::apic::send_eoi();
     }
 
     match vector {
-        32 => {
+            32 => {
             // LAPIC timer — scheduler heartbeat
-            TICKS.fetch_add(1, Ordering::Relaxed);
+            let t = crate::percpu::tick();
+            // Debug: verify timer fires after context switches
+            let bsp_fires = TIMER_FIRED_ON_BSP.fetch_add(1, Ordering::Relaxed) + 1;
+            log::info!(
+                "[timer] tick #{} (percpu_tick={})",
+                bsp_fires, t
+            );
 
-            // Preemptive context switch
-            if crate::task::is_initialized() {
+            // Preemptive context switch — only the BSP runs the
+            // scheduler. APs run a per-CPU idle loop and don't have
+            // their own task table state.
+            if crate::task::is_initialized() && super::apic::is_bsp() {
                 if crate::task::schedule(frame) {
                     let new_rsp = frame.rsp;
                     let rip = frame.rip;
-                    let cs = frame.cs;
-                    let rflags = frame.rflags;
                     log::info!("sched: switch RSP={:#x} RIP={:#x}", new_rsp, rip);
                     unsafe {
-                        // Use popfq + retfq instead of iretq to avoid the strict
-                        // CS-descriptor checks that iretq enforces (canonicality,
-                        // DPL vs current CPL, etc.) — these checks sometimes reject
-                        // a perfectly valid 0x08 selector when reached via synthetic
-                        // frame on a different privilege-level path.
+                        // WHPX mishandles both popfq at CPL=0 (clears IF
+                        // after emulation) and iretq with CS=0x08 (#GP
+                        // err=0x8).  Work around both by using sti + ret:
+                        //
+                        //   1. Switch to the new task's stack + restore GPRs.
+                        //   2. sti sets IF=1 (interrupt gates enter with
+                        //      IF=0, so this is always correct).
+                        //   3. A near ret jumps to the task's RIP — CS
+                        //      stays 0x08, no far transfer that could
+                        //      trigger WHPX bugs.
                         core::arch::asm!(
                             "mov rsp, {rsp}",
-                            "push {cs}",
+                            "mov r15, {r15}",
+                            "mov r14, {r14}",
+                            "mov r13, {r13}",
+                            "mov r12, {r12}",
+                            "mov rbx, {rbx}",
+                            "mov rbp, {rbp}",
+                            "mov rsi, {rsi}",
+                            "mov rdi, {rdi}",
+                            "sti",
                             "push {rip}",
-                            "push {rflags}",
-                            "popfq",
-                            "retfq",
+                            "ret",
                             rsp = in(reg) new_rsp,
                             rip = in(reg) rip,
-                            cs = in(reg) cs,
-                            rflags = in(reg) rflags,
+                            r15 = in(reg) frame.r15,
+                            r14 = in(reg) frame.r14,
+                            r13 = in(reg) frame.r13,
+                            r12 = in(reg) frame.r12,
+                            rbx = in(reg) frame.rbx,
+                            rbp = in(reg) frame.rbp,
+                            rsi = in(reg) frame.rsi,
+                            rdi = in(reg) frame.rdi,
                             options(noreturn)
                         );
                     }

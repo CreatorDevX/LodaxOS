@@ -1,2 +1,2 @@
 @echo off
-build.bat && python create_disk_image.py && run.bat
+cls && build.bat && python create_disk_image.py && run.bat

@@ -15,7 +15,7 @@
     "relocation-model": "static",
     "pre-link-args": {
         "ld.lld": [
-            "-Tsr/linker.ld",
+            "-Texrun/linker.ld",
             "--gc-sections"
         ]
     }

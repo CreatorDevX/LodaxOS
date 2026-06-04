@@ -2,11 +2,8 @@ target/*
 memsave.md
 *.log
 *.img
-kernel.elf
-sr.elf
-serial_out.txt
-serial_output.txt
-qemu_log.txt
+*.elf
+*.txt
 efi/*
 esp/*
 *.pyc

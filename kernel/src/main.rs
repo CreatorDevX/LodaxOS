@@ -7,13 +7,18 @@ extern crate alloc;
 
 mod acpi;
 mod arch;
+mod exec;
 mod font;
 mod intr;
 mod logger;
 mod mm;
 mod serial;
-mod sr_loader;
 mod task;
+
+#[path = "../../src/ap_start.rs"]
+mod ap_start;
+#[path = "../../src/percpu.rs"]
+mod percpu;
 
 use lodaxos_system::BootInfo;
 
@@ -239,10 +244,6 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fb.write_str_centered("Kernel VMAs...", 110, 0, 255, 0);
     mm::vma::init_kernel_vmas();
 
-    log::debug!("Loading Secure Runtime ELF");
-    fb.write_str_centered("Secure Runtime...", 130, 0, 255, 0);
-    sr_loader::load_sr(&info);
-
     // Disable interrupts — UEFI may have left PIT/HPET active
     unsafe { core::arch::asm!("cli") };
 
@@ -295,7 +296,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     y += line_h;
     fb.write_str("[x] Kernel VMA tree (demand paging)", 20, y, 0, 255, 0);
     y += line_h;
-    fb.write_str("[x] Secure Runtime loaded", 20, y, 0, 255, 0);
+    fb.write_str("[x] Executive Runtime loaded", 20, y, 0, 255, 0);
     y += line_h;
 
     fb.write_str("[x] LAPIC MMIO mapped", 20, y, 0, 255, 0);
@@ -335,6 +336,25 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     log::info!("Task system ready — {} tasks registered", task::task_count());
 
+    // Spawn Executive Runtime as a separate ring-0 process. Must be
+    // AFTER task::init_main_task() so the task table is initialised
+    // and the scheduler can find a slot. exec::load forks the kernel's
+    // PML4, maps the ExRun ELF + mailbox into the new PML4, and
+    // registers a Task. The next schedule() will time-slice it.
+    log::info!("Spawning Executive Runtime as separate ring-0 process");
+    fb.write_str("[ ] Executive Runtime...", 20, y, 180, 180, 180);
+    match exec::load(&info) {
+        Some(task_id) => {
+            log::info!("ExRun: spawned as task {} (own PML4, shared mailbox)", task_id);
+            fb.write_str("[x] Executive Runtime (separate PML4)", 20, y, 0, 255, 0);
+        }
+        None => {
+            log::warn!("ExRun: not spawned (no image or cap denied)");
+            fb.write_str("[!] Executive Runtime not spawned", 20, y, 255, 200, 0);
+        }
+    }
+    y += line_h;
+
     if ioapic_count > 0 {
         let routes = intr::install_all_masked();
         log::info!("IOAPIC: {} routes installed (masked)", routes);
@@ -352,6 +372,20 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     arch::apic::set_timer_count(1);
 
     arch::apic::pit_enable_periodic(100);
+
+    // Mark the BSP online in the per-CPU table.
+    arch::apic::set_bsp_lapic_id(info.bsp_apic_id);
+    percpu::set_bsp_apic_id(info.bsp_apic_id);
+    percpu::mark_online(info.bsp_apic_id);
+
+    // Release APs brought up by the boot MP Services. Each AP will
+    // enter `ap_entry` and block on `kernel_ready`.
+    log::info!("SMP: releasing APs (ap_count={})", info.ap_count);
+    ap_start::release_aps(info);
+
+    // All CPUs (BSP + APs) may now enter the scheduler. APs are
+    // spinning on `kernel_ready` in `ap_entry`; this releases them.
+    percpu::release_all_aps();
 
     log::info!("Enabling interrupts");
     unsafe { core::arch::asm!("sti") };
@@ -409,6 +443,16 @@ unsafe fn simple_task1() {
     let mut counter = 0u64;
     loop {
         counter += 1;
+        if counter == 1_000_000 {
+            // Diagnostic: read LAPIC timer registers to check if timer is alive
+            const APIC_LVT_TIMER: usize = 0x320;
+            const APIC_TICR: usize = 0x380;
+            const APIC_CCR: usize = 0x390;
+            let lvt = arch::apic::read32(APIC_LVT_TIMER);
+            let ticr = arch::apic::read32(APIC_TICR);
+            let ccr = arch::apic::read32(APIC_CCR);
+            log::info!("[task1] LAPIC diag: LVT={:#x} TICR={} CCR={}", lvt, ticr, ccr);
+        }
         if counter % 500_000 == 0 {
             log::info!("[task1] counter={}", counter);
         }

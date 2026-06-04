@@ -1,6 +1,6 @@
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::mm::virt;
 
@@ -8,7 +8,7 @@ use crate::mm::virt;
 const IA32_APIC_BASE: u32 = 0x1B;
 
 /// LAPIC MMIO register offsets.
-const APIC_ID: usize = 0x20;
+pub const APIC_ID: usize = 0x20;
 const APIC_LVR: usize = 0x30;
 const APIC_TPR: usize = 0x80;
 const APIC_EOI: usize = 0xB0;
@@ -29,8 +29,9 @@ const APIC_LVT_PERIODIC: u32 = 1 << 17;
 /// LINT0/1 delivery mode: fixed, active-high, edge-triggered.
 const APIC_LVT_MASKED: u32 = 1 << 16;
 
-/// LAPIC ticks per millisecond (calibrated at runtime).
-static mut TICKS_PER_MS: u32 = 0;
+/// LAPIC ticks per millisecond (calibrated at runtime). Public so
+/// `ap_start` can re-use the BSP's calibration on each AP.
+pub static mut TICKS_PER_MS: u32 = 0;
 
 /// True once the LAPIC MMIO region is mapped and enabled.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -41,7 +42,8 @@ pub fn is_initialized() -> bool {
 }
 
 /// Cached higher-half virtual address of the LAPIC base.
-static mut LAPIC_BASE: u64 = 0;
+/// Exposed as `pub` so `percpu::current_apic_id` can read the LAPIC ID register.
+pub static mut LAPIC_BASE: u64 = 0;
 
 // ---- MSR helpers ----
 
@@ -61,13 +63,13 @@ unsafe fn read_msr(msr: u32) -> u64 {
 // ---- MMIO register access ----
 
 /// Read a 32-bit value from a LAPIC MMIO register.
-unsafe fn read32(offset: usize) -> u32 {
+pub unsafe fn read32(offset: usize) -> u32 {
     let addr = LAPIC_BASE + offset as u64;
     unsafe { (addr as *const u32).read_volatile() }
 }
 
 /// Write a 32-bit value to a LAPIC MMIO register.
-unsafe fn write32(offset: usize, val: u32) {
+pub unsafe fn write32(offset: usize, val: u32) {
     let addr = LAPIC_BASE + offset as u64;
     unsafe { (addr as *mut u32).write_volatile(val) }
 }
@@ -112,6 +114,37 @@ pub fn init_mmio() {
 
 /// LAPIC Error LVT register offset.
 const APIC_LVT_ERROR: usize = 0x370;
+
+/// BSP (Bootstrap Processor) LAPIC ID. Set by `set_bsp_lapic_id`
+/// during early init. The BSP is the CPU that boots first and runs
+/// the kernel's main idle loop; APs run a separate per-CPU idle loop
+/// and don't participate in the scheduler.
+static BSP_LAPIC_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Record the BSP's LAPIC ID. Must be called once during init,
+/// before the LAPIC timer ISR fires.
+pub fn set_bsp_lapic_id(apic_id: u32) {
+    BSP_LAPIC_ID.store(apic_id, Ordering::Release);
+}
+
+/// True if the current CPU is the BSP. Used by the LAPIC timer ISR
+/// to decide whether to run the scheduler (only the BSP runs tasks).
+/// If the BSP ID has not yet been set, assumes we're on the BSP
+/// (the only CPU at that point).
+pub fn is_bsp() -> bool {
+    let bsp = BSP_LAPIC_ID.load(Ordering::Acquire);
+    if bsp == u32::MAX {
+        return true;
+    }
+    let raw: u32 = unsafe { read32(APIC_ID) };
+    (raw >> 24) == bsp
+}
+
+/// Read the current LAPIC ID from the LAPIC ID register (offset 0x20).
+/// High byte is the LAPIC ID. The lower bytes are reserved.
+pub fn read_lapic_id() -> u32 {
+    unsafe { read32(APIC_ID) >> 24 }
+}
 
 /// Enable the LAPIC and mask LINT0/LINT1 (required in symmetric mode).
 ///
@@ -264,6 +297,20 @@ pub fn set_timer_count(ms: u32) {
         let count = TICKS_PER_MS * ms;
         write32(APIC_TICR, count);
         log::info!("LAPIC timer: initial count = {} ({} ms interval)", count, ms);
+    }
+}
+
+/// Per-AP timer setup. Each AP reprograms its own LAPIC timer to fire at
+/// the same 1 ms interval as the BSP, using the BSP's calibrated
+/// `TICKS_PER_MS`. The IDT is shared so the same vector 32 handler runs
+/// on every CPU; the handler reads `percpu::current_apic_id()` to know
+/// which CPU's tick counter to increment.
+pub fn ap_enable_timer(_apic_id: u32) {
+    unsafe {
+        let count = TICKS_PER_MS * 1; // 1 ms period
+        write32(APIC_LVT_TIMER, 32 | APIC_LVT_PERIODIC);
+        write32(APIC_TDCR, 0b0011); // divide by 16
+        write32(APIC_TICR, count);
     }
 }
 

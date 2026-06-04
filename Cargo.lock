@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lodaxos-exrun"
+version = "0.1.0"
+dependencies = [
+ "lodaxos-system",
+ "log",
+]
+
+[[package]]
 name = "lodaxos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -57,15 +65,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "lodaxos-sr"
-version = "0.1.0"
-dependencies = [
- "lodaxos-system",
-]
-
-[[package]]
 name = "lodaxos-system"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "log"
