@@ -38,6 +38,7 @@ const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Ehdr {
     e_ident:     [u8; 16],
     e_type:      u16,
@@ -56,6 +57,7 @@ struct Elf64Ehdr {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Phdr {
     p_type:   u32,
     p_flags:  u32,
@@ -69,11 +71,16 @@ struct Elf64Phdr {
 
 const KERNEL_STACK_PAGES: u64 = 4; // 16 KiB
 
+#[inline]
+unsafe fn read_unaligned<T: Copy>(base: *const u8, offset: usize) -> T {
+    ptr::read_unaligned(base.add(offset) as *const T)
+}
+
 /// Load an ELF64 image as a separate ring-0 process. The image is
 /// `&[u8]` of the raw ELF (PT_LOAD segments only — symbols are
 /// ignored). Returns the new task's id, or `None` on failure.
 pub fn load(boot_info: &BootInfo) -> Option<usize> {
-    use lodaxos_core::cap;
+    use crate::cap;
     use lodaxos_system::{CapOp, Caps};
 
     if boot_info.exrun_image_size == 0 || boot_info.exrun_image_addr == 0 {
@@ -91,18 +98,36 @@ pub fn load(boot_info: &BootInfo) -> Option<usize> {
 
     let image_ptr = boot_info.exrun_image_addr as *const u8;
     let image_size = boot_info.exrun_image_size as usize;
-    let image = unsafe { core::slice::from_raw_parts(image_ptr, image_size) };
+    if image_size < core::mem::size_of::<Elf64Ehdr>() {
+        log::error!("exec: ExRun image too small: {} bytes", image_size);
+        return None;
+    }
 
     // Check ELF magic.
-    let magic: u32 = u32::from_le_bytes(image[0..4].try_into().unwrap());
+    let magic: u32 = unsafe { read_unaligned(image_ptr, 0) };
     if magic != 0x464c457f {
         log::error!("exec: bad ELF magic {:#x}", magic);
         return None;
     }
 
-    let ehdr: &Elf64Ehdr = unsafe { &*(image.as_ptr() as *const Elf64Ehdr) };
+    let ehdr: Elf64Ehdr = unsafe { read_unaligned(image_ptr, 0) };
     if ehdr.e_machine != 0x3E {
         log::error!("exec: not x86-64 (e_machine={})", ehdr.e_machine);
+        return None;
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
+        log::error!("exec: bad phentsize {}", ehdr.e_phentsize);
+        return None;
+    }
+    let phdr_bytes = (ehdr.e_phnum as usize).saturating_mul(ehdr.e_phentsize as usize);
+    let phdr_end = (ehdr.e_phoff as usize).saturating_add(phdr_bytes);
+    if phdr_end > image_size {
+        log::error!(
+            "exec: program header table out of bounds: off={} bytes={} image={}",
+            ehdr.e_phoff,
+            phdr_bytes,
+            image_size
+        );
         return None;
     }
     log::info!(
@@ -131,10 +156,9 @@ pub fn load(boot_info: &BootInfo) -> Option<usize> {
     //    the kernel's PML4 — the process's code lives only in the
     //    forked PML4. (This is the architectural separation: the
     //    kernel cannot accidentally read the process's code/data.)
-    let phdr_base = image.as_ptr() as u64 + ehdr.e_phoff;
     for i in 0..ehdr.e_phnum {
-        let phdr = (phdr_base + (i as u64) * (ehdr.e_phentsize as u64)) as *const Elf64Phdr;
-        let phdr: &Elf64Phdr = unsafe { &*phdr };
+        let phdr_off = ehdr.e_phoff as usize + (i as usize) * (ehdr.e_phentsize as usize);
+        let phdr: Elf64Phdr = unsafe { read_unaligned(image_ptr, phdr_off) };
         if phdr.p_type != PT_LOAD {
             continue;
         }
@@ -145,6 +169,17 @@ pub fn load(boot_info: &BootInfo) -> Option<usize> {
         let flags = phdr.p_flags;
         if memsz == 0 {
             continue;
+        }
+        let file_end = (offset as usize).saturating_add(filesz as usize);
+        if file_end > image_size || filesz > memsz {
+            log::error!(
+                "exec: invalid PT_LOAD bounds offset={:#x} filesz={:#x} memsz={:#x} image={:#x}",
+                offset,
+                filesz,
+                memsz,
+                image_size
+            );
+            return None;
         }
         let pt_flags: u64 = if (flags & PF_W) != 0 {
             virt::DATA
@@ -186,7 +221,7 @@ pub fn load(boot_info: &BootInfo) -> Option<usize> {
             if copy_start < copy_end {
                 let src_offset = offset as usize + (copy_start - seg_start);
                 let dst_off = (copy_start - page_start) as isize;
-                let src = image.as_ptr().wrapping_add(src_offset);
+                let src = image_ptr.wrapping_add(src_offset);
                 unsafe {
                     ptr::copy_nonoverlapping(
                         src,

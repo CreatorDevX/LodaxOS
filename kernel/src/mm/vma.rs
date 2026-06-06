@@ -1,6 +1,8 @@
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::phys;
+use crate::sync::IrqSaveSpinLock;
 
 const PAGE_SHIFT: u64 = 12;
 
@@ -57,6 +59,9 @@ impl RadixNode {
 pub struct VmaTree {
     root: *mut RadixNode,
 }
+
+// Required for `IrqSaveSpinLock<VmaTree>` to be `Sync`.
+unsafe impl Send for VmaTree {}
 
 fn radix_shift(level: usize) -> u64 {
     PAGE_SHIFT + (level as u64) * RADIX_BITS
@@ -289,13 +294,24 @@ impl ProcessMemory {
 
 // ---- Global kernel VMA tree for demand paging ----
 
-fn kernel_vma_ptr() -> *mut VmaTree {
-    &raw mut KERNEL_VMA_TREE
+/// Synchronized kernel VMA tree.  All mutations go through
+/// `with_kernel_vma_tree()` which acquires the IRQ-safe lock.
+static KERNEL_VMA_TREE: IrqSaveSpinLock<VmaTree> = IrqSaveSpinLock::new(VmaTree::new_const());
+
+/// Single-shot gate for `init_kernel_vmas`.  Prevents re-entrancy.
+static KERNEL_VMA_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Run `f` with the kernel VMA tree locked.  The closure receives
+/// a mutable reference to the tree.
+pub fn with_kernel_vma_tree<R>(f: impl FnOnce(&mut VmaTree) -> R) -> R {
+    let mut guard = KERNEL_VMA_TREE.lock();
+    f(&mut *guard)
 }
 
-static mut KERNEL_VMA_TREE: VmaTree = VmaTree::new_const();
-
 pub fn init_kernel_vmas() {
+    if KERNEL_VMA_INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
     // The kernel heap is mapped at HIGHER_HALF.
     // Register it as a demand-paged VMA (covers entire 64MB heap range).
     let heap_virt_base: u64 = 0xFFFF_8080_0000_0000;
@@ -311,9 +327,10 @@ pub fn init_kernel_vmas() {
         ptr::write(p, vma);
         p
     };
-    unsafe {
-        (*kernel_vma_ptr()).insert(&mut *ptr);
-    }
+    with_kernel_vma_tree(|tree| {
+        tree.insert(unsafe { &mut *ptr });
+    });
+    KERNEL_VMA_INITIALIZED.store(true, Ordering::Release);
     log::info!("Kernel VMA tree initialized: heap {:#x}-{:#x}",
         heap_virt_base, heap_virt_base + heap_size);
 }
@@ -346,38 +363,35 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
         log::warn!("vma::handle_page_fault: cap denied: {:?}", e);
         return false;
     }
-    let result = unsafe {
-        (*kernel_vma_ptr()).find_covering(fault_addr)
-    };
 
-    match result {
-        Some(_vma) => {
-            let page_addr = fault_addr & !0xFFF;
-            let phys_page = match phys::alloc_page() {
-                Some(p) => p,
-                None => return false,
-            };
-            // Zero the freshly-allocated page so the kernel never sees
-            // stale (and possibly sensitive) physical-memory contents through
-            // a new VMA mapping.
-            unsafe {
-                core::ptr::write_bytes(phys_page as *mut u8, 0, phys::PAGE_SIZE as usize);
-                let cr3: u64;
-                core::arch::asm!("mov {}, cr3", out(reg) cr3);
-                super::virt::map_page_explicit(
-                    cr3 & !0xFFF,
-                    page_addr,
-                    phys_page,
-                    super::virt::DATA,
-                );
-                // Flush the TLB entry for this page — the MMU still caches
-                // the old "not present" state and would immediately re-#PF
-                // without this invlpg.
-                core::arch::asm!("invlpg [{}]", in(reg) page_addr);
-            }
-            log::trace!("Demand-paged: {:#x} -> {:#x}", page_addr, phys_page);
-            true
+    // Check the kernel VMA tree under the lock.
+    let found = with_kernel_vma_tree(|tree| {
+        tree.find_covering(fault_addr).is_some()
+    });
+
+    if found {
+        let page_addr = fault_addr & !0xFFF;
+        let phys_page = match phys::alloc_page() {
+            Some(p) => p,
+            None => return false,
+        };
+        // Zero the freshly-allocated page so the kernel never sees
+        // stale (and possibly sensitive) physical-memory contents through
+        // a new VMA mapping.
+        unsafe {
+            core::ptr::write_bytes(phys_page as *mut u8, 0, phys::PAGE_SIZE as usize);
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3);
+            super::virt::map_page_explicit(
+                cr3 & !0xFFF,
+                page_addr,
+                phys_page,
+                super::virt::DATA,
+            );
         }
-        None => false,
+        log::trace!("Demand-paged: {:#x} -> {:#x}", page_addr, phys_page);
+        true
+    } else {
+        false
     }
 }

@@ -40,6 +40,10 @@ pub struct BootInfo {
     pub max_cpus: u32,
     /// BSP LAPIC ID (always 0 on x86).
     pub bsp_apic_id: u32,
+    /// Physical address of the AP trampoline function (in bootloader memory).
+    /// The kernel must reserve this page so the buddy allocator does not
+    /// overwrite code that APs are currently executing.
+    pub ap_trampoline_phys: u64,
     /// Number of enabled application processors (APs) reported by UEFI MP Services.
     pub ap_count: u32,
     /// LAPIC ID of each AP, indexed 0..ap_count.

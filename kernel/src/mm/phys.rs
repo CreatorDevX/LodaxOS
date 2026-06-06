@@ -1,35 +1,14 @@
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lodaxos_system::{CapOp, Caps};
 use crate::cap;
+use crate::sync::IrqSaveSpinLock;
 
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_SIZE: u64 = 0x1000;
 
 const MAX_ORDER: usize = 10;
 const ORDER_COUNT: usize = MAX_ORDER + 1;
-
-struct SpinLock {
-    locked: AtomicBool,
-}
-
-impl SpinLock {
-    const fn new() -> Self {
-        Self { locked: AtomicBool::new(false) }
-    }
-
-    fn lock(&self) {
-        while self.locked.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed,
-        ).is_err() {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
 
 #[repr(C)]
 struct FreeBlock {
@@ -58,16 +37,20 @@ static mut ZONE: Zone = Zone {
     free_pages: AtomicUsize::new(0),
 };
 
-static LOCK: SpinLock = SpinLock::new();
+/// IRQ-safe spinlock guarding all buddy free-list operations. Held only for
+/// short critical sections (typical: a few linked-list mutations).
+static LOCK: IrqSaveSpinLock<()> = IrqSaveSpinLock::new(());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 const BOOTINFO_HANDOFF_PAGE: u64 = 0x1000;
 
-/// Physical base of the dynamically-allocated BootInfo struct.  Set by
-/// `init_from_regions`; checked by `is_reserved_page` to prevent double-free
-/// of the BootInfo page(s) the caller did not include in its free-memory list.
-static mut BOOTINFO_RESERVED_BASE: u64 = 0;
-static mut BOOTINFO_RESERVED_PAGES: u64 = 0;
+/// Physical base (page number, not address) of the dynamically-allocated
+/// BootInfo struct. Set once by `init_from_regions` and read by
+/// `is_reserved_page` to prevent double-free. Atomic so the read is
+/// race-free with the init write.
+static BOOTINFO_RESERVED_PN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Number of pages reserved for BootInfo. Set once by `init_from_regions`.
+static BOOTINFO_RESERVED_PAGES: AtomicU64 = AtomicU64::new(0);
 
 fn block_size(order: usize) -> u64 {
     (1u64 << order) * PAGE_SIZE
@@ -77,22 +60,39 @@ fn max_order_for_pages(page_count: u64) -> usize {
     if page_count == 0 {
         return 0;
     }
-    page_count.ilog2().min(MAX_ORDER as u32) as usize
+    let leading = page_count.leading_zeros() as u64;
+    let floor_pow2 = 1u64 << (63 - leading);
+    let order = if floor_pow2 == page_count {
+        63 - leading
+    } else {
+        63 - leading - 1
+    };
+    order.min(MAX_ORDER as u64) as usize
 }
 
 fn max_order_at(phys_addr: u64, remaining_bytes: u64) -> usize {
-    let pages = phys_addr / PAGE_SIZE;
-    let align_bits = pages.trailing_zeros() as usize;
-    let size_bits = if remaining_bytes < PAGE_SIZE {
-        0
+    let max_by_size = max_order_for_pages(remaining_bytes / PAGE_SIZE);
+    let max_by_align = if phys_addr == 0 {
+        MAX_ORDER
     } else {
-        let p = remaining_bytes / PAGE_SIZE;
-        p.ilog2() as usize
+        let page_num = phys_addr / PAGE_SIZE;
+        let mut o = 0;
+        let mut a = page_num;
+        while a & 1 == 0 && o < MAX_ORDER {
+            a >>= 1;
+            o += 1;
+        }
+        o
     };
-    align_bits.min(size_bits).min(MAX_ORDER)
+    max_by_size.min(max_by_align)
 }
 
 unsafe fn add_to_free_list(zone: &mut Zone, addr: u64, order: usize) {
+    debug_assert!(
+        addr % block_size(order) == 0,
+        "add_to_free_list: addr {:#x} not aligned to block_size({}) = {:#x}",
+        addr, order, block_size(order),
+    );
     let block = addr as *mut FreeBlock;
     (*block).next = zone.free_lists[order];
     zone.free_lists[order] = block;
@@ -101,10 +101,11 @@ unsafe fn add_to_free_list(zone: &mut Zone, addr: u64, order: usize) {
 unsafe fn pop_from_free_list(zone: &mut Zone, order: usize) -> Option<u64> {
     let head = zone.free_lists[order];
     if head.is_null() {
-        return None;
+        None
+    } else {
+        zone.free_lists[order] = (*head).next;
+        Some(head as u64)
     }
-    zone.free_lists[order] = (*head).next;
-    Some(head as u64)
 }
 
 unsafe fn split_and_enqueue(zone: &mut Zone, addr: u64, high_order: usize, target_order: usize) {
@@ -120,17 +121,23 @@ fn is_reserved_page(page: u64) -> bool {
     if page == 0 || page == BOOTINFO_HANDOFF_PAGE / PAGE_SIZE {
         return true;
     }
-    let base = unsafe { BOOTINFO_RESERVED_BASE };
-    let pages = unsafe { BOOTINFO_RESERVED_PAGES };
-    if pages == 0 {
+    let base = BOOTINFO_RESERVED_PN.load(Ordering::Acquire);
+    let pages = BOOTINFO_RESERVED_PAGES.load(Ordering::Acquire);
+    if base == u64::MAX || pages == 0 {
         return false;
     }
-    page >= base / PAGE_SIZE && page < (base / PAGE_SIZE) + pages
+    page >= base && page < base + pages
 }
 
 /// Reserve a single 4 KB page so the buddy allocator will never hand it out.
 /// Removes the page from whatever free-list block contains it by splitting
 /// the encompassing block around the target address.
+///
+/// The before/after portions are re-added via `carve_blocks` which splits
+/// them into properly-aligned buddy sub-blocks. A single `add_to_free_list`
+/// call is wrong because `max_order_at` can over-estimate the order when
+/// the remaining page count is not a power of two (e.g. 511 pages → order 9
+/// = 2 MB block that doesn't fit), poisoning the free lists.
 unsafe fn reserve_one_page(zone: &mut Zone, target: u64) {
     for order in 0..ORDER_COUNT {
         let mut curr = zone.free_lists[order];
@@ -141,7 +148,6 @@ unsafe fn reserve_one_page(zone: &mut Zone, target: u64) {
             let next = (*curr).next;
 
             if target >= block_addr && target < block_end {
-                // Unlink this block
                 if prev.is_null() {
                     zone.free_lists[order] = next;
                 } else {
@@ -149,21 +155,17 @@ unsafe fn reserve_one_page(zone: &mut Zone, target: u64) {
                 }
                 zone.free_pages.fetch_sub(1 << order, Ordering::Relaxed);
 
-                // Re-add the portion before the target page
                 let before = target - block_addr;
                 if before > 0 {
-                    let before_order = max_order_at(block_addr, before);
-                    add_to_free_list(zone, block_addr, before_order);
-                    zone.free_pages.fetch_add(1 << before_order, Ordering::Relaxed);
+                    let n = carve_blocks(zone, block_addr, before);
+                    zone.free_pages.fetch_add(n, Ordering::Relaxed);
                 }
 
-                // Re-add the portion after the target page
                 let after_start = target + PAGE_SIZE;
                 let after = block_end - after_start;
                 if after > 0 {
-                    let after_order = max_order_at(after_start, after);
-                    add_to_free_list(zone, after_start, after_order);
-                    zone.free_pages.fetch_add(1 << after_order, Ordering::Relaxed);
+                    let n = carve_blocks(zone, after_start, after);
+                    zone.free_pages.fetch_add(n, Ordering::Relaxed);
                 }
                 return;
             }
@@ -225,6 +227,9 @@ fn carve_blocks(zone: &mut Zone, mut start: u64, size: u64) -> usize {
 /// BootInfo struct — its page(s) are removed from the free lists so the
 /// buddy allocator does not re-issue them (the UEFI memory map includes
 /// the BootInfo's region as EfiLoaderData / free).
+///
+/// SMP-safety: the body runs under LOCK. `INITIALIZED` is a one-shot
+/// gate; concurrent calls are serialised.
 pub unsafe fn init_from_regions(regions: &[(u64, u64)], boot_info_phys: u64) {
     if INITIALIZED.load(Ordering::SeqCst) {
         return;
@@ -251,6 +256,7 @@ pub unsafe fn init_from_regions(regions: &[(u64, u64)], boot_info_phys: u64) {
         (*zp).top = max_top;
     }
 
+    let _g = LOCK.lock();
     let mut total_pages = 0usize;
     for &(start, size) in regions {
         total_pages += carve_blocks(unsafe { &mut *zone_ptr() }, start, size);
@@ -268,15 +274,14 @@ pub unsafe fn init_from_regions(regions: &[(u64, u64)], boot_info_phys: u64) {
         unsafe { reserve_one_page(&mut *zone_ptr(), addr) };
     }
     total_pages = total_pages.saturating_sub(bootinfo_pages);
-    unsafe {
-        BOOTINFO_RESERVED_BASE = bootinfo_base;
-        BOOTINFO_RESERVED_PAGES = bootinfo_pages as u64;
-    }
+    BOOTINFO_RESERVED_PN.store(bootinfo_base / PAGE_SIZE, Ordering::Release);
+    BOOTINFO_RESERVED_PAGES.store(bootinfo_pages as u64, Ordering::Release);
 
     unsafe {
         (*zp).total_pages.store(total_pages, Ordering::Relaxed);
         (*zp).free_pages.store(total_pages, Ordering::Relaxed);
     }
+    drop(_g);
 
     log::info!("Physical allocator (buddy): {} pages free ({} MB), orders 0-{}",
         total_pages,
@@ -284,6 +289,23 @@ pub unsafe fn init_from_regions(regions: &[(u64, u64)], boot_info_phys: u64) {
         MAX_ORDER);
 
     INITIALIZED.store(true, Ordering::SeqCst);
+}
+
+/// Reserve a physical address range so the buddy allocator never hands
+/// it out.  `start` must be 4 KB-aligned.  `size_in_pages` is the number
+/// of 4 KB pages to reserve.
+///
+/// # Safety
+/// Caller must ensure the range is not already in use and that the zone
+/// has been initialised.
+pub unsafe fn reserve_range(start: u64, size_in_pages: usize) {
+    let zp = zone_ptr();
+    let zone = &mut *zp;
+    let _g = LOCK.lock();
+    for i in 0..size_in_pages {
+        let addr = start + (i as u64) * PAGE_SIZE;
+        reserve_one_page(zone, addr);
+    }
 }
 
 pub fn alloc_order(order: usize) -> Option<u64> {
@@ -299,7 +321,7 @@ pub fn alloc_order(order: usize) -> Option<u64> {
         return None;
     }
 
-    LOCK.lock();
+    let _g = LOCK.lock();
     let result = {
         let zp = zone_ptr();
         let zone = unsafe { &mut *zp };
@@ -319,7 +341,7 @@ pub fn alloc_order(order: usize) -> Option<u64> {
         };
         addr
     };
-    LOCK.unlock();
+    drop(_g);
 
     if result.is_none() {
         log::error!("alloc_order({}): out of memory!", order);
@@ -343,7 +365,7 @@ pub fn free_order(addr: u64, order: usize) {
         return;
     }
 
-    LOCK.lock();
+    let _g = LOCK.lock();
     let zone = unsafe { &mut *zone_ptr() };
     let mut merge_addr = addr;
     let mut merge_order = order;
@@ -388,7 +410,6 @@ pub fn free_order(addr: u64, order: usize) {
 
     unsafe { add_to_free_list(zone, merge_addr, merge_order) };
     zone.free_pages.fetch_add(1 << merge_order, Ordering::Relaxed);
-    LOCK.unlock();
 }
 
 pub fn alloc_page() -> Option<u64> {

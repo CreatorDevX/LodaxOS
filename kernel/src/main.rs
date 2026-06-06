@@ -7,17 +7,17 @@ extern crate alloc;
 
 mod acpi;
 mod arch;
+mod cap;
 mod exec;
 mod font;
 mod intr;
 mod logger;
 mod mm;
 mod serial;
+mod sync;
 mod task;
 
-#[path = "../../src/ap_start.rs"]
 mod ap_start;
-#[path = "../../src/percpu.rs"]
 mod percpu;
 
 use lodaxos_system::BootInfo;
@@ -148,6 +148,21 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial::init();
     logger::init().unwrap_or(());
 
+    // Enable FPU and SSE on the BSP.
+    // OSXSAVE is set only if CPUID indicates XSAVE support, because
+    // QEMU TCG may not emulate XSAVE (causing #GP → triple fault).
+    unsafe {
+        core::arch::asm!("fninit", options(nostack, preserves_flags));
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, preserves_flags));
+        cr4 |= 1 << 9   // CR4.OSFXSR
+             | 1 << 10; // CR4.OSXMMEXCPT
+        if has_xsave() {
+            cr4 |= 1 << 18; // CR4.OSXSAVE
+        }
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, preserves_flags));
+    }
+
     log::info!("LodaxOS kernel booting");
     log::info!("BootInfo at {:#x}", boot_info as u64);
 
@@ -222,6 +237,95 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         log::warn!("No MADT found");
         ([acpi::madt::IoApicInfo { ioapic_id: 0, addr: 0, gsi_base: 0 }; acpi::madt::MAX_IOAPICS], 0, None)
     };
+
+    // Reserve AP pages BEFORE virt::init() — the buddy allocator is live
+    // but has not yet allocated anything (virt::init will allocate ~1600
+    // page-table pages). UEFI page tables are still active so reading
+    // *(arg_phys as *const ApArg) is safe.
+    if info.ap_count > 0 {
+        unsafe {
+            use lodaxos_system::ApArg;
+            let tramp_page = info.ap_trampoline_phys & !0xFFF;
+            if tramp_page != 0 {
+                mm::phys::reserve_range(tramp_page, 1);
+                log::info!("reserved AP boot trampoline page at {:#x}", tramp_page);
+            }
+            let ap_stack_pages = 4usize;
+            for i in 0..(info.ap_count as usize) {
+                let arg_phys = info.ap_arg_phys[i];
+                mm::phys::reserve_range(arg_phys, 1);
+                let ap = arg_phys as *const ApArg;
+                let stack_top = (*ap).target_kernel_stack;
+                if stack_top > 0 {
+                    let stack_base = stack_top - (ap_stack_pages as u64) * 4096;
+                    mm::phys::reserve_range(stack_base, ap_stack_pages);
+                    log::info!(
+                        "reserved AP[{}] Arg={:#x} stack={:#x}..{:#x}",
+                        i, arg_phys, stack_base, stack_top
+                    );
+                }
+            }
+        }
+    }
+
+    // Reserve the ExRun ELF staging buffer BEFORE virt::init().
+    // The buffer lives in UEFI LOADER_DATA pages that are now in the
+    // buddy free lists. Without this reservation, virt::init()'s
+    // ~1600 page-table allocations can overwrite the ELF data,
+    // corrupting e_entry and causing a #UD at a garbage address.
+    if info.exrun_image_addr != 0 && info.exrun_image_size > 0 {
+        let base = info.exrun_image_addr & !0xFFFu64;
+        let end = info.exrun_image_addr + info.exrun_image_size;
+        let pages = ((end - base + 4095) / 4096) as usize;
+        unsafe { mm::phys::reserve_range(base, pages) };
+        log::info!(
+            "reserved ExRun ELF buffer at {:#x} ({} pages)",
+            base, pages
+        );
+    }
+
+    // Reserve the framebuffer pages BEFORE virt::init(). The GOP framebuffer
+    // typically lives inside a UEFI "free" memory region, so the buddy
+    // allocator's `init_from_regions` happily adds those pages to the free
+    // list. If a buddy block's first 8 bytes happen to fall inside the
+    // framebuffer, the `(*head).next` dereference in `pop_from_free_list`
+    // reads pixel data as a pointer — the resulting garbage head then faults
+    // the next pop on a "misaligned pointer dereference" panic. Reserving the
+    // framebuffer pages keeps them out of the free list.
+    {
+        let fb_base = info.framebuffer.phys_addr & !0xFFFu64;
+        let fb_size = (info.framebuffer.height as u64)
+            * (info.framebuffer.stride as u64)
+            * (info.framebuffer.bytes_per_pixel as u64);
+        let fb_end = fb_base + fb_size;
+        let fb_pages = ((fb_end - fb_base + 4095) / 4096) as usize;
+        if fb_pages > 0 {
+            unsafe { mm::phys::reserve_range(fb_base, fb_pages) };
+            log::info!(
+                "reserved framebuffer at {:#x} ({} pages, {} KB)",
+                fb_base, fb_pages, fb_size / 1024
+            );
+        }
+    }
+
+    // Reserve LAPIC + IOAPIC MMIO pages. These are usually excluded from the
+    // UEFI "free" list, but on some firmware they show up as EfiLoaderData.
+    // A free block at 0xFEE00000 (LAPIC) would let the kernel's page-table
+    // pages get allocated on top of the LAPIC, and any subsequent write to
+    // the LAPIC would stomp the slab/PTE — silent corruption. Reserve the
+    // 2MB-aligned region that contains both to be safe.
+    {
+        const LAPIC_PHYS: u64 = 0xFEE0_0000;
+        const IOAPIC_PHYS: u64 = 0xFEC0_0000;
+        // 2MB-aligned region covering 0xFEC00000..0xFEFFFFFF.
+        let mmio_base: u64 = 0xFEC0_0000;
+        let mmio_pages: usize = 0x20_0000 / 4096; // 32 pages
+        unsafe { mm::phys::reserve_range(mmio_base, mmio_pages) };
+        log::info!(
+            "reserved APIC MMIO region at {:#x} (LAPIC {:#x}, IOAPIC {:#x})",
+            mmio_base, LAPIC_PHYS, IOAPIC_PHYS
+        );
+    }
 
     log::debug!("Initializing 4-level page tables");
     fb.write_str_centered("Page tables...", 70, 0, 255, 0);
@@ -310,7 +414,11 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fb.write_str("Loading GDT + TSS...", 20, y, 180, 180, 180);
 
     log::info!("Loading GDT and TSS");
-    arch::gdt::load();
+    // Initialise the BSP's per-CPU GDT/TSS at the BSP's slot.  Slot
+    // is the BSP's LAPIC ID (mod MAX_CPUS).  Each AP also has its
+    // own GDT/TSS, initialised in `ap_start::ap_entry` (Phase 2).
+    let bsp_slot = (info.bsp_apic_id as usize) % lodaxos_system::MAX_CPUS;
+    unsafe { arch::gdt::init_for_slot(bsp_slot); }
     log::info!("GDT and TSS loaded");
 
     log::info!("Initializing IDT");
@@ -318,10 +426,22 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     arch::idt::init();
     log::info!("IDT loaded — 256 vectors");
 
+    // Mark the BSP online before creating tasks so initial placement does
+    // not assign runnable work to APs that have not entered the kernel yet.
+    arch::apic::set_bsp_lapic_id(info.bsp_apic_id);
+    percpu::set_bsp_apic_id(info.bsp_apic_id);
+    percpu::mark_online(info.bsp_apic_id);
+    // Install per-CPU TLS on the BSP: GS base = &PERCPU[bsp_slot],
+    // TSC_AUX = bsp_lapic_id. This must happen *before* any code reads
+    // `current_apic_id()` via the fast path, and before APs are
+    // released (so APs see a consistent setup). See Phase 1 of the
+    // SMP plan.
+    percpu::install_gs_base(info.bsp_apic_id as usize);
+
     // Initialize task system
     log::info!("Initializing task manager");
     task::init();
-    task::init_main_task();
+    task::init_idle_task();
 
     // Create test kernel tasks
     let task1_entry = simple_task1 as *const () as u64;
@@ -337,7 +457,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     log::info!("Task system ready — {} tasks registered", task::task_count());
 
     // Spawn Executive Runtime as a separate ring-0 process. Must be
-    // AFTER task::init_main_task() so the task table is initialised
+    // AFTER task::init_idle_task() so the task table is initialised
     // and the scheduler can find a slot. exec::load forks the kernel's
     // PML4, maps the ExRun ELF + mailbox into the new PML4, and
     // registers a Task. The next schedule() will time-slice it.
@@ -372,11 +492,6 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     arch::apic::set_timer_count(1);
 
     arch::apic::pit_enable_periodic(100);
-
-    // Mark the BSP online in the per-CPU table.
-    arch::apic::set_bsp_lapic_id(info.bsp_apic_id);
-    percpu::set_bsp_apic_id(info.bsp_apic_id);
-    percpu::mark_online(info.bsp_apic_id);
 
     // Release APs brought up by the boot MP Services. Each AP will
     // enter `ap_entry` and block on `kernel_ready`.
@@ -417,9 +532,14 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     log::info!("LodaxOS initialization complete — entering idle loop (task 0)");
     let mut last_log = 0u64;
     let mut last_key = 0u64;
+    let bsp_cpu = percpu::current_apic_id() as usize;
 
     loop {
         unsafe { core::arch::asm!("hlt") };
+        // If only the idle task remains, try to steal from another CPU.
+        if percpu::task_count(bsp_cpu) <= 1 {
+            task::steal_task(bsp_cpu);
+        }
         let now = arch::idt::ticks();
         if now - last_log >= 1000 {
             let pit = arch::idt::pit_ticks();
@@ -436,6 +556,27 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             last_log = now;
         }
     }
+}
+
+/// Check CPUID.1.ECX[26] for XSAVE support.
+/// Uses manual push/pop rbx because LLVM reserves RBX internally
+/// and rejects `out("ebx")` in inline asm.
+pub(crate) fn has_xsave() -> bool {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {0:e}, ecx",
+            "pop rbx",
+            out(reg) ecx,
+            out("eax") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    (ecx & (1 << 26)) != 0
 }
 
 /// Test task 1: busy-loop counter, preemption handles switching

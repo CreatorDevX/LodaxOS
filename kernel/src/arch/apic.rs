@@ -13,12 +13,30 @@ const APIC_LVR: usize = 0x30;
 const APIC_TPR: usize = 0x80;
 const APIC_EOI: usize = 0xB0;
 const APIC_SVR: usize = 0xF0;
+const APIC_ICR_LOW: usize = 0x300;
+const APIC_ICR_HIGH: usize = 0x310;
 const APIC_LVT_TIMER: usize = 0x320;
 const APIC_LVT_LINT0: usize = 0x350;
 const APIC_LVT_LINT1: usize = 0x360;
 const APIC_TDCR: usize = 0x3E0;
 const APIC_TICR: usize = 0x380;
 const APIC_CCR: usize = 0x390;
+
+/// ICR delivery mode
+const ICR_FIXED: u32 = 0;
+const ICR_INIT: u32 = 5 << 8;
+const ICR_STARTUP: u32 = 6 << 8;
+
+/// ICR destination shorthand
+const ICR_DEST_PHYSICAL: u32 = 0;
+const ICR_DEST_LOGICAL: u32 = 1 << 11;
+const ICR_SELF: u32 = 1 << 16;
+const ICR_ALL_INCLUDING_SELF: u32 = 2 << 16;
+const ICR_ALL_EXCLUDING_SELF: u32 = 3 << 16;
+
+/// ICR assert / level bits (must be 0 for edge-triggered fixed IPIs)
+const ICR_ASSERT: u32 = 1 << 14;
+const ICR_EDGE: u32 = 0;
 
 /// Spurious vector — bit 8 enables LAPIC software, bits 0–7 = vector.
 const APIC_SVR_ENABLE: u32 = 1 << 8;
@@ -307,6 +325,14 @@ pub fn set_timer_count(ms: u32) {
 /// which CPU's tick counter to increment.
 pub fn ap_enable_timer(_apic_id: u32) {
     unsafe {
+        // Each AP must enable its own LAPIC (the BSP's enable() only
+        // affects the BSP's LAPIC).
+        write32(APIC_LVT_LINT0, APIC_LVT_MASKED);
+        write32(APIC_LVT_LINT1, APIC_LVT_MASKED);
+        write32(APIC_LVT_ERROR, APIC_LVT_MASKED | 0xFF);
+        write32(APIC_SVR, APIC_SVR_ENABLE | 0xFF);
+        write32(APIC_TPR, 0);
+
         let count = TICKS_PER_MS * 1; // 1 ms period
         write32(APIC_LVT_TIMER, 32 | APIC_LVT_PERIODIC);
         write32(APIC_TDCR, 0b0011); // divide by 16
@@ -330,11 +356,84 @@ pub fn pit_enable_periodic(freq_hz: u32) {
     }
 }
 
+/// Send an IPI to a specific APIC ID using fixed delivery mode.
+///
+/// Blocks until the previous IPI has been delivered (delivery status clears).
+pub fn send_ipi(dest_apic_id: u32, vector: u8) {
+    unsafe {
+        // Wait for delivery status to clear.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        // Write destination APIC ID to ICR high.
+        write32(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+        // Write ICR low: vector + fixed + physical + edge (no assert).
+        // Bit 14 (level/assert) must be 0 for edge-triggered fixed delivery.
+        write32(APIC_ICR_LOW, vector as u32 | ICR_FIXED);
+        // Wait for delivery to complete.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Broadcast IPI to all APs (excluding self).  Used for TLB shootdowns
+/// and other cross-CPU coordination.
+pub fn send_ipi_others(vector: u8) {
+    unsafe {
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        write32(APIC_ICR_LOW, vector as u32 | ICR_ALL_EXCLUDING_SELF | ICR_FIXED);
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Send End-Of-Interrupt to the LAPIC. Must be called at the end of every
 /// LAPIC interrupt handler to acknowledge the interrupt.
 #[inline]
 pub fn send_eoi() {
     unsafe {
         write32(APIC_EOI, 0);
+    }
+}
+
+/// Send an INIT IPI to a specific APIC ID. The INIT IPI resets the target
+/// CPU. After receiving INIT, the AP waits for a SIPI.
+pub fn send_init_ipi(dest_apic_id: u32) {
+    unsafe {
+        // Wait for delivery status to clear.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        // Write destination APIC ID to ICR high.
+        write32(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+        // INIT IPI: delivery mode = INIT, level assert, edge triggered.
+        write32(APIC_ICR_LOW, ICR_INIT | ICR_ASSERT | ICR_EDGE);
+        // Wait for delivery to complete.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Send a SIPI (Startup IPI) to a specific APIC ID. The vector specifies
+/// the physical address where the AP starts executing (vector * 0x1000).
+pub fn send_sipi(dest_apic_id: u32, vector: u8) {
+    unsafe {
+        // Wait for delivery status to clear.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        // Write destination APIC ID to ICR high.
+        write32(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+        // STARTUP IPI: delivery mode = STARTUP, level assert, edge triggered.
+        write32(APIC_ICR_LOW, (vector as u32) | ICR_STARTUP | ICR_ASSERT | ICR_EDGE);
+        // Wait for delivery to complete.
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
     }
 }

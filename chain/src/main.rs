@@ -46,6 +46,7 @@ fn main() -> Status {
         exrun_image_size: 0,
         max_cpus: lodaxos_system::MAX_CPUS as u32,
         bsp_apic_id: 0,
+        ap_trampoline_phys: 0,
         ap_count: 0,
         ap_apic_ids: [0u32; lodaxos_system::MAX_CPUS],
         ap_arg_phys: [0u64; lodaxos_system::MAX_CPUS],

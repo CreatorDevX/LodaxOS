@@ -137,6 +137,9 @@ fn main() -> Status {
     }
     log::info!("BootInfo updated at {:#x}", boot_info_addr);
 
+    // Record the AP trampoline physical address so the kernel can reserve it.
+    boot_info.ap_trampoline_phys = mp::ap_trampoline as *const () as u64;
+
     // --- Bring up APs via UEFI MP Services (BEFORE exit_boot_services) ---
     //
     // MP Services survives the call to ExitBootServices in the sense that

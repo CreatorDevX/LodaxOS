@@ -77,9 +77,11 @@ pub fn bring_up_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
             break;
         }
 
-        // Allocate the ApArg in UEFI Loader-Data memory (survives ExitBootServices).
+        // Allocate the ApArg below 4 GB so the kernel's PML4 identity map
+        // (which covers only 0..4 GB) can reach both the ApArg and its
+        // contents (target_gdt_ptr etc.) after the AP switches CR3.
         let ap_arg_ptr = uefi::boot::allocate_pages(
-            AllocateType::AnyPages,
+            AllocateType::MaxAddress(0xFFFF_FFFF),
             MemoryType::LOADER_DATA,
             1, // 1 page = 4 KiB
         )?;
@@ -90,9 +92,10 @@ pub fn bring_up_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
         ap_arg.go.store(0, Ordering::Release);
         ap_arg.lapic_id = info.processor_id as u32;
 
-        // Allocate the AP's 16 KiB kernel stack (also in Loader-Data).
+        // Allocate the AP's 16 KiB kernel stack below 4 GB so the
+        // kernel's PML4 identity map can reach it after CR3 switch.
         let stack_ptr = uefi::boot::allocate_pages(
-            AllocateType::AnyPages,
+            AllocateType::MaxAddress(0xFFFF_FFFF),
             MemoryType::LOADER_DATA,
             AP_STACK_PAGES,
         )?;
@@ -162,6 +165,7 @@ pub fn bring_up_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
     boot_info.ap_count = ap_index;
     boot_info.bsp_apic_id = 0; // BSP is always processor 0 in MP Services
     log::info!("MP Services: {} APs prepared for kernel release", ap_index);
+
     Ok(())
 }
 
@@ -191,6 +195,54 @@ pub fn bring_up_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
 ///   - Switch RSP to the per-CPU kernel stack.
 ///   - Jump to the kernel's AP entry point (`[{arg} + 0x20]`).
 ///     Never returns.
+/// Null-terminated checkpoint messages for AP trampoline COM1 debug output.
+#[used]
+#[unsafe(no_mangle)]
+static CP1_MSG: [u8; 17] = *b"AP GO RELEASED\r\n\0";
+#[used]
+#[unsafe(no_mangle)]
+static CPX_MSG: [u8; 16] = *b"AP GO EXIT OK\r\n\0";
+#[used]
+#[unsafe(no_mangle)]
+static CPP_MSG: [u8; 20] = *b"AP PRE CR3 SWITCH\r\n\0";
+#[used]
+#[unsafe(no_mangle)]
+static CP2_MSG: [u8; 18] = *b"AP CR3 SWITCHED\r\n\0";
+#[used]
+#[unsafe(no_mangle)]
+static CP3_MSG: [u8; 22] = *b"AP JUMPING TO ENTRY\r\n\0";
+
+/// Write a null-terminated string to COM1 by polling LSR and writing each
+/// byte to THR.  Called from the AP trampoline (Microsoft x64 ABI).
+///
+/// # Safety
+/// `msg` must point to a readable null-terminated byte string valid in the
+/// current address space.
+#[unsafe(no_mangle)]
+unsafe extern "efiapi" fn trampoline_puts(mut msg: *const u8) {
+    loop {
+        let byte = *msg;
+        if byte == 0 {
+            break;
+        }
+        core::arch::asm!(
+            "2: in al, dx",
+            "test al, 0x20",
+            "jz 2b",
+            in("dx") 0x3FDu16,
+            out("al") _,
+            options(nostack, nomem, preserves_flags),
+        );
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") byte,
+            options(nostack, nomem, preserves_flags),
+        );
+        msg = msg.add(1);
+    }
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 pub extern "efiapi" fn ap_trampoline(_arg: *mut core::ffi::c_void) {
@@ -203,17 +255,54 @@ pub extern "efiapi" fn ap_trampoline(_arg: *mut core::ffi::c_void) {
         "cli",
         "mov dword ptr [rcx + 0x28], 1",
         "mfence",
+        // --- Diagnostic: COM1 checkpoint BEFORE go loop ---
+        "push rcx",
+        "lea rcx, [rip + CP1_MSG]",
+        "call trampoline_puts",
+        "pop rcx",
+        // --- Spin on `go` with tight mov loop ---
+        // QEMU TCG memory is always coherent (single address space
+        // shared by all vCPU threads).  A plain `mov` read of `go`
+        // sees the BSP's store immediately.  No clflush, no cpuid,
+        // no yielding needed on TCG MTTCG.
+        // WHPX is handled separately: see `release_aps` in the kernel
+        // which uses `lock xchg` + `clflush` + `in al,0x80` to
+        // guarantee cross-VP visibility.
         "2:",
-        "pause",
-        "mov eax, dword ptr [rcx + 0x2C]",
+        "mov eax, [rcx + 0x2C]",    // read go
         "test eax, eax",
-        "jz 2b",
+        "jnz 3f",                    // go == 1 → exit spin
+        "pause",
+        "jmp 2b",
+        "3:",
+        // --- Diagnostic: COM1 checkpoint AFTER go loop exit ---
+        "push rcx",
+        "lea rcx, [rip + CPX_MSG]",
+        "call trampoline_puts",
+        "pop rcx",
+        // The AP wrote `ready=1` to offset 0x28 during Phase 1, caching
+        // the ApArg page in its L1.  The BSP's writes to `target_*` fields
+        // (offsets 0x00–0x20) may be in a different cache line but evict
+        // the whole line from the BSP's side.  Defensive clflush of the
+        // entire ApArg to guarantee the AP's reads go to host memory.
+        "clflush [rcx]",
+        "mfence",
         "mov rax, [rcx + 0x00]",
         // Switch to the kernel stack *before* switching CR3: the UEFI
         // stack may live above 4 GB, which the kernel identity map does
         // not cover, and we need a mapped stack for `push`/`retfq` etc.
         "mov rsp, [rcx + 0x18]",
+        // --- Diagnostic: COM1 checkpoint BEFORE CR3 switch ---
+        "push rcx",
+        "lea rcx, [rip + CPP_MSG]",
+        "call trampoline_puts",
+        "pop rcx",
         "mov cr3, rax",
+        // --- Checkpoint 2 ---
+        "push rcx",
+        "lea rcx, [rip + CP2_MSG]",
+        "call trampoline_puts",
+        "pop rcx",
         "mov rbx, [rcx + 0x08]",
         "lgdt [rbx]",
         "push 0x08",
@@ -229,6 +318,11 @@ pub extern "efiapi" fn ap_trampoline(_arg: *mut core::ffi::c_void) {
         "mov ss, ax",
         "mov rbx, [rcx + 0x10]",
         "lidt [rbx]",
+        // --- Checkpoint 3 ---
+        "push rcx",
+        "lea rcx, [rip + CP3_MSG]",
+        "call trampoline_puts",
+        "pop rcx",
         "mov rdi, rcx",
         "mov rax, [rcx + 0x20]",
         "jmp rax",

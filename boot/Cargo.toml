@@ -5,6 +5,5 @@ edition = "2024"
 
 [dependencies]
 lodaxos-system = { path = "../system" }
-lodaxos-core = { path = "../shared" }
 uefi = { version = "0.37", default-features = false, features = ["alloc"] }
 log = "0.4"

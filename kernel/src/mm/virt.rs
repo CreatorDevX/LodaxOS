@@ -1,5 +1,5 @@
-use core::sync::atomic::{AtomicBool, Ordering};
-use lodaxos_system::{CapOp, Caps};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use lodaxos_system::{CapOp, Caps, MAX_CPUS};
 
 use super::phys;
 use crate::cap;
@@ -19,6 +19,52 @@ pub const DATA: u64 = PRESENT | WRITABLE | NO_EXECUTE;
 pub const HIGHER_HALF: u64 = 0xFFFF_8000_0000_0000;
 
 static PT_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Physical address of the kernel's PML4 (set once by `init`).
+/// Accessed lock-free because it is written once during boot and
+/// read-only thereafter.
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+
+/// Return the kernel PML4 physical address.  Set during page-table init
+/// and never changes.  All CPUs share the same kernel PML4 for the
+/// higher-half mappings; per-task PML4s are forks of this one.
+pub fn kernel_pml4() -> u64 {
+    KERNEL_PML4.load(Ordering::Relaxed)
+}
+
+/// Physical address of the last virtual address whose TLB entry needs
+/// flushing on remote CPUs.  Written by `unmap` / `map_page_explicit`
+/// before sending the shootdown IPI; read by the IPI handler.
+pub(crate) static TLB_FLUSH_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU acknowledge flag for TLB shootdown IPIs.
+/// Set to 1 by the IPI handler after executing `invlpg`.
+pub static TLB_ACK: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Send TLB shootdown IPI to all other CPUs and wait for their ack.
+/// The address to flush must already be stored in `TLB_FLUSH_ADDR`.
+fn tlb_shootdown() {
+    let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
+    // Clear acks for all other CPUs.
+    for i in 0..MAX_CPUS {
+        if i != cpu {
+            TLB_ACK[i].store(0, Ordering::Release);
+        }
+    }
+    // Ensure the address is visible before the IPI arrives.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // Send IPI to all others.
+    crate::arch::apic::send_ipi_others(crate::arch::idt::IPI_VECTOR);
+    // Wait for each other CPU to ack.
+    for i in 0..MAX_CPUS {
+        if i == cpu { continue; }
+        if !crate::percpu::is_online(i) { continue; }
+        while TLB_ACK[i].load(Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
@@ -187,6 +233,7 @@ pub unsafe fn init(regions: &[(u64, u64)], fb_phys: Option<(u64, u64)>) {
     log::info!("Page tables: CR3 loaded with phys={:#x}", pml4_page);
     log::info!("Page tables: post-CR3-switch check");
 
+    KERNEL_PML4.store(pml4_page, Ordering::Release);
     PT_INITIALIZED.store(true, Ordering::SeqCst);
 }
 
@@ -365,16 +412,31 @@ pub fn unmap(virt: u64) {
     let pt = phys_to_virtual(pt_entry & !0xFFF);
     unsafe { (*pt).0[pt_idx] = 0; }
 
-    // Flush TLB
+    // Flush TLB locally.
     unsafe {
         core::arch::asm!("invlpg [{}]", in(reg) virt);
     }
+
+    // Broadcast TLB shootdown IPI to all other CPUs.
+    TLB_FLUSH_ADDR.store(virt, Ordering::Release);
+    tlb_shootdown();
 }
 
-pub fn pml4_address() -> u64 {
+/// Physical address of the currently-loaded PML4 (reads CR3).
+/// Prefer `kernel_pml4()` for the kernel's shared page table; use
+/// this to detect which PML4 is currently loaded on this CPU.
+#[inline]
+pub fn current_pml4() -> u64 {
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
     cr3 & !0xFFF
+}
+
+/// Backward-compat alias for `current_pml4()`.  Will be deprecated
+/// once all call sites are updated.
+#[inline]
+pub fn pml4_address() -> u64 {
+    current_pml4()
 }
 
 /// Switch the active PML4 (write CR3). The new PML4 must already be
@@ -559,4 +621,10 @@ pub fn map_page_explicit(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     }
     let pml4 = phys_to_virtual(pml4_phys);
     map_page(pml4, virt, phys, flags);
+
+    // Broadcast TLB shootdown to all other CPUs so the new mapping
+    // takes effect immediately. Without this, another CPU may still
+    // see the old PTE (or "not present") for this virtual address.
+    TLB_FLUSH_ADDR.store(virt, Ordering::Release);
+    tlb_shootdown();
 }

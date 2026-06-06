@@ -5,5 +5,4 @@ edition = "2024"
 
 [dependencies]
 lodaxos-system = { path = "../system" }
-lodaxos-core = { path = "../shared" }
 log = "0.4"

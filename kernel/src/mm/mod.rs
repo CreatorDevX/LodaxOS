@@ -1,4 +1,7 @@
-pub use lodaxos_core::mm::{heap, phys, virt, vma};
+pub mod phys;
+pub mod virt;
+pub mod heap;
+pub mod vma;
 
 #[global_allocator]
 static ALLOCATOR: heap::GlobalAllocator = heap::GlobalAllocator;

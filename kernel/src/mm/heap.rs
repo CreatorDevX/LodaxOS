@@ -3,26 +3,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{phys, virt};
-
-struct SpinLock {
-    locked: AtomicBool,
-}
-
-impl SpinLock {
-    const fn new() -> Self {
-        Self { locked: AtomicBool::new(false) }
-    }
-    fn lock(&self) {
-        while self.locked.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed,
-        ).is_err() {
-            core::hint::spin_loop();
-        }
-    }
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
+use crate::sync::IrqSaveSpinLock;
 
 #[repr(C)]
 struct Slab {
@@ -104,8 +85,13 @@ struct KmemCache {
     partial: *mut Slab,
     free: *mut Slab,
     full: *mut Slab,
-    lock: SpinLock,
 }
+
+/// One global IRQ-safe spinlock for the slab allocator. A single global
+/// lock is sufficient for v1 (the per-cache list is the contended data,
+/// not the cache table itself). Will be replaced with per-cache locks
+/// once we have a per-cache slot layout.
+static HEAP_LOCK: IrqSaveSpinLock<()> = IrqSaveSpinLock::new(());
 
 impl KmemCache {
     const fn new_const(obj_size: usize, slab_order: u8, objs_per_slab: u16) -> Self {
@@ -116,50 +102,48 @@ impl KmemCache {
             partial: ptr::null_mut(),
             free: ptr::null_mut(),
             full: ptr::null_mut(),
-            lock: SpinLock::new(),
         }
     }
 
     unsafe fn alloc(&mut self) -> *mut u8 {
-        self.lock.lock();
-
-        // Try partial list first (raw ptr to avoid borrow conflicts)
-        if !self.partial.is_null() {
-            let slab = self.partial;
-            let obj = (*slab).alloc_obj();
-            let is_full = (*slab).is_full();
-            if is_full {
-                self.remove_partial_ptr(slab);
-                self.push_full_ptr(slab);
+        // Fast path: try partial first.
+        {
+            let _g = HEAP_LOCK.lock();
+            if !self.partial.is_null() {
+                let slab = self.partial;
+                let obj = (*slab).alloc_obj();
+                let is_full = (*slab).is_full();
+                if is_full {
+                    Self::remove_partial_ptr(self, slab);
+                    Self::push_full_ptr(self, slab);
+                }
+                return obj;
             }
-            self.lock.unlock();
-            return obj;
-        }
-
-        // Try free list
-        if !self.free.is_null() {
-            let slab = self.free;
-            self.free = (*slab).next;
+            // Try free list
             if !self.free.is_null() {
-                (*self.free).prev = ptr::null_mut();
+                let slab = self.free;
+                self.free = (*slab).next;
+                if !self.free.is_null() {
+                    (*self.free).prev = ptr::null_mut();
+                }
+                (*slab).next = ptr::null_mut();
+                (*slab).prev = ptr::null_mut();
+                let obj = (*slab).alloc_obj();
+                let is_full = (*slab).is_full();
+                if is_full {
+                    Self::push_full_ptr(self, slab);
+                } else {
+                    Self::push_partial_ptr(self, slab);
+                }
+                return obj;
             }
-            (*slab).next = ptr::null_mut();
-            (*slab).prev = ptr::null_mut();
-            let obj = (*slab).alloc_obj();
-            let is_full = (*slab).is_full();
-            if is_full {
-                self.push_full_ptr(slab);
-            } else {
-                self.push_partial_ptr(slab);
-            }
-            self.lock.unlock();
-            return obj;
         }
-
-        // Allocate new slab
-        let Some(phys_addr) = phys::alloc_order(self.slab_order as usize) else {
-            self.lock.unlock();
-            return ptr::null_mut();
+        // Slow path: need a new slab. Release the per-cache lock before
+        // calling into `phys::` to avoid the wrong-direction lock order
+        // (`heap → phys`). Re-acquire the lock to install the slab.
+        let phys_addr = match phys::alloc_order(self.slab_order as usize) {
+            Some(p) => p,
+            None => return ptr::null_mut(),
         };
         // Map the slab's phys pages into the higher-half at
         // HIGHER_HALF + phys_addr. Without this explicit mapping, the
@@ -181,22 +165,21 @@ impl KmemCache {
         let slab = Slab::init(virt_base as *mut u8, self.slab_order, self.obj_size);
         let obj = (*slab).alloc_obj();
         let is_full = (*slab).is_full();
+        let _g = HEAP_LOCK.lock();
         if is_full {
-            self.push_full_ptr(slab);
+            Self::push_full_ptr(self, slab);
         } else {
-            self.push_partial_ptr(slab);
+            Self::push_partial_ptr(self, slab);
         }
-        self.lock.unlock();
         obj
     }
 
     unsafe fn free(&mut self, obj: *mut u8) {
-        self.lock.lock();
+        let _g = HEAP_LOCK.lock();
 
         // Find slab via raw pointer to avoid borrow conflicts
         let slab_ptr = self.find_slab_ptr(obj);
         if slab_ptr.is_null() {
-            self.lock.unlock();
             return;
         }
 
@@ -206,16 +189,15 @@ impl KmemCache {
 
         if was_full && !now_empty {
             // Full -> Partial: move from full list to partial list
-            self.remove_full_ptr(slab_ptr);
-            self.push_partial_ptr(slab_ptr);
+            Self::remove_full_ptr(self, slab_ptr);
+            Self::push_partial_ptr(self, slab_ptr);
         }
         if now_empty {
             // All freed: move to free list
             // Check partial list first, then full
-            self.remove_from_any_list(slab_ptr);
-            self.push_free_ptr(slab_ptr);
+            Self::remove_from_any_list(self, slab_ptr);
+            Self::push_free_ptr(self, slab_ptr);
         }
-        self.lock.unlock();
     }
 
     unsafe fn find_slab_ptr(&mut self, obj: *mut u8) -> *mut Slab {

@@ -279,6 +279,7 @@ define_stub_noerr!(stub_irq31, 63);
 
 define_stub_noerr!(stub_spurious, 255);
 define_stub_noerr!(stub_syscall, 0x80);
+define_stub_noerr!(stub_ipi, 0x81);
 
 // ---- Static IDT ----
 
@@ -287,15 +288,27 @@ static mut IDT: [IdtEntry; 256] = {
     [EMPTY; 256]
 };
 
-static mut IDTR: Idtr = Idtr {
-    limit: 0,
-    base: 0,
-};
+use lodaxos_system::MAX_CPUS;
 
-/// Return the higher-half virtual address of the IDT pointer. Used by
-/// the SMP bring-up code to write `target_idt_ptr` into each AP's ApArg.
+/// Per-CPU IDTR. Although the IDT contents are shared (handlers are
+/// CPU-agnostic), the IDTR register itself must be loaded by each CPU.
+/// On x86, the IDTR is a CPU-local register — every CPU can have a
+/// different IDT base.  We share the IDT contents but give each CPU
+/// its own IDTR slot so the SMP trampoline can `lidt` to a per-CPU
+/// pointer (this keeps the boot MP path identical: the boot code
+/// writes `target_idt_ptr` into each AP's ApArg from this function,
+/// and the AP loads it without further translation).
+static mut IDTR_TABLE: [Idtr; MAX_CPUS] = [const { Idtr { limit: 0, base: 0 } }; MAX_CPUS];
+
+/// Return the higher-half virtual address of the IDT pointer for `slot`.
+pub fn idt_pointer_for_slot(slot: usize) -> u64 {
+    let slot = slot % MAX_CPUS;
+    unsafe { &raw const IDTR_TABLE[slot] as u64 }
+}
+
+/// Backwards-compat alias (returns the BSP's IDTR pointer address).
 pub fn idt_pointer_address() -> u64 {
-    &raw const IDTR as u64
+    idt_pointer_for_slot(0)
 }
 
 // ---- IST1 stack for double faults ----
@@ -367,8 +380,13 @@ pub fn mask_pic() {
 pub fn init() {
     unsafe {
         let idt_base = &raw const IDT as u64;
-        IDTR.limit = (mem::size_of::<IdtEntry>() * 256 - 1) as u16;
-        IDTR.base = idt_base;
+        // Initialise every per-CPU IDTR slot to the same base.  The
+        // base is the same (we share the IDT contents), but each CPU
+        // has its own IDTR register that must be loaded.
+        for slot in 0..MAX_CPUS {
+            IDTR_TABLE[slot].limit = (mem::size_of::<IdtEntry>() * 256 - 1) as u16;
+            IDTR_TABLE[slot].base = idt_base;
+        }
 
         // Wire exception vectors 0–31
         set_gate(0, stub_de as *const () as u64, 0);
@@ -443,12 +461,15 @@ pub fn init() {
         // Syscall interrupt gate (vector 0x80)
         set_gate(0x80, stub_syscall as *const () as u64, 0);
 
-        // Set IST1 in TSS for double fault handler
+        // IPI interrupt gate (vector 0x81) — used for cross-CPU wake / balancing
+        set_gate(0x81, stub_ipi as *const () as u64, 0);
+
+        // Set IST1 in TSS for double fault handler (per-CPU).
         let ist1_addr = &raw const IST1_STACK.0 as u64 + 16384;
         super::gdt::set_ist1(ist1_addr);
 
-        // Load IDT
-        asm!("lidt [{idtr}]", idtr = in(reg) &raw const IDTR);
+        // Load IDT (BSP slot).
+        asm!("lidt [{idtr}]", idtr = in(reg) &raw const IDTR_TABLE[0]);
     }
 }
 
@@ -474,6 +495,7 @@ extern "C" fn interrupt_dispatcher(frame: &mut TrapFrame) {
         0..=31 => exception_handler(frame, vector),
         32..=63 => irq_handler(frame, vector),
         0x80 => syscall_handler(frame),
+        0x81 => ipi_handler(frame),
         0xFF => {},
         _ => exception_handler(frame, vector),
     }
@@ -559,19 +581,6 @@ fn exception_handler(frame: &mut TrapFrame, vector: u64) {
 // ---- IRQ handler (called from interrupt_dispatcher) ----
 
 fn irq_handler(frame: &mut TrapFrame, vector: u64) {
-    // RAW COM1 write: prove ISR is entered at all after context switch.
-    // Wait for THR empty so the byte is not lost to UART FIFO contention
-    // when the serial driver (log::info!) is mid-write.
-    unsafe {
-        // Wait for THR empty (bit 5 of LSR at 0x3FD)
-        loop {
-            let status: u8;
-            core::arch::asm!("in al, dx", in("dx") 0x3FDu16, out("al") status, options(nomem, nostack));
-            if status & 0x20 != 0 { break; }
-        }
-        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b'I', options(nomem, nostack));
-    }
-
     if super::apic::is_initialized() {
         super::apic::send_eoi();
     }
@@ -580,17 +589,20 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
             32 => {
             // LAPIC timer — scheduler heartbeat
             let t = crate::percpu::tick();
-            // Debug: verify timer fires after context switches
-            let bsp_fires = TIMER_FIRED_ON_BSP.fetch_add(1, Ordering::Relaxed) + 1;
-            log::info!(
-                "[timer] tick #{} (percpu_tick={})",
-                bsp_fires, t
-            );
+            let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
+            // Per-CPU rate-limited timer log.  Each CPU logs every
+            // ~200 ticks so the output doesn't saturate the serial port.
+            let fires = crate::percpu::PERCPU[cpu].timer_fires.fetch_add(1, Ordering::Relaxed) + 1;
+            if fires % 200 == 1 {
+                log::info!(
+                    "[timer] cpu={} tick={} percpu_tick={}",
+                    cpu, fires, t
+                );
+            }
 
-            // Preemptive context switch — only the BSP runs the
-            // scheduler. APs run a per-CPU idle loop and don't have
-            // their own task table state.
-            if crate::task::is_initialized() && super::apic::is_bsp() {
+            // Preemptive context switch — every CPU runs the scheduler
+            // on each timer tick.
+            if crate::task::is_initialized() {
                 if crate::task::schedule(frame) {
                     let new_rsp = frame.rsp;
                     let rip = frame.rip;
@@ -616,8 +628,8 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                             "mov rbp, {rbp}",
                             "mov rsi, {rsi}",
                             "mov rdi, {rdi}",
-                            "sti",
                             "push {rip}",
+                            "sti",
                             "ret",
                             rsp = in(reg) new_rsp,
                             rip = in(reg) rip,
@@ -705,6 +717,34 @@ fn syscall_handler(frame: &mut TrapFrame) {
             frame.rax = u64::MAX; // error
         }
     }
+}
+
+/// IPI vector number used for cross-CPU wake / reschedule requests.
+pub const IPI_VECTOR: u8 = 0x81;
+
+/// Flag set by the IPI handler; the timer ISR checks it to decide
+/// whether to reschedule after an IPI wake.
+pub(crate) static IPI_PENDING: AtomicU64 = AtomicU64::new(0);
+
+fn ipi_handler(_frame: &mut TrapFrame) {
+    // Mark that an IPI was received so the next timer tick knows to
+    // re-evaluate the runqueue.  We don't reschedule *here* because
+    // the IPI may have interrupted a critical section.
+    IPI_PENDING.store(1, Ordering::Release);
+
+    // TLB shootdown: if TLB_FLUSH_ADDR is non-zero, execute invlpg.
+    let flush_addr = crate::mm::virt::TLB_FLUSH_ADDR.load(Ordering::Acquire);
+    if flush_addr != 0 {
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) flush_addr);
+        }
+        // Acknowledge via our per-CPU TLB_ACK slot.
+        let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
+        crate::mm::virt::TLB_ACK[cpu].store(1, Ordering::Release);
+    }
+
+    log::trace!("IPI received");
+    super::apic::send_eoi();
 }
 
 fn halt_loop() -> ! {
