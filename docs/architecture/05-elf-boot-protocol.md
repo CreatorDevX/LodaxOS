@@ -2,7 +2,7 @@
 
 ## Overview
 
-The boot protocol defines how control and data pass between the three boot stages: chainloader, bootloader, and kernel. The protocol is centered on the `BootInfo` struct stored at physical address `0x1000`.
+The boot protocol defines how control and data pass between the three boot stages: chainloader, bootloader, and kernel. The protocol is centered on the `BootInfo` struct; only the 8-byte pointer lives at physical address `0x1000` (`BOOT_INFO_HANDOFF_ADDR`).
 
 ## BootInfo Protocol
 
@@ -37,21 +37,19 @@ pub struct BootInfo {
     pub kernel_image_size: u64,             // size of kernel ELF buffer
     pub rsdp_addr: u64,                     // ACPI RSDP physical address
     pub madt_addr: u64,                     // MADT physical address
-    pub exrun_image_addr: u64,              // physical addr of Executive Runtime ELF buffer
-    pub exrun_image_size: u64,              // size of ExRun ELF buffer
     pub max_cpus: u32,                      // MAX_CPUS (= 4)
     pub bsp_apic_id: u32,                   // BSP LAPIC ID
     pub ap_count: u32,                      // number of APs (0..MAX_CPUS)
     pub ap_apic_ids: [u32; MAX_CPUS],       // LAPIC ID of each AP
-    pub ap_arg_phys: [u64; MAX_CPUS],       // physical addr of each ApArg
 }
 ```
 
-The SMP handoff fields (`max_cpus`, `bsp_apic_id`, `ap_count`,
-`ap_apic_ids`, `ap_arg_phys`) are populated by the bootloader
-after `StartupThisAP` brings the APs up but before
-`exit_boot_services`. The kernel uses them in the BSP release
-loop to set each AP's `go = 1`.
+The SMP fields (`max_cpus`, `bsp_apic_id`, `ap_count`,
+`ap_apic_ids`) are populated by the bootloader via UEFI MP
+Services enumeration before `exit_boot_services`. The kernel
+brings APs up via LAPIC INIT-SIPI-SIPI after ExitBootServices,
+writing per-AP mailbox slots at 0x8400+ in the SIPI trampoline
+page, NOT via `ApArg` (which no longer exists).
 
 ### Lifecycle
 
@@ -98,13 +96,14 @@ All segments must be within the first 128 MB (`0x800_0000`). This is a safety ch
 ### Entry Point Convention
 
 The kernel entry point (`_start`) uses the System V AMD64 ABI calling convention:
-- `RDI` = `BOOT_INFO_ADDR` (0x1000) — pointer to BootInfo
+- `RDI` = physical address of the dynamically-allocated `BootInfo` struct
+  (the pointer stored at `BOOT_INFO_HANDOFF_ADDR` (`0x1000`), NOT the fixed address itself)
 - RSP must be mod 16 = 8 at entry (simulating the state after a `call` instruction)
 
 The bootloader jumps with:
 ```asm
 sub rsp, 8          ; align stack for SysV ABI (simulate missing call)
-mov rdi, BOOT_INFO  ; pass BootInfo address
+mov rdi, boot_info  ; pass BootInfo physical address (dynamically allocated)
 jmp entry           ; never returns
 ```
 
@@ -189,22 +188,21 @@ The kernel is loaded at exactly `0x100000` by the bootloader. No relocation proc
 
 ## Future Protocol Extensions
 
-### Multi-Processor Boot
+### Multi-Processor Boot (Implemented)
 
-For SMP support, the BootInfo will need:
-- Per-CPU stack pointers
-- APIC ID list
-- SIPI trampoline location
-
-The boot protocol will be extended without breaking backward compatibility by adding optional fields at the end of the BootInfo struct, using `size` or `version` fields to detect which fields are present.
+SMP is already implemented:
+- `BootInfo.ap_apic_ids` carries the list of AP LAPIC IDs (populated by UEFI MP Services)
+- Per-CPU kernel stacks are allocated by the kernel from the buddy allocator (not in BootInfo)
+- SIPI trampoline is at fixed address `0x8000` (SIPI vector 0x08), loaded by `arch::smp::init()`
+- AP mailbox slots at `0x8400+` carry per-AP GDT/IDT pointers, stack top, entry point, and PML4
+- BSP broadcasts INIT to all APs → 10ms → broadcasts SIPI (vector 0x08) → 1ms → broadcasts second SIPI → polls per-AP status bytes
 
 ### Device Tree Blob
 
 On non-ACPI systems (e.g., RISC-V, ARM), the boot protocol should support passing a flattened device tree (FDT) instead of ACPI tables. The BootInfo could gain a `dtb_addr` field alongside `rsdp_addr`.
 
-### Secure Runtime Boot
+### Executive Runtime (Removed)
 
-When Secure Runtime is implemented, the bootloader will need to load SR as a separate binary alongside the kernel. This could be:
-- Another entry in the kernel ELF file (as a separate segment)
-- A second file loaded from the ext4 partition
-- Embedded in the kernel binary and extracted at boot
+The Executive Runtime (`exrun`) crate has been removed from the workspace. It was a
+`loop { hlt }` stub with its own forked PML4 and shared mailbox. A future Secure Runtime
+may replace it with a full policy engine and capability broker.

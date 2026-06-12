@@ -42,14 +42,10 @@ fn main() -> Status {
         kernel_image_size: 0,
         rsdp_addr: 0,
         madt_addr: 0,
-        exrun_image_addr: 0,
-        exrun_image_size: 0,
         max_cpus: lodaxos_system::MAX_CPUS as u32,
         bsp_apic_id: 0,
-        ap_trampoline_phys: 0,
         ap_count: 0,
         ap_apic_ids: [0u32; lodaxos_system::MAX_CPUS],
-        ap_arg_phys: [0u64; lodaxos_system::MAX_CPUS],
     });
     let boot_info_ptr = alloc::boxed::Box::into_raw(boot_info) as *mut BootInfo;
     let boot_info_phys = boot_info_ptr as u64;

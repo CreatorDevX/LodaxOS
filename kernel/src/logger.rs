@@ -4,6 +4,22 @@ use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 
 use crate::serial;
 
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> Write for BufWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let n = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
 struct SerialLogger;
 
 impl Log for SerialLogger {
@@ -12,8 +28,8 @@ impl Log for SerialLogger {
     }
 
     fn log(&self, record: &Record) {
-        let level = record.level();
-        let level_padded = match level {
+        let cpu = crate::percpu::current_apic_id();
+        let level_padded = match record.level() {
             Level::Error => "ERROR",
             Level::Warn => "WARN ",
             Level::Info => "INFO ",
@@ -21,22 +37,21 @@ impl Log for SerialLogger {
             Level::Trace => "TRACE",
         };
 
-        serial::write_str("[");
-        serial::write_str(level_padded);
-        serial::write_str("] ");
-        serial::write_str(record.target());
-        serial::write_str(": ");
+        let mut buf = [0u8; 512];
+        let mut w = BufWriter { buf: &mut buf, pos: 0 };
 
-        struct SerialWriter;
-        impl Write for SerialWriter {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                serial::write_str(s);
-                Ok(())
-            }
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!("[CPU{}] [{}] {}: ", cpu, level_padded, record.target()),
+        );
+        let _ = core::fmt::write(&mut w, *record.args());
+        let _ = w.write_str("\n");
+
+        let filled = w.pos;
+        if filled > 0 {
+            let s = unsafe { core::str::from_utf8_unchecked(&buf[..filled]) };
+            serial::write_str(s);
         }
-
-        let _ = core::fmt::write(&mut SerialWriter, *record.args());
-        serial::write_str("\n");
     }
 
     fn flush(&self) {}

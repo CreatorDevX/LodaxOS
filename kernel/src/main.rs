@@ -8,7 +8,6 @@ extern crate alloc;
 mod acpi;
 mod arch;
 mod cap;
-mod exec;
 mod font;
 mod intr;
 mod logger;
@@ -139,7 +138,8 @@ fn format_free_mb(mb: u64, buf: &mut [u8; 32]) -> &str {
 }
 
 /// Kernel entry point. Called by the bootloader after loading the ELF.
-/// `boot_info` is a pointer to the BootInfo struct at physical address 0x1000.
+/// `boot_info` is a pointer to the dynamically-allocated BootInfo struct;
+/// the pointer itself is stored at BOOT_INFO_HANDOFF_ADDR (0x1000).
 #[unsafe(no_mangle)]
 extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let info = unsafe { &*boot_info };
@@ -238,51 +238,14 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         ([acpi::madt::IoApicInfo { ioapic_id: 0, addr: 0, gsi_base: 0 }; acpi::madt::MAX_IOAPICS], 0, None)
     };
 
-    // Reserve AP pages BEFORE virt::init() — the buddy allocator is live
-    // but has not yet allocated anything (virt::init will allocate ~1600
-    // page-table pages). UEFI page tables are still active so reading
-    // *(arg_phys as *const ApArg) is safe.
-    if info.ap_count > 0 {
-        unsafe {
-            use lodaxos_system::ApArg;
-            let tramp_page = info.ap_trampoline_phys & !0xFFF;
-            if tramp_page != 0 {
-                mm::phys::reserve_range(tramp_page, 1);
-                log::info!("reserved AP boot trampoline page at {:#x}", tramp_page);
-            }
-            let ap_stack_pages = 4usize;
-            for i in 0..(info.ap_count as usize) {
-                let arg_phys = info.ap_arg_phys[i];
-                mm::phys::reserve_range(arg_phys, 1);
-                let ap = arg_phys as *const ApArg;
-                let stack_top = (*ap).target_kernel_stack;
-                if stack_top > 0 {
-                    let stack_base = stack_top - (ap_stack_pages as u64) * 4096;
-                    mm::phys::reserve_range(stack_base, ap_stack_pages);
-                    log::info!(
-                        "reserved AP[{}] Arg={:#x} stack={:#x}..{:#x}",
-                        i, arg_phys, stack_base, stack_top
-                    );
-                }
-            }
-        }
-    }
+    // Initialise the SIPI trampoline.  The buddy allocator is live but
+    // has not yet allocated anything (virt::init will allocate ~1600
+    // page-table pages).  We reserve the trampoline page and copy the
+    // binary before virt::init because the page-tables we're building
+    // identity-map the first 4 GB (including 0x8000).
+    arch::smp::init();
 
-    // Reserve the ExRun ELF staging buffer BEFORE virt::init().
-    // The buffer lives in UEFI LOADER_DATA pages that are now in the
-    // buddy free lists. Without this reservation, virt::init()'s
-    // ~1600 page-table allocations can overwrite the ELF data,
-    // corrupting e_entry and causing a #UD at a garbage address.
-    if info.exrun_image_addr != 0 && info.exrun_image_size > 0 {
-        let base = info.exrun_image_addr & !0xFFFu64;
-        let end = info.exrun_image_addr + info.exrun_image_size;
-        let pages = ((end - base + 4095) / 4096) as usize;
-        unsafe { mm::phys::reserve_range(base, pages) };
-        log::info!(
-            "reserved ExRun ELF buffer at {:#x} ({} pages)",
-            base, pages
-        );
-    }
+
 
     // Reserve the framebuffer pages BEFORE virt::init(). The GOP framebuffer
     // typically lives inside a UEFI "free" memory region, so the buddy
@@ -400,8 +363,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     y += line_h;
     fb.write_str("[x] Kernel VMA tree (demand paging)", 20, y, 0, 255, 0);
     y += line_h;
-    fb.write_str("[x] Executive Runtime loaded", 20, y, 0, 255, 0);
-    y += line_h;
+
 
     fb.write_str("[x] LAPIC MMIO mapped", 20, y, 0, 255, 0);
     y += line_h;
@@ -443,36 +405,6 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     task::init();
     task::init_idle_task();
 
-    // Create test kernel tasks
-    let task1_entry = simple_task1 as *const () as u64;
-    if let Some(task_id) = task::create_task(task1_entry) {
-        log::info!("Created test task 1 with ID {}", task_id);
-    }
-
-    let task2_entry = simple_task2 as *const () as u64;
-    if let Some(task_id) = task::create_task(task2_entry) {
-        log::info!("Created test task 2 with ID {}", task_id);
-    }
-
-    log::info!("Task system ready — {} tasks registered", task::task_count());
-
-    // Spawn Executive Runtime as a separate ring-0 process. Must be
-    // AFTER task::init_idle_task() so the task table is initialised
-    // and the scheduler can find a slot. exec::load forks the kernel's
-    // PML4, maps the ExRun ELF + mailbox into the new PML4, and
-    // registers a Task. The next schedule() will time-slice it.
-    log::info!("Spawning Executive Runtime as separate ring-0 process");
-    fb.write_str("[ ] Executive Runtime...", 20, y, 180, 180, 180);
-    match exec::load(&info) {
-        Some(task_id) => {
-            log::info!("ExRun: spawned as task {} (own PML4, shared mailbox)", task_id);
-            fb.write_str("[x] Executive Runtime (separate PML4)", 20, y, 0, 255, 0);
-        }
-        None => {
-            log::warn!("ExRun: not spawned (no image or cap denied)");
-            fb.write_str("[!] Executive Runtime not spawned", 20, y, 255, 200, 0);
-        }
-    }
     y += line_h;
 
     if ioapic_count > 0 {
@@ -493,10 +425,10 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     arch::apic::pit_enable_periodic(100);
 
-    // Release APs brought up by the boot MP Services. Each AP will
-    // enter `ap_entry` and block on `kernel_ready`.
-    log::info!("SMP: releasing APs (ap_count={})", info.ap_count);
-    ap_start::release_aps(info);
+    // Bring up APs via SIPI trampoline. Each AP enters `ap_entry` and
+    // blocks on `kernel_ready`.
+    log::info!("SMP: booting {} AP(s) via INIT-SIPI-SIPI", info.ap_count);
+    ap_start::smp_boot_aps(info);
 
     // All CPUs (BSP + APs) may now enter the scheduler. APs are
     // spinning on `kernel_ready` in `ap_entry`; this releases them.
@@ -573,50 +505,17 @@ pub(crate) fn has_xsave() -> bool {
             out(reg) ecx,
             out("eax") _,
             out("edx") _,
-            options(nostack, preserves_flags),
         );
     }
     (ecx & (1 << 26)) != 0
 }
 
-/// Test task 1: busy-loop counter, preemption handles switching
-unsafe fn simple_task1() {
-    let mut counter = 0u64;
-    loop {
-        counter += 1;
-        if counter == 1_000_000 {
-            // Diagnostic: read LAPIC timer registers to check if timer is alive
-            const APIC_LVT_TIMER: usize = 0x320;
-            const APIC_TICR: usize = 0x380;
-            const APIC_CCR: usize = 0x390;
-            let lvt = arch::apic::read32(APIC_LVT_TIMER);
-            let ticr = arch::apic::read32(APIC_TICR);
-            let ccr = arch::apic::read32(APIC_CCR);
-            log::info!("[task1] LAPIC diag: LVT={:#x} TICR={} CCR={}", lvt, ticr, ccr);
-        }
-        if counter % 500_000 == 0 {
-            log::info!("[task1] counter={}", counter);
-        }
-    }
-}
-
-/// Test task 2: busy-loop counter, preemption handles switching
-unsafe fn simple_task2() {
-    let mut counter = 0u64;
-    loop {
-        counter += 1;
-        if counter % 750_000 == 0 {
-            log::info!("[task2] counter={}", counter);
-        }
-    }
-}
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(loc) = info.location() {
-        serial::write_str("PANIC at ");
-        serial::write_str(loc.file());
-        serial::write_str(":");
+        serial::write_str_unlocked("PANIC at ");
+        serial::write_str_unlocked(loc.file());
+        serial::write_str_unlocked(":");
         let mut line_buf = [0u8; 10];
         let mut val = loc.line();
         let mut i = 0;
@@ -631,21 +530,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             }
         }
         for &b in line_buf[..i].iter().rev() {
-            serial::write_str(core::str::from_utf8(&[b]).unwrap_or("?"));
+            serial::write_str_unlocked(core::str::from_utf8(&[b]).unwrap_or("?"));
         }
-        serial::write_str("\n");
+        serial::write_str_unlocked("\n");
     }
     use core::fmt::Write;
     struct SerialWriter;
     impl Write for SerialWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            serial::write_str(s);
+            serial::write_str_unlocked(s);
             Ok(())
         }
     }
-    serial::write_str("  message: ");
+    serial::write_str_unlocked("  message: ");
     let _ = write!(SerialWriter, "{}", info.message());
-    serial::write_str("\n");
+    serial::write_str_unlocked("\n");
     loop {
         unsafe { core::arch::asm!("cli; hlt") };
     }

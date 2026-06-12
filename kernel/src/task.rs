@@ -121,6 +121,7 @@ pub fn init_idle_task() {
         .expect("failed to allocate idle kernel stack");
     let stack_base = virt::HIGHER_HALF + pages;
     let stack_top = stack_base + KERNEL_STACK_SIZE;
+    unsafe { virt::map_contiguous(virt::pml4_address(), stack_base, pages, 2, virt::DATA); }
     unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE as usize) };
 
     let current_rsp: u64;
@@ -228,6 +229,10 @@ pub fn create_task_in(entry: u64, arg: u64, pml4_phys: u64) -> Option<usize> {
 
     unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE as usize) };
 
+    // Map the stack into the task's page tables so it is accessible
+    // after the scheduler switches CR3 to this PML4.
+    unsafe { virt::map_contiguous(pml4_phys, stack_base, pages, 2, virt::DATA); }
+
     let iretq_frame = stack_top - IRETQ_FRAME_SIZE;
     unsafe {
         (iretq_frame as *mut u64).write(entry);
@@ -284,14 +289,18 @@ pub fn create_task_in(entry: u64, arg: u64, pml4_phys: u64) -> Option<usize> {
 
 /// Called from the LAPIC timer IRQ handler on EVERY CPU.
 ///
-/// Returns true if a context switch occurred.
-pub fn schedule(frame: &mut TrapFrame) -> bool {
+/// Returns `(true, next_pml4)` if a context switch occurred.
+/// `next_pml4` is the physical address of the target task's PML4,
+/// or 0 if no CR3 switch is needed.  The caller must switch CR3
+/// **after** switching RSP to the new task's stack so that the
+/// old stack remains valid during the log::info! calls that follow.
+pub fn schedule(frame: &mut TrapFrame) -> (bool, u64) {
     let cpu_id = current_cpu_id();
     let m = manager_ptr();
     let _g = unsafe { lock_manager() };
     unsafe {
         if (*m).count < 2 {
-            return false;
+            return (false, 0);
         }
 
         let original_rsp = frame.rsp;
@@ -307,13 +316,13 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
         let next = match crate::percpu::rq(cpu_id).pop() {
             Some(id) => id,
             // Nothing ready on this CPU — stay on current.
-            None => return false,
+            None => return (false, 0),
         };
 
         if next == cur {
             // Push it back so it gets picked next tick.
             crate::percpu::rq(cpu_id).push(next);
-            return false;
+            return (false, 0);
         }
 
         // ---- Advance current task's vruntime ----
@@ -339,16 +348,16 @@ pub fn schedule(frame: &mut TrapFrame) -> bool {
         }
 
         let cur_pml4 = virt::pml4_address();
-        if next_pml4 != cur_pml4 && next_pml4 != 0 {
+        let need_switch = next_pml4 != cur_pml4 && next_pml4 != 0;
+        if need_switch {
             log::trace!("sched: switch PML4 {:#x} → {:#x}", cur_pml4, next_pml4);
-            virt::switch_pml4(next_pml4);
         }
 
         log::info!("sched: CPU{} task {} → {} (vruntime {} → {})",
             cpu_id, cur, next,
             if let Some(t) = &(*m).tasks[cur] { t.vruntime } else { 0 },
             if let Some(t) = &(*m).tasks[next] { t.vruntime } else { 0 });
-        true
+        (true, if need_switch { next_pml4 } else { 0 })
     }
 }
 
@@ -372,7 +381,10 @@ pub fn block_current(frame: &mut TrapFrame) {
     }
     // Release lock before schedule (schedule locks internally).
     drop(_g);
-    schedule(frame);
+    let (_, next_pml4) = schedule(frame);
+    if next_pml4 != 0 {
+        virt::switch_pml4(next_pml4);
+    }
 }
 
 pub fn wake(task_id: usize) {

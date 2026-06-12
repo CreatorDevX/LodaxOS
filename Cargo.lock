@@ -39,14 +39,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lodaxos-exrun"
-version = "0.1.0"
-dependencies = [
- "lodaxos-system",
- "log",
-]
-
-[[package]]
 name = "lodaxos-kernel"
 version = "0.1.0"
 dependencies = [

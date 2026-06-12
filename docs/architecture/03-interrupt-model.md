@@ -60,7 +60,7 @@ The MADT contains Interrupt Source Override (ISO) entries that map ISA IRQ sourc
 - ISA IRQ 0 (PIT) → GSI 2
 - ISA IRQ 1 (keyboard) → GSI 1
 
-The interrupt routing table (`src/intr/mod.rs`) is built as follows:
+The interrupt routing table (`kernel/src/intr/mod.rs`) is built as follows:
 
 1. For each ISO entry with `bus == 0`:
    - Record the ISA IRQ source → GSI mapping
@@ -211,15 +211,16 @@ When PCI enumeration is implemented, MSI/MSI-X interrupts will be programmed by:
 2. Writing the message address (MSI: `0xFEE` + destination APIC ID) and message data (vector) to the PCI device's MSI capability
 3. No IOAPIC involvement — MSIs go directly from the PCI bus to the LAPIC
 
-### IPI (Inter-Processor Interrupts)
+### IPI (Inter-Processor Interrupts) — Implemented
 
-For SMP support, IPIs will be sent via the LAPIC's ICR (Interrupt Command Register):
-- `X2APIC` mode: write to MSR `0x830` + `0x831`
-- `XAPIC` mode: write to MMIO `0x300` (ICR low) then `0x310` (ICR high)
+IPIs are sent via the LAPIC's ICR (Interrupt Command Register) in xAPIC MMIO mode:
+- Write destination APIC ID to `0x310` (ICR high)
+- Write vector + delivery mode to `0x300` (ICR low)
+- Poll for delivery status clear
 
 Common IPI types:
-- INIT (vector 0): Start a processor
-- STARTUP (vector 0x467): SIPI with startup address
+- INIT (vector 0, ICR bit 11): Start a processor (used in INIT-SIPI-SIPI sequence)
+- STARTUP (vector 0x467, bit 11): SIPI with startup address (used in INIT-SIPI-SIPI)
 - Fixed: Deliver a specific vector (e.g., TLB shootdown, reschedule)
 
 ### NMI Handling

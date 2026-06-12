@@ -10,13 +10,11 @@
 //!
 //! ## SMP bring-up
 //!
-//! The boot crate brings APs up via UEFI MP Services. The trampoline
-//! switches the AP to the kernel's PML4/GDT/IDT/stack and sets
-//! `ApArg.ready = 1`. The kernel main writes `ApArg.target_pml4_phys`,
-//! `ApArg.target_gdt_ptr`, `ApArg.target_idt_ptr`, and
-//! `ApArg.target_entry` for each AP, then sets `ApArg.go = 1`.
-//! The trampoline then jumps into `ap_start::ap_entry`, which is the
-//! per-CPU entry point in long mode with kernel state fully set up.
+//! The kernel brings APs up via LAPIC INIT-SIPI-SIPI using a real-mode
+//! trampoline at physical address 0x8000.  The trampoline switches the AP
+//! to the kernel's PML4/GDT/IDT/stack and jumps into `ap_start::ap_entry`,
+//! which is the per-CPU entry point in long mode with kernel state fully
+//! set up.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use lodaxos_system::MAX_CPUS;
@@ -28,11 +26,15 @@ pub const MAX_TASKS: usize = 32;
 /// Lock-free for single-producer (timer ISR on this CPU) and
 /// single-consumer (schedule on this CPU). Cross-CPU wake/steal
 /// uses the global task table lock.
+///
+/// Uses the standard SPSC pattern: the producer writes the entry
+/// *then* advances `tail` (release) to publish; the consumer reads
+/// `tail` (acquire) *then* reads the entry.  `pop` advances `head`
+/// (release) to vacate the slot for the producer's full-check.
 pub struct ReadyQueue {
     pub buf: [AtomicUsize; MAX_TASKS],
     pub head: AtomicUsize,
     pub tail: AtomicUsize,
-    pub count: AtomicUsize,
 }
 
 impl ReadyQueue {
@@ -41,27 +43,18 @@ impl ReadyQueue {
             buf: [const { AtomicUsize::new(0) }; MAX_TASKS],
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            count: AtomicUsize::new(0),
         }
     }
 
     /// Push a task ID onto this CPU's ready queue.
     /// Returns `false` if the queue is full.
     pub fn push(&self, id: usize) -> bool {
-        let mut c = self.count.load(Ordering::Relaxed);
-        loop {
-            if c >= MAX_TASKS {
-                return false;
-            }
-            match self.count.compare_exchange_weak(
-                c, c + 1, Ordering::Acquire, Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => c = actual,
-            }
-        }
         let t = self.tail.load(Ordering::Relaxed);
-        self.buf[t % MAX_TASKS].store(id, Ordering::Release);
+        let h = self.head.load(Ordering::Acquire);
+        if t.wrapping_sub(h) >= MAX_TASKS {
+            return false;
+        }
+        self.buf[t % MAX_TASKS].store(id, Ordering::Relaxed);
         self.tail.store(t.wrapping_add(1), Ordering::Release);
         true
     }
@@ -69,34 +62,23 @@ impl ReadyQueue {
     /// Pop a task ID from this CPU's ready queue.
     /// Returns `None` if the queue is empty.
     pub fn pop(&self) -> Option<usize> {
-        let c = self.count.load(Ordering::Relaxed);
-        if c == 0 {
+        let h = self.head.load(Ordering::Relaxed);
+        let t = self.tail.load(Ordering::Acquire);
+        if h == t {
             return None;
         }
-        // Decrement count.
-        loop {
-            let actual = self.count.compare_exchange_weak(
-                c, c - 1, Ordering::Acquire, Ordering::Relaxed,
-            );
-            match actual {
-                Ok(_) => break,
-                Err(a) => {
-                    if a == 0 { return None; }
-                }
-            }
-        }
-        let h = self.head.load(Ordering::Relaxed);
-        let id = self.buf[h % MAX_TASKS].load(Ordering::Acquire);
+        let id = self.buf[h % MAX_TASKS].load(Ordering::Relaxed);
         self.head.store(h.wrapping_add(1), Ordering::Release);
         Some(id)
     }
 
     /// Peek at the front without removing.
     pub fn peek(&self) -> Option<usize> {
-        if self.count.load(Ordering::Relaxed) == 0 {
+        let h = self.head.load(Ordering::Relaxed);
+        let t = self.tail.load(Ordering::Acquire);
+        if h == t {
             return None;
         }
-        let h = self.head.load(Ordering::Relaxed);
         Some(self.buf[h % MAX_TASKS].load(Ordering::Relaxed))
     }
 }
@@ -191,7 +173,6 @@ pub fn mark_online(apic_id: u32) {
         (*p).apic_id.store(apic_id, Ordering::Release);
         (*p).online.store(true, Ordering::Release);
     }
-    log::info!("percpu: CPU {} online", apic_id);
 }
 
 pub fn is_online(cpu: usize) -> bool {
@@ -208,10 +189,10 @@ pub fn wait_for_kernel_ready(apic_id: u32) {
 }
 
 /// Release all APs by setting `kernel_ready` for every slot, even those
-/// not yet online. `release_aps()` (which writes `go = 1` and wakes the
-/// AP) runs *before* the APs have had time to boot through the trampoline
-/// and call `mark_online` — by the time each AP reaches
-/// `wait_for_kernel_ready` its flag will already be `true`.
+/// not yet online.  `smp_boot_aps()` runs *before* the APs have had time
+/// to boot through the SIPI trampoline and call `mark_online` — by the
+/// time each AP reaches `wait_for_kernel_ready` its flag will already
+/// be `true`.
 pub fn release_all_aps() {
     for slot in 0..MAX_CPUS {
         PERCPU[slot].kernel_ready.store(true, Ordering::Release);
@@ -260,7 +241,10 @@ pub fn install_gs_base(slot: usize) {
         // and matches the Linux convention.
         wrmsr(IA32_KERNEL_GS_BASE, ptr);
         // Cache the LAPIC ID in TSC_AUX for `rdtscp`-based lookups.
-        wrmsr(IA32_TSC_AUX, apic_id as u64);
+        // Only write if the CPU supports RDTSCP — `qemu64` lacks it.
+        if has_rdtscp() {
+            wrmsr(IA32_TSC_AUX, apic_id as u64);
+        }
     }
 }
 

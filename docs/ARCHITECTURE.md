@@ -26,7 +26,7 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 
 ### What Exists Today
 
-- 6-crate Rust workspace producing UEFI-compatible binaries
+- 5-crate Rust workspace producing UEFI-compatible binaries
 - Two-stage UEFI boot chain (chainloader â†’ bootloader â†’ kernel)
 - Bare-metal x86-64 kernel with full interrupt handling
 - 4-level page tables with higher-half mapping
@@ -37,15 +37,16 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 - Preemptive CFS (Completely Fair Scheduler) task scheduler with syscall interface
 - Self-contained ext4 filesystem reader (bootloader only)
 - UEFI GOP framebuffer with bitmap font rendering
-- Secure Runtime (`sr`) stub binary loaded into a higher-half address (entry parsed, never jumped to)
+- SMP support via INIT-SIPI-SIPI (up to 4 CPUs)
+- Secure Runtime (planned): policy process with forked PML4 and shared mailbox for dynamic capability brokering
 
-### What Is Planned (see 08-future-architecture.md)
+### What Is Planned (see 10-future-architecture.md)
 
 - Secure Runtime: userspace service manager, policy engine, capability broker
 - PyI: JIT-compiled Python/WASM runtime for userspace applications
 - Agent model: first-class system domains with isolated userspace environments
 - Driver services: device-specific logic outside the kernel
-- PCI enumeration, MSI/MSI-X, SMP support
+- PCI enumeration, MSI/MSI-X
 - Layered recovery from application through kernel
 
 ## System Structure
@@ -103,7 +104,14 @@ Fault codes follow a flat hex numbering: `0x0x` = hard fault, `0x1x` = soft faul
 
 ## File Layout
 
-All kernel implementation lives in `src/` at the workspace root. The `shared/` crate re-exports `src/` code via `#[path]` and `include!` directives. Individual crate entry points are in `chain/src/`, `boot/src/`, and `kernel/src/`. This single-source layout avoids duplication while allowing independent compilation targets (UEFI PE32+ vs. bare-metal ELF).
+Each crate has its own `src/` directory with independent implementations:
+- `system/src/` â€” shared type definitions (BootInfo, Caps, Mailbox)
+- `chain/src/` â€” first-stage UEFI chainloader
+- `boot/src/` â€” second-stage UEFI bootloader (ext4 parser, ELF loader)
+- `kernel/src/` â€” bare-metal kernel
+
+
+There is no shared `src/` root directory or `shared/` crate. Each crate is self-contained and depends only on `lodaxos-system` for type definitions.
 
 ---
 
@@ -111,32 +119,25 @@ All kernel implementation lives in `src/` at the workspace root. The `shared/` c
 
 ## Workspace Topology
 
-The workspace `Cargo.toml` at root defines six members with resolver version 2:
+The workspace `Cargo.toml` at root defines four members with resolver version 2:
 
 ```toml
 [workspace]
-members = ["system", "shared", "chain", "boot", "kernel", "sr"]
+members = ["system", "chain", "boot", "kernel"]
 resolver = "2"
 ```
 
 The dependency graph is a directed acyclic graph:
 
 ```
-lodaxos-system  (no deps)
+lodaxos-system  (no deps, pure types)
       â†“
-lodaxos-core    (depends on lodaxos-system)
-      â†“
-lodaxos-kernel  (depends on lodaxos-core, lodaxos-system)
-      â†“
-lodaxos-boot    (depends on lodaxos-core, lodaxos-system)
-      â†“
+lodaxos-kernel  (depends on lodaxos-system)
+lodaxos-boot    (depends on lodaxos-system)
 lodaxos-chain   (depends on lodaxos-system)
-lodaxos-sr      (depends on lodaxos-system)
 ```
 
-`lodaxos-chain` depends only on `lodaxos-system` (not `lodaxos-core`) because the chainloader has its own inline serial driver â€” it does not need the full shared subsystem library.
-
-`lodaxos-sr` is the Secure Runtime stub. It is built as a bare-metal `x86_64-unknown-none` ELF (custom `sr/target.json`, base `0xFFFF_9000_0000_0000`, code-model=large) and is loaded by the kernel into a higher-half staging buffer. The current implementation is a `loop { hlt }` placeholder that logs its own entry point and never executes.
+Each crate is self-contained â€” there is no shared implementation crate. The kernel and bootloader both have their own independent copies of serial, logger, and other infrastructure code. This is intentional: they run at different privilege levels and different environments (UEFI vs bare metal), and the amount of shared code is small.
 
 ## Crate Purposes
 
@@ -145,40 +146,25 @@ lodaxos-sr      (depends on lodaxos-system)
 **Purpose**: Pure type definitions shared across all boot stages. Zero dependencies, `#![no_std]`.
 
 **Contents**:
-- `BootInfo` struct â€” the inter-stage communication structure at physical address `0x1000`
+- `BootInfo` struct â€” the inter-stage communication structure (dynamically allocated; 8-byte pointer at `0x1000` = `BOOT_INFO_HANDOFF_ADDR`)
 - `FramebufferInfo` â€” GOP framebuffer metadata (address, resolution, stride, pixel format)
 - `MemoryRegion` â€” (phys_start, size) pair for free memory regions
-- Constants: `BOOT_INFO_ADDR` (`0x1000`), `MAX_MEMORY_REGIONS` (`128`)
+- `Caps` / `CapOp` / `CapError` / `CapResponse` / `CapRequest` / `Mailbox` â€” capability-system types and kernelâ†”policy-process IPC page (reserved for future use)
+- Constants: `BOOT_INFO_HANDOFF_ADDR` (`0x1000`), `MAX_MEMORY_REGIONS` (`128`), `MAX_CPUS` (`4`)
 
 **Rationale**: Separating types into their own crate avoids circular dependencies and ensures that every boot stage agrees on the exact memory layout of the handoff struct. A single-byte misalignment between chainloader and kernel would cause silent data corruption.
-
-### `lodaxos-core` (`shared/`)
-
-**Purpose**: Canonical implementation of all kernel subsystems, re-exported for use by both the kernel and the bootloader.
-
-**Contents**: Re-exports via one-liner wrappers:
-- `serial.rs` â€” `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/serial.rs"));`
-- `logger.rs` â€” thin wrapper re-exporting `src/logger.rs`
-- `task.rs` â€” `include!()` macro includes `src/task.rs` directly
-- `font.rs` â€” thin wrapper
-- `arch/` module â€” re-exports `src/arch/*`
-- `acpi/` module â€” re-exports `src/acpi/*`
-- `mm/` module â€” re-exports `src/mm/*`
-- `intr/` module â€” re-exports `src/intr/*`
-
-**Rationale**: The bootloader and kernel need the same serial driver, the same logger, the same memory allocators. Rather than compile the same code twice (or worse, maintain two copies), the shared crate uses `include!` to pull in the canonical source. Each target crate then re-exports from `lodaxos_core::*`.
 
 ### `lodaxos-chain` (`chain/`)
 
 **Purpose**: First-stage UEFI chainloader. Its job is minimal: initialize the serial port, write a skeleton `BootInfo` at `0x1000`, read `Bootloader.efi` from the ESP, and chainload it via `uefi::boot::load_image` + `start_image`.
 
 **Key design choices**:
-- Own inline serial init (raw `out` instructions) instead of depending on `lodaxos-core` â€” keeps the chainloader small and independent
+- Own inline serial init (raw `out` instructions) â€” keeps the chainloader small and independent
 - Does not parse ext4 â€” that's the bootloader's job
 - Does not exit boot services â€” that's the bootloader's job
 - Captures memory map and framebuffer info, writes them to `BootInfo`, then hands off
 
-**Why two-stage?** The chainloader is a simple PE32+ on FAT32. The bootloader is a larger binary that includes a full ext4 parser and ELF loader. Separating them lets the chainloader stay small (386 KB) and reliable.
+**Why two-stage?** The chainloader is a simple PE32+ on FAT32. The bootloader is a larger binary that includes a full ext4 parser and ELF loader. Separating them lets the chainloader stay small (~386 KB) and reliable.
 
 ### `lodaxos-boot` (`boot/`)
 
@@ -187,15 +173,17 @@ lodaxos-sr      (depends on lodaxos-system)
 2. Re-collects the UEFI memory map (allocations from chainload may have changed it)
 3. Loads `kernel.elf` from the ext4 partition using its own ext4 filesystem parser
 4. Captures the ACPI RSDP from the UEFI configuration table
-5. Writes the updated `BootInfo` back to `0x1000`
-6. Calls `exit_boot_services()`
-7. Loads the kernel ELF segments into physical memory
-8. Jumps to the kernel entry point
+5. Enumerates AP LAPIC IDs via UEFI MP Services protocol
+6. Writes the updated `BootInfo` back through the dynamic pointer
+7. Calls `exit_boot_services()`
+8. Loads the kernel ELF segments into physical memory
+9. Jumps to the kernel entry point
 
 **Key design choices**:
 - Self-contained ext4 parser â€” no external crate dependency for filesystem reading
 - Must capture RSDP *before* `exit_boot_services` â€” after that, UEFI runtime services are gone
 - Must `cli` immediately after `exit_boot_services` â€” stale UEFI timer interrupts would triple-fault without our IDT
+- UEFI MP Services is only used to *enumerate* APs â€” the kernel brings them up via INIT-SIPI-SIPI after ExitBootServices
 
 ### `lodaxos-kernel` (`kernel/`)
 
@@ -208,42 +196,14 @@ lodaxos-sr      (depends on lodaxos-system)
 - Custom linker script (see 05-elf-boot-protocol.md)
 - No `eh_frame`, no `comment`, no `note` sections â€” discarded to save space
 
-## Module Wrapper Pattern
-
-Each target crate has thin module stubs that re-export from the shared crate:
-
-```rust
-// kernel/src/serial.rs
-pub use lodaxos_core::serial::*;
-```
-
-```rust
-// kernel/src/mm/mod.rs
-pub use lodaxos_core::mm::*;
-```
-
-This lets kernel code write `crate::serial::write_str(...)` or `crate::mm::phys::alloc_page()` without caring whether the implementation lives in `kernel/src/` or `shared/src/`. The bootloader uses the exact same pattern with `boot/src/` stubs.
-
-For `task.rs`, which is tightly coupled to the kernel's `TrapFrame` and `mm::phys`/`mm::virt`, the shared crate uses `include!` directly:
-
-```rust
-// shared/src/task.rs
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/task.rs"));
-```
-
-This means the canonical `src/task.rs` is compiled as part of `lodaxos-core`, and both `kernel::task` and `boot::task` re-export from it. The bootloader does not actually use the task scheduler, but the code compiles because the linker discards unused symbols.
-
 ## Build Targets
 
 | Profile | Target triple | Uses std |
 |---|---|---|
 | Debug/Release (lodaxos-system) | host | yes (cargo default) |
-| Debug/Release (lodaxos-core) | host | yes |
 | Debug/Release (lodaxos-kernel) | x86_64-unknown-none (custom) | no (`build-std`) |
 | Debug/Release (lodaxos-boot) | x86_64-unknown-uefi | no |
 | Debug/Release (lodaxos-chain) | x86_64-unknown-uefi | no |
-
-The kernel and bootloader both compile `lodaxos-core`. This is intentional: they run at different privilege levels and different environments, and the shared code (serial, logging, memory algorithms) is designed to work in both contexts. The kernel links against `lodaxos-core` via Rust's standard crate resolution. The bootloader does the same.
 
 ---
 
@@ -284,7 +244,7 @@ LodaxOS uses a four-tier memory model:
 
 The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel. The kernel's `phys::init_from_regions` receives the pointer as its `boot_info_phys` argument and reserves the page(s) covering it from the buddy free lists; the same range is also checked by `is_reserved_page` on free paths.
 
-## Physical Page Allocator â€” Buddy System (`src/mm/phys.rs`)
+## Physical Page Allocator â€” Buddy System (`kernel/src/mm/phys.rs`)
 
 ### Data Structure
 
@@ -358,7 +318,7 @@ A `SpinLock` (implemented as `AtomicBool` with `compare_exchange_weak` + `pause`
 - Internal fragmentation: At most (2^n - 1) pages per allocation; worst case < 50% for misaligned sizes.
 - External fragmentation: None within the buddy system (coalescing is greedy and complete).
 
-## Virtual Memory (`src/mm/virt.rs`)
+## Virtual Memory (`kernel/src/mm/virt.rs`)
 
 ### Address Space Layout
 
@@ -411,7 +371,7 @@ Phase 1â€“5: Allocate PML4, map higher-half for all boot regions (mix 2 MB 
 
 The identity map uses 2 MB huge pages. Creating a 4 KB page at the same PD level would conflict (the CPU would see the 4 KB entry's flags, but the PD entry is marked as a huge page). Therefore, MMIO regions like LAPIC and IOAPIC are mapped only in the higher-half, with smaller pages that coexist at different virtual addresses referring to the same physical memory. This is a known workaround â€” the proper fix is to split the PDP entry into 512 PD entries and mark the MMIO 2 MB slot with cache-disable, but that has not been implemented yet.
 
-## Slab Heap Allocator (`src/mm/heap.rs`)
+## Slab Heap Allocator (`kernel/src/mm/heap.rs`)
 
 ### Design (SLUB-inspired)
 
@@ -495,7 +455,7 @@ The slab system does not pre-map a fixed heap arena. Each new slab allocates phy
 
 Each `KmemCache` has its own `SpinLock`. The `GlobalAllocator` dispatches to the correct cache by size. Different-size allocations can proceed in parallel on different cores (fine-grained locking), but same-size allocations on different cores serialize.
 
-## VMA / Demand Paging (`src/mm/vma.rs`)
+## VMA / Demand Paging (`kernel/src/mm/vma.rs`)
 
 ### Radix Tree
 
@@ -543,7 +503,7 @@ Additional VMAs may be inserted during kernel init (e.g., for framebuffer).
 
 ### Page Fault Handler (`handle_page_fault(addr, error_code)`)
 
-Called from the #PF handler in `src/arch/idt.rs`:
+Called from the #PF handler in `kernel/src/arch/idt.rs`:
 
 1. Read CR2 (the faulting address).
 2. If the fault originated in user mode (`error_code & 4`): walk the current process's `ProcessMemory` tree (future: per-process page tables).
@@ -600,12 +560,12 @@ The buddy allocator global lock is coarse but acceptable because buddy operation
 
 | File | Component |
 |---|---|
-| `src/mm/phys.rs` | Buddy allocator |
-| `src/mm/heap.rs` | Slab allocator |
-| `src/mm/vma.rs` | Radix tree, VMA, page fault handler |
-| `src/mm/virt.rs` | Page table management |
-| `src/mm/mod.rs` | Module declarations |
-| `src/arch/idt.rs` | IDT entry points (including #PF) |
+| `kernel/src/mm/phys.rs` | Buddy allocator |
+| `kernel/src/mm/heap.rs` | Slab allocator |
+| `kernel/src/mm/vma.rs` | Radix tree, VMA, page fault handler |
+| `kernel/src/mm/virt.rs` | Page table management |
+| `kernel/src/mm/mod.rs` | Module declarations |
+| `kernel/src/arch/idt.rs` | IDT entry points (including #PF) |
 
 ## Migration from Previous System
 
@@ -680,7 +640,7 @@ The MADT contains Interrupt Source Override (ISO) entries that map ISA IRQ sourc
 - ISA IRQ 0 (PIT) â†’ GSI 2
 - ISA IRQ 1 (keyboard) â†’ GSI 1
 
-The interrupt routing table (`src/intr/mod.rs`) is built as follows:
+The interrupt routing table (`kernel/src/intr/mod.rs`) is built as follows:
 
 1. For each ISO entry with `bus == 0`:
    - Record the ISA IRQ source â†’ GSI mapping
@@ -831,15 +791,16 @@ When PCI enumeration is implemented, MSI/MSI-X interrupts will be programmed by:
 2. Writing the message address (MSI: `0xFEE` + destination APIC ID) and message data (vector) to the PCI device's MSI capability
 3. No IOAPIC involvement â€” MSIs go directly from the PCI bus to the LAPIC
 
-### IPI (Inter-Processor Interrupts)
+### IPI (Inter-Processor Interrupts) â€” Implemented
 
-For SMP support, IPIs will be sent via the LAPIC's ICR (Interrupt Command Register):
-- `X2APIC` mode: write to MSR `0x830` + `0x831`
-- `XAPIC` mode: write to MMIO `0x300` (ICR low) then `0x310` (ICR high)
+IPIs are sent via the LAPIC's ICR (Interrupt Command Register) in xAPIC MMIO mode:
+- Write destination APIC ID to `0x310` (ICR high)
+- Write vector + delivery mode to `0x300` (ICR low)
+- Poll for delivery status clear
 
 Common IPI types:
-- INIT (vector 0): Start a processor
-- STARTUP (vector 0x467): SIPI with startup address
+- INIT (vector 0, ICR bit 11): Start a processor (used in INIT-SIPI-SIPI sequence)
+- STARTUP (vector 0x467, bit 11): SIPI with startup address (used in INIT-SIPI-SIPI)
 - Fixed: Deliver a specific vector (e.g., TLB shootdown, reschedule)
 
 ### NMI Handling
@@ -897,6 +858,7 @@ pub struct Task {
     pub id: usize,
     pub saved_frame: TrapFrame,      // snapshot of registers when not running
     pub kernel_stack_base: u64,      // bottom of allocated 8 KB stack
+    pub kernel_stack_top: u64,       // top of allocated 8 KB stack
     pub state: TaskState,            // Ready or Blocked
     pub vruntime: u64,               // CFS virtual runtime (lower = scheduled sooner)
 }
@@ -906,11 +868,12 @@ pub struct Task {
 
 ```rust
 pub struct TaskManager {
-    tasks: [Option<Task>; MAX_TASKS],  // max 16 tasks
-    current: usize,                     // current running task index
+    tasks: [Option<Task>; MAX_TASKS],  // max 32 tasks
     count: usize,                       // total tasks registered
     initialized: bool,
 }
+
+// Note: There is no `current` field â€” per-CPU tracking is in `percpu.rs`.
 ```
 
 ## Stack Layout
@@ -937,12 +900,14 @@ When the scheduler first switches to this task, it restores the TrapFrame and ex
 
 ## The Idle Task (Task 0)
 
-Task 0 is the idle task, created during kernel initialization (`init_main_task`). It has a special role:
+Task 0 is the idle task, created during kernel initialization (`init_idle_task`). It has a special role:
 
 1. It is registered as the current execution context
-2. It gets its own 8 KB kernel stack (the kernel switches RSP to this stack after initialization)
+2. The BSP uses its own identity-mapped kernel stack (from page table init) rather than a separately allocated stack
 3. Its entry point is the idle loop (`hlt` + periodic logging)
 4. It runs whenever no other task is ready
+
+Each AP also creates an idle task during its own `ap_entry()` init (one idle task per CPU).
 
 The idle loop:
 ```rust
@@ -960,7 +925,7 @@ Blocking task 0 is explicitly refused by `block_current` (logged as an error) â
 
 `task::create_task(entry: u64) -> Option<usize>`
 
-1. Check if `MAX_TASKS` (16) would be exceeded
+1. Check if `MAX_TASKS` (32) would be exceeded
 2. Allocate 2 contiguous physical pages (8 KB) for the kernel stack
 3. Map them at `HIGHER_HALF + phys_addr`
 4. Zero the stack
@@ -986,35 +951,55 @@ Blocking task 0 is explicitly refused by `block_current` (logged as an error) â
 4. Dispatcher calls `irq_handler(frame, 32)`
 5. `irq_handler`:
    a. Sends EOI to LAPIC
-   b. Increments global tick counter (`TICKS.fetch_add(1, Relaxed)`)
-   c. Calls `task::schedule(frame)`
+   b. Increments the global tick counter via `crate::percpu::tick()`
+      (which funnels into `arch::idt::tick()` â€” a single source of
+      truth shared by BSP and AP idle logs and the `get_ticks`
+      syscall 4)
+   c. If this is the BSP and the task manager is initialised,
+      calls `task::schedule(frame)`; the return path restores the
+      next task's full GPR set (rdi, rsi, rbp, rbx, r12â€“r15) and
+      uses `popfq + retfq` (not `iretq`) to avoid CS-descriptor
+      checks rejecting the synthetic 0x08 selector. See audit S2.
 
 ### Schedule Algorithm (CFS)
 
 ```rust
-pub fn schedule(frame: &mut TrapFrame) -> bool {
-    if count < 2 { return false; }  // nothing to schedule
+pub fn schedule(frame: &mut TrapFrame) -> (bool, u64) {
+    let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
+    if crate::percpu::task_count(cpu) < 2 { return (false, 0); }
 
     // 1. Save current task's state
-    let cur = current;
+    let cur = crate::percpu::current_task();
     tasks[cur].saved_frame = *frame;
-    tasks[cur].saved_frame.rsp = frame_addr + 0xA0;  // correct RSP
-    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
+    // The original RSP is at TrapFrame offset 0xA0;
+    // save it directly rather than recomputing from the frame address.
+    tasks[cur].saved_frame.rsp = frame.rsp;
+    let cur_vruntime = tasks[cur].vruntime;
 
-    // 2. Find the next ready task with the smallest vruntime.
-    let next = pick_next_ready(&*m, cur);
+    // 2. Find next ready task with smallest vruntime, preferring
+    //    tasks from this CPU's ready queue.
+    let next = find_least_loaded(cur, cpu);
 
-    // 3. If no other ready task exists, leave the current task in place.
-    if next == cur { return false; }
+    // 3. If no other ready task exists, leave current in place.
+    if next == cur || tasks[next].state != TaskState::Ready {
+        return (false, 0);
+    }
 
-    // 4. Restore next task's state and switch to it.
+    // 4. Advance current task's vruntime only on actual switch.
+    tasks[cur].vruntime = cur_vruntime.saturating_add(VRUNTIME_TICK);
+
+    // 5. Restore next task's state and switch. Update TSS.RSP0
+    //    so ring-0 IRQs push onto the new task's stack.
     *frame = tasks[next].saved_frame;
-    current = next;
-    true
+    let next_stack_top = tasks[next].kernel_stack_top;
+    if next_stack_top != 0 {
+        unsafe { crate::arch::gdt::tss_set_rsp0_for_slot(cpu, next_stack_top); }
+    }
+    crate::percpu::set_current_task(next);
+    let next_pml4 = tasks[next].pml4;
+    (true, next_pml4)
 }
 ```
-
-The RSP correction is critical: `frame_addr + 0xA0` is the address of the RSP field in the TrapFrame, which is where the hardware pushed the original RSP on ring-0 interrupt entry. The saved_frame's RSP field contains this value, but after the stub pushes all GPRs, `frame.rsp` is simply a memory location, not the actual stack pointer.
 
 ### Context Switch Mechanics
 
@@ -1022,14 +1007,25 @@ When `schedule()` returns `true` (a switch was made), the timer IRQ handler does
 
 ```asm
 mov rsp, frame.rsp     ; switch to new task's stack
-push frame.cs          ; push new CS
-push frame.rip         ; push new RIP
-push frame.rflags      ; push new RFLAGS
-popfq                  ; restore RFLAGS (enables interrupts if IF=1)
-retfq                  ; far return: pop RIP and CS
+cmp next_pml4, 0       ; skip if PML4 unchanged
+je 2f
+mfence
+mov cr3, next_pml4     ; switch page tables if needed
+2:
+mov r15, frame.r15     ; restore callee-saved regs
+mov r14, frame.r14
+mov r13, frame.r13
+mov r12, frame.r12
+mov rbx, frame.rbx
+mov rbp, frame.rbp
+mov rsi, frame.rsi
+mov rdi, frame.rdi
+push frame.rip          ; push new RIP
+sti                     ; enable interrupts (WHPX-safe)
+ret                     ; jump to the task's RIP
 ```
 
-This sequence avoids `iretq`'s strict CS descriptor checks (canonicality, DPL vs CPL), which sometimes reject a valid `0x08` kernel selector when reached via a synthetic frame path.
+This sequence avoids `iretq`'s strict CS descriptor checks (canonicality, DPL vs CPL) and WHPX bugs with `popfq` at CPL=0 (which clears IF after emulation).
 
 ## Blocking and Wake
 
@@ -1102,36 +1098,54 @@ For hard real-time constraints:
 
 ## Overview
 
-The boot protocol defines how control and data pass between the three boot stages: chainloader, bootloader, and kernel. The protocol is centered on the `BootInfo` struct stored at physical address `0x1000`.
+The boot protocol defines how control and data pass between the three boot stages: chainloader, bootloader, and kernel. The protocol is centered on the `BootInfo` struct; only the 8-byte pointer lives at physical address `0x1000` (`BOOT_INFO_HANDOFF_ADDR`).
 
 ## BootInfo Protocol
 
 ### Location
 
-Physical address `0x1000` (page 1). This address was chosen because:
-- It is page-aligned (must be for the kernel to map it into page tables if needed)
+Physical address `0x1000` (page 1) holds an **8-byte pointer** to a
+dynamically-allocated `BootInfo` (chainloader `Box::new`s the struct
+and writes the pointer at `0x1000`). The kernel reads the pointer,
+then dereferences it. This removes the fixed-address constraint on
+BootInfo itself (which is ~2 KB) â€” only the 8-byte pointer occupies
+`0x1000`. The address was chosen because:
+- It is page-aligned (must be for the kernel to read the pointer
+  with a single 8-byte load after the page-table switch)
 - It is not page 0 (which would trigger Rust null-pointer UB)
-- It is within the first 4 GB (always identity-mapped by the kernel's page tables)
+- It is within the first 4 GB (always identity-mapped by the
+  kernel's page tables)
 - It survives `exit_boot_services` (it is in conventional memory)
+- The chainloader reserves the page at `0x1000` so the buddy
+  allocator does not hand it out
 
-### Struct Definition
+### Struct Definition (`system/src/lib.rs`)
 
 ```rust
 #[repr(C)]
 pub struct BootInfo {
-    memory_regions: [MemoryRegion; 128],   // free memory descriptors
-    memory_region_count: usize,            // number of valid entries
-    framebuffer: FramebufferInfo,          // GOP framebuffer details
-    partition_zero_lba: u64,               // ext4 partition LBA
-    partition_zero_size: u64,              // ext4 partition size
-    kernel_image_addr: u64,                // physical addr of kernel ELF buffer
-    kernel_image_size: u64,                // size of kernel ELF buffer
-    rsdp_addr: u64,                        // ACPI RSDP physical address
-    madt_addr: u64,                        // MADT physical address
-    sr_image_addr: u64,                    // physical addr of Secure Runtime ELF buffer
-    sr_image_size: u64,                    // size of SR ELF buffer
+    pub memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS], // 128 free memory descriptors
+    pub memory_region_count: usize,         // number of valid entries
+    pub framebuffer: FramebufferInfo,       // GOP framebuffer details
+    pub partition_zero_lba: u64,            // ext4 partition LBA
+    pub partition_zero_size: u64,           // ext4 partition size
+    pub kernel_image_addr: u64,             // physical addr of kernel ELF buffer
+    pub kernel_image_size: u64,             // size of kernel ELF buffer
+    pub rsdp_addr: u64,                     // ACPI RSDP physical address
+    pub madt_addr: u64,                     // MADT physical address
+    pub max_cpus: u32,                      // MAX_CPUS (= 4)
+    pub bsp_apic_id: u32,                   // BSP LAPIC ID
+    pub ap_count: u32,                      // number of APs (0..MAX_CPUS)
+    pub ap_apic_ids: [u32; MAX_CPUS],       // LAPIC ID of each AP
 }
 ```
+
+The SMP fields (`max_cpus`, `bsp_apic_id`, `ap_count`,
+`ap_apic_ids`) are populated by the bootloader via UEFI MP
+Services enumeration before `exit_boot_services`. The kernel
+brings APs up via LAPIC INIT-SIPI-SIPI after ExitBootServices,
+writing per-AP mailbox slots at 0x8400+ in the SIPI trampoline
+page, NOT via `ApArg` (which no longer exists).
 
 ### Lifecycle
 
@@ -1178,13 +1192,14 @@ All segments must be within the first 128 MB (`0x800_0000`). This is a safety ch
 ### Entry Point Convention
 
 The kernel entry point (`_start`) uses the System V AMD64 ABI calling convention:
-- `RDI` = `BOOT_INFO_ADDR` (0x1000) â€” pointer to BootInfo
+- `RDI` = physical address of the dynamically-allocated `BootInfo` struct
+  (the pointer stored at `BOOT_INFO_HANDOFF_ADDR` (`0x1000`), NOT the fixed address itself)
 - RSP must be mod 16 = 8 at entry (simulating the state after a `call` instruction)
 
 The bootloader jumps with:
 ```asm
 sub rsp, 8          ; align stack for SysV ABI (simulate missing call)
-mov rdi, BOOT_INFO  ; pass BootInfo address
+mov rdi, boot_info  ; pass BootInfo physical address (dynamically allocated)
 jmp entry           ; never returns
 ```
 
@@ -1269,25 +1284,24 @@ The kernel is loaded at exactly `0x100000` by the bootloader. No relocation proc
 
 ## Future Protocol Extensions
 
-### Multi-Processor Boot
+### Multi-Processor Boot (Implemented)
 
-For SMP support, the BootInfo will need:
-- Per-CPU stack pointers
-- APIC ID list
-- SIPI trampoline location
-
-The boot protocol will be extended without breaking backward compatibility by adding optional fields at the end of the BootInfo struct, using `size` or `version` fields to detect which fields are present.
+SMP is already implemented:
+- `BootInfo.ap_apic_ids` carries the list of AP LAPIC IDs (populated by UEFI MP Services)
+- Per-CPU kernel stacks are allocated by the kernel from the buddy allocator (not in BootInfo)
+- SIPI trampoline is at fixed address `0x8000` (SIPI vector 0x08), loaded by `arch::smp::init()`
+- AP mailbox slots at `0x8400+` carry per-AP GDT/IDT pointers, stack top, entry point, and PML4
+- BSP broadcasts INIT to all APs â†’ 10ms â†’ broadcasts SIPI (vector 0x08) â†’ 1ms â†’ broadcasts second SIPI â†’ polls per-AP status bytes
 
 ### Device Tree Blob
 
 On non-ACPI systems (e.g., RISC-V, ARM), the boot protocol should support passing a flattened device tree (FDT) instead of ACPI tables. The BootInfo could gain a `dtb_addr` field alongside `rsdp_addr`.
 
-### Secure Runtime Boot
+### Executive Runtime (Removed)
 
-When Secure Runtime is implemented, the bootloader will need to load SR as a separate binary alongside the kernel. This could be:
-- Another entry in the kernel ELF file (as a separate segment)
-- A second file loaded from the ext4 partition
-- Embedded in the kernel binary and extracted at boot
+The Executive Runtime (`exrun`) crate has been removed from the workspace. It was a
+`loop { hlt }` stub with its own forked PML4 and shared mailbox. A future Secure Runtime
+may replace it with a full policy engine and capability broker.
 
 ---
 
@@ -1310,7 +1324,7 @@ Kernel reads RSDP address from BootInfo
 
 ## RSDP (Root System Description Pointer)
 
-The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The chainloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
+The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The bootloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
 
 Scanned regions, in order:
 1. The hint from `BootInfo.rsdp_addr` (validated by signature and checksum)
@@ -1397,7 +1411,7 @@ apic_id: u8
 flags: u32 (bit 0 = enabled)
 ```
 
-The kernel counts enabled CPUs (those with `flags & 1 != 0`) for future SMP support. Currently, CPUs beyond the BSP are noted but not started.
+The kernel parses MADT to find the LAPIC and I/O APIC base addresses. The APIC IDs used for SMP boot come from `BootInfo.ap_apic_ids`, populated by the bootloader via UEFI MP Services enumeration (not from the MADT). The BSP kernel later starts APs via LAPIC INIT-SIPI-SIPI.
 
 ### Entry 1: I/O APIC
 
@@ -1427,7 +1441,7 @@ ISOs are how ACPI tells the OS about deviations from the standard ISA IRQâ†�
 - ISA IRQ 0 usually overrides to GSI 2 (PIT)
 - ISA IRQ 2 often cascades differently
 
-The interrupt routing table (`src/intr/mod.rs`) is built from ISOs plus identity mappings for any ISA IRQ without an ISO.
+The interrupt routing table (`kernel/src/intr/mod.rs`) is built from ISOs plus identity mappings for any ISA IRQ without an ISO.
 
 ## GSI (Global System Interrupt) Routing
 
@@ -1484,19 +1498,23 @@ PCI bus enumeration will use:
 4. Device BARs (Base Address Registers) determine MMIO/I/O ranges
 5. MSI/MSI-X capabilities are detected and configured
 
-### Multi-Processor Startup
+### Multi-Processor Startup â€” Implemented
 
-Per the Intel Multiprocessor Specification, APs (Application Processors) are started via:
-1. Send INIT IPI to the AP
-2. Wait 10 ms
-3. Send STARTUP IPI with SIPI vector (0x467 = startup code at `0x8000`)
-4. Wait for AP to acknowledge
-5. AP executes trampoline code that:
-   a. Sets up page tables (BSP's PML4 is shared)
-   b. Loads GDT (BSP's GDT is shared)
-   c. Sets up per-CPU stack
-   d. Calls per-CPU initialization routine
-   e. Enters idle loop
+Per the Intel Multiprocessor Specification, APs (Application Processors) are started via `arch::smp::smp_boot_aps()`:
+1. Pre-load SIPI trampoline (compiled machine code) at `0x8000` (SIPI vector 0x08)
+2. Prepare per-CPU mailbox slots at `0x8400+` (GDT/IDT ptrs, PML4, stack top, entry, status bytes)
+3. Send INIT IPI to the AP via LAPIC ICR
+4. Wait ~10 ms (PIT-based busy-wait)
+5. Send STARTUP IPI with vector 0x08 (startup at `0x8000`)
+6. Wait ~1 ms (pause-based busy-wait loop)
+7. Send second STARTUP IPI
+8. AP executes trampoline code that:
+   a. Real-mode entry â†’ A20 gate â†’ protected mode â†’ PAE â†’ long mode
+   b. Reads mailbox at `0x8400+` for PML4, GDT pointer, IDT pointer, stack top, entry point
+   c. Loads kernel GDT/IDT, switches RSP to per-CPU kernel stack
+   d. Reads APIC ID from LAPIC MMIO, then jumps to `ap_entry()`
+   e. Per-CPU init: FPU/SSE, mark online, install GS base, LAPIC timer, idle task, `ltr`, `sti`
+   f. Enters per-CPU idle/scheduling loop
 
 ### ACPI Namespace (AML)
 
@@ -1521,10 +1539,8 @@ The build system produces three UEFI binaries (chainloader, bootloader, kernel) 
 ```
 Source code (Rust nightly)
   â”‚
-  â”œâ”€ cargo build -p lodaxos-system       â†’ system/target/ (library)
-  â”œâ”€ cargo build -p lodaxos-core         â†’ shared/target/ (library)
+  â”œâ”€ cargo build -p lodaxos-system       â†’ target/debug/ (library)
   â”œâ”€ cargo build -p lodaxos-kernel       â†’ kernel.elf (custom x86_64-unknown-none)
-  â”œâ”€ cargo build -p lodaxos-sr           â†’ sr.elf (custom x86_64-unknown-none, large code-model)
   â”œâ”€ cargo build -p lodaxos-boot         â†’ lodaxos-boot.efi (x86_64-unknown-uefi)
   â””â”€ cargo build -p lodaxos-chain        â†’ lodaxos-chain.efi (x86_64-unknown-uefi)
                                               â”‚
@@ -1539,27 +1555,25 @@ Source code (Rust nightly)
 
 ```bat
 cargo +nightly build -p lodaxos-system
-cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zbuild-std=core,alloc
-cargo +nightly build -p lodaxos-sr --target sr/target.json -Zbuild-std=core
 cargo +nightly build -p lodaxos-boot --target x86_64-unknown-uefi
 cargo +nightly build -p lodaxos-chain --target x86_64-unknown-uefi
-copy target\target\debug\deps\lodaxos_kernel-* kernel.elf
-copy target\target\debug\deps\lodaxos_sr-* sr.elf
+cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zbuild-std=core,alloc
+copy target\x86_64-unknown-uefi\debug\lodaxos-boot.efi staging\Bootloader.efi
+copy target\x86_64-unknown-uefi\debug\lodaxos-chain.efi staging\lodaxos-chain.efi
+copy target\kernel\debug\lodaxos-kernel staging\kernel.elf
 ```
 
 Key points:
 - Kernel uses `-Zbuild-std=core,alloc` to build Rust's core and alloc libraries from source for the custom target
-- SR uses `-Zbuild-std=core` only â€” it has no `alloc` dependency
-- `-Zbuild-std-features=compiler-builtins-mem` enables compiler memory intrinsics (memcpy, memset, memcmp)
-- `-Zjson-target-spec` allows using the JSON target specification without installing it globally
-- The kernel.elf is found by wildcard in `target/target/` (the subdirectory name matches the target filename)
+- The kernel target outputs to `target/kernel/debug/`
+- Each crate's target directory is configured via `build-std` and the JSON target spec in its subdirectory
+- The 4-crate workspace is: system, chain, boot, kernel
 
 ### Build Targets Output
 
 | Build Artifact | File | Size |
 |---|---|---|
 | lodaxos-kernel | `kernel.elf` | ~3.9 MB |
-| lodaxos-sr | `sr.elf` | small (stub) |
 | lodaxos-boot | `target/x86_64-unknown-uefi/debug/lodaxos-boot.efi` | ~493 KB |
 | lodaxos-chain | `target/x86_64-unknown-uefi/debug/lodaxos-chain.efi` | ~386 KB |
 
@@ -1581,7 +1595,7 @@ LBA 1181696â€“1228799: Backup GPT
 
 - **Type GUID**: `0FC63DAF-8483-4772-8E79-3D69D8477DE4` (Linux filesystem)
 - **Label**: "LodaxOS"
-- **Contents**: `Bootloader.efi`, `kernel.elf`, `sr.elf`
+- **Contents**: `Bootloader.efi`, `kernel.elf`
 - **Size**: 512 MB
 
 Created via `mke2fs -d` which populates the filesystem from a staging directory without requiring loop device mounting. This is critical because WSL2 does not support loop devices.
@@ -1590,7 +1604,6 @@ Created via `mke2fs -d` which populates the filesystem from a staging directory 
 dd if=/dev/zero of=ext4_part.img bs=1M count=512
 mkdir -p /tmp/lodaxos_staging
 cp kernel.elf /tmp/lodaxos_staging/
-cp sr.elf /tmp/lodaxos_staging/
 cp lodaxos-boot.efi /tmp/lodaxos_staging/Bootloader.efi
 mke2fs -t ext4 -d /tmp/lodaxos_staging -L LodaxOS ext4_part.img
 ```
@@ -1612,7 +1625,7 @@ The Python FAT32 creator constructs:
 4. **Root directory cluster** (cluster 2): Directory entry for `BOOTX64.EFI` (short name, extension, attributes, cluster, file size)
 5. **Data cluster 3+**: Chainloader binary data
 
-The ESP root also contains legacy copies of `Bootloader.efi` and `kernel.elf` for the temporary boot test where the chainloader reads them directly from the ESP instead of from ext4.
+The ESP root also contains legacy copies of `Bootloader.efi` and `kernel.elf` for the temporary boot test where the chainloader reads them directly from the ESP.
 
 ### GPT Header Construction
 
@@ -1758,7 +1771,7 @@ Each boot stage has its own panic handler:
 
 ### Exception Handling
 
-The kernel's exception handler (vector 0â€“31) logs detailed register state and halts for all exceptions except breakpoints (#BP, vector 3) and page faults (#PF, vector 14 â€” which logs but the kernel currently cannot resolve them).
+The kernel's exception handler (vector 0â€“31) logs detailed register state and halts for all exceptions except breakpoints (#BP, vector 3) and page faults (#PF, vector 14 â€” which the kernel resolves via `mm::vma::handle_page_fault` for kernel VMA regions).
 
 Double Faults (#DF, vector 8) use IST1 (Interrupt Stack Table 1) â€” a dedicated 16 KB stack. This ensures that if the kernel's stack is corrupted, the double fault handler still has a valid stack. The handler logs and halts.
 
@@ -1907,7 +1920,7 @@ This would be embedded in the SR's service definition metadata stored on Partiti
 
 This document defines the API surfaces between kernel subsystems. The interfaces are designed to be minimal and flat â€” each subsystem exposes a small number of public functions, and subsystems interact through these narrow interfaces rather than through shared global state.
 
-## Serial Subsystem (`src/serial.rs`)
+## Serial Subsystem (`kernel/src/serial.rs`)
 
 ### Public API
 
@@ -1932,7 +1945,7 @@ pub fn write_str(s: &str);               // Write string (\n â†’ \r\n)
 - Panic handler: calls `write_str` for error messages
 - GDT loader: uses `com1_trace` for early debug output (single-byte writes with 100K retry timeout)
 
-## Logger Subsystem (`src/logger.rs`)
+## Logger Subsystem (`kernel/src/logger.rs`)
 
 ### Public API
 
@@ -1960,7 +1973,7 @@ Uses `core::fmt::write` to render arguments without heap allocation.
 - All kernel code via `log::info!()`, `log::warn!()`, `log::error!()`, `log::debug!()`, `log::trace!()`
 - Panic handler uses `write` directly for panic message formatting
 
-## Font Subsystem (`src/font.rs`)
+## Font Subsystem (`kernel/src/font.rs`)
 
 ### Public API
 
@@ -1978,7 +1991,7 @@ Bitmap font for ASCII 32â€“126 (95 glyphs). Each glyph is 16 bytes (16 rows
 
 - Framebuffer (`kernel::Framebuffer`): calls `get_glyph` for text rendering in `put_char`, `write_str`, `write_str_centered`
 
-## Physical Memory Allocator (`src/mm/phys.rs`)
+## Physical Memory Allocator (`kernel/src/mm/phys.rs`)
 
 ### Public API
 
@@ -2006,7 +2019,7 @@ pub fn free_pages(addr: u64, count: u64);
 - Task manager (`task.rs`): allocates pages for task kernel stacks
 - IOAPIC/LAPIC MMIO mapping utilities
 
-## Virtual Memory Manager (`src/mm/virt.rs`)
+## Virtual Memory Manager (`kernel/src/mm/virt.rs`)
 
 ### Public API
 
@@ -2043,7 +2056,7 @@ pub fn map_region_higher_half(pml4, phys, size, flags);
 - Task init: maps kernel stack pages
 - (Future) Userspace: manages per-process page tables
 
-## Heap Allocator (`src/mm/heap.rs`)
+## Heap Allocator (`kernel/src/mm/heap.rs`)
 
 ### Public API
 
@@ -2069,7 +2082,7 @@ static ALLOCATOR: GlobalAllocator;
 - All code that uses `alloc::vec::Vec`, `alloc::boxed::Box`, `alloc::string::String`, `alloc::format!`, etc.
 - Bootloader uses UEFI allocator (`uefi::allocator::Allocator`), not this kernel heap
 
-## ACPI Subsystem (`src/acpi/mod.rs`)
+## ACPI Subsystem (`kernel/src/acpi/mod.rs`)
 
 ### Public API
 
@@ -2101,7 +2114,7 @@ pub struct AcpiContext {
 - Kernel main: calls `acpi::init(info.rsdp_addr)` â†’ parses MADT â†’ configures IOAPICs and interrupt routing
 - MADT parser: called by ACPI subsystem with physical address
 
-## Interrupt Routing (`src/intr/mod.rs`)
+## Interrupt Routing (`kernel/src/intr/mod.rs`)
 
 ### Public API
 
@@ -2137,7 +2150,7 @@ Output: IrqRoute instances used by:
 - Kernel main: routes IOAPIC entries, enables PIT/keyboard
 - IDT irq_handler: maps vector back to ISA source for PIT/keyboard handling
 
-## IOAPIC Driver (`src/arch/ioapic.rs`)
+## IOAPIC Driver (`kernel/src/arch/ioapic.rs`)
 
 ### Public API
 
@@ -2162,7 +2175,7 @@ pub fn make_redir_high(apic_id: u8) -> u32;
 - Interrupt routing: calls `set_entry`, `mask_entry`, `unmask_entry`
 - Kernel main: calls `init` with IOAPIC info from MADT
 
-## LAPIC Driver (`src/arch/apic.rs`)
+## LAPIC Driver (`kernel/src/arch/apic.rs`)
 
 ### Public API
 
@@ -2175,21 +2188,29 @@ pub fn calibrate_pit();
 pub fn set_timer_count(ms: u32);
 pub fn pit_enable_periodic(freq_hz: u32);
 pub fn send_eoi();
+pub fn send_init_ipi(apic_id: u32);
+pub fn send_sipi(apic_id: u32, vector: u8);
+pub fn ap_enable_timer(apic_id: u32);
 ```
 
 ### Dependents
 
 - Kernel main: calls `init_mmio` â†’ `enable` â†’ `calibrate_pit` â†’ `configure_timer` â†’ `set_timer_count`
+- SMP AP boot: calls `send_init_ipi` / `send_sipi` for INIT-SIPI-SIPI sequence
+- AP entry: calls `ap_enable_timer` for per-CPU LAPIC timer enable
 - IDT irq_handler: calls `send_eoi` if LAPIC is initialized
 - Kernel idle loop: relies on timer for scheduling
 
-## GDT Subsystem (`src/arch/gdt.rs`)
+## GDT Subsystem (`kernel/src/arch/gdt.rs`)
 
 ### Public API
 
 ```rust
 pub fn load();
 pub fn set_ist1(addr: u64);
+pub fn tss_set_rsp0(rsp0: u64);
+pub fn tss_set_rsp0_for_slot(slot: usize, rsp0: u64);
+pub fn init_tss_descriptor_for_slot(slot: usize);
 
 // Exported selectors:
 pub const KERNEL_CODE_SEL: u16 = 0x08;
@@ -2200,8 +2221,10 @@ pub const KERNEL_CODE_SEL: u16 = 0x08;
 - Kernel main: calls `load` (which also calls `set_ist1` from the IDT's perspective; `gdt::load` does not call it)
 - IDT init: calls `set_ist1` to wire the double-fault IST1 stack into the TSS
 - Task creation: uses `KERNEL_CODE_SEL` (0x08) for task CS
+- AP boot: calls `init_tss_descriptor_for_slot` for each AP before release
+- Scheduler: calls `tss_set_rsp0` on context switch to update per-CPU RSP0
 
-## IDT Subsystem (`src/arch/idt.rs`)
+## IDT Subsystem (`kernel/src/arch/idt.rs`)
 
 ### Public API
 
@@ -2232,22 +2255,22 @@ pub fn key_scancode() -> u16;
 - Syscall handlers: process syscall requests
 - Idle loop: reads `ticks()`, `pit_ticks()`, `key_count()`
 
-## Task Manager (`src/task.rs`)
+## Task Manager (`kernel/src/task.rs`)
 
 ### Public API
 
 ```rust
 pub fn init();
-pub fn init_main_task();
-pub fn task0_stack_top() -> u64;
+pub fn init_idle_task();
 pub fn is_initialized() -> bool;
 pub fn current_task_id() -> usize;
 pub fn task_count() -> usize;
 pub fn create_task(entry: u64) -> Option<usize>;
-pub fn schedule(frame: &mut TrapFrame) -> bool;
+pub fn schedule(frame: &mut TrapFrame) -> (bool, u64);
 pub fn block_current(frame: &mut TrapFrame);
 pub fn wake(task_id: usize);
 pub fn yield_now();
+pub fn steal_task(hungry_cpu: usize);
 ```
 
 ### Data Flow
@@ -2260,7 +2283,7 @@ Timer IRQ (vector 32)
       â†’ finds next ready task (CFS: minimum `vruntime`)
       â†’ overwrites TrapFrame with next task's state
       â†’ returns true
-    â†’ context switch via mov rsp + popfq/retfq
+    â†’ context switch via mov rsp + sti + push rip + ret (WHPX-safe)
 
 Syscall (int 0x80)
   â†’ syscall_handler()
@@ -2273,7 +2296,9 @@ Syscall (int 0x80)
 ### Dependents
 
 - IDT: calls `schedule` from timer IRQ handler
-- Kernel main: calls `init`, `init_main_task`, `create_task` for test tasks
+- Kernel main: calls `init`, `init_idle_task`, `create_task` for test tasks
+- AP entry: calls `init_idle_task` for per-CPU idle task
+- AP scheduling loop: calls `steal_task` for work stealing
 - Syscall handlers: call block_current, wake, current_task_id
 
 ## Framebuffer (`kernel/src/main.rs`)
@@ -2320,24 +2345,31 @@ Phase 1C: Physical allocator init           (regions from 1A)
 Phase 1D: ACPI init                        (regions from 1A, phys alloc)
 Phase 1E: Page tables init                 (regions, phys alloc, optionally fb)
 Phase 1F: Heap init                        (page tables, phys alloc)
+Phase 1G: VMA tree init                    (heap)
 Phase 2A: cli + mask PIC                    (no dependencies)
 Phase 2B: LAPIC MMIO init                  (page tables)
 Phase 2C: IOAPIC init + INTR routing       (page tables, ACPI/MADT)
+Phase 2D: Reserve AP pages                 (phys alloc)
+Phase 2E: SIPI trampoline init             (phys alloc â€” loads trampoline to 0x8000)
+Phase 2F: Framebuffer re-map in higher-half (page tables)
 Phase 3A: GDT load                         (page tables)
 Phase 3B: IDT init                         (GDT)
-Phase 3C: Task init                        (IDT, page tables, phys alloc)
-Phase 3D: Create test tasks                (task init)
-Phase 3E: Install IOAPIC routes            (IOAPIC + INTR init)
-Phase 3F: Enable LAPIC                     (LAPIC MMIO, IOAPIC)
-Phase 3G: Calibrate LAPIC timer            (LAPIC)
-Phase 3H: Configure LAPIC timer            (LAPIC calibrated)
-Phase 3I: Enable PIT periodic              (IOAPIC routes)
-Phase 3J: sti + int 32 test               (everything above)
-Phase 3K: Unmask device routes             (IOAPIC routes)
+Phase 3C: Percpu BSP init                  (mark online, install gs_base)
+Phase 3D: Task init + init_idle_task       (IDT, page tables, phys alloc)
+Phase 3E: Create test tasks                (task init)
+Phase 3F: Install IOAPIC routes            (IOAPIC + INTR init)
+Phase 3H: Enable LAPIC                     (LAPIC MMIO, IOAPIC)
+Phase 3I: Calibrate LAPIC timer            (LAPIC)
+Phase 3J: Configure LAPIC timer            (LAPIC calibrated)
+Phase 3K: Enable PIT periodic              (IOAPIC routes)
+Phase 3L: SMP AP boot (arch::smp::smp_boot_aps) â€” INIT-SIPI-SIPI via LAPIC ICR (page tables, LAPIC)
+Phase 3M: release_all_aps                  â€” sets kernel_ready=true for all CPUs
+Phase 3N: sti + int 32 test               (everything above)
+Phase 3O: Unmask device routes             (IOAPIC routes)
 Phase 4: Idle loop                         (all of the above)
 ```
 
-This order ensures that each subsystem's dependencies are initialized before it runs. For example, heap depends on page tables (to map heap pages) which depends on the physical allocator (to allocate page table pages).
+This order ensures that each subsystem's dependencies are initialized before it runs. For example, heap depends on page tables (to map heap pages) which depends on the physical allocator (to allocate page table pages). APs are released after all kernel state is ready so they can immediately participate in scheduling.
 
 ---
 
@@ -2738,5 +2770,5 @@ This is softer than hard revocation (which would immediately fail the next memor
 
 ---
 
-*Generated from 11 module files - 2708 total lines*
+*Generated from 11 module files - 2741 total lines*
 

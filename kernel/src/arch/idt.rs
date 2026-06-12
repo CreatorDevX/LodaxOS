@@ -295,8 +295,7 @@ use lodaxos_system::MAX_CPUS;
 /// On x86, the IDTR is a CPU-local register — every CPU can have a
 /// different IDT base.  We share the IDT contents but give each CPU
 /// its own IDTR slot so the SMP trampoline can `lidt` to a per-CPU
-/// pointer (this keeps the boot MP path identical: the boot code
-/// writes `target_idt_ptr` into each AP's ApArg from this function,
+/// pointer (the trampoline mailbox stores the IDT pointer directly,
 /// and the AP loads it without further translation).
 static mut IDTR_TABLE: [Idtr; MAX_CPUS] = [const { Idtr { limit: 0, base: 0 } }; MAX_CPUS];
 
@@ -306,7 +305,16 @@ pub fn idt_pointer_for_slot(slot: usize) -> u64 {
     unsafe { &raw const IDTR_TABLE[slot] as u64 }
 }
 
+/// Return the limit and base of the IDT pointer for `slot`.
+/// Used by the SMP init code to copy the IDT pointer into the
+/// SIPI mailbox.
+pub fn idt_ptr_limit_base(slot: usize) -> (u16, u64) {
+    let slot = slot % MAX_CPUS;
+    unsafe { (IDTR_TABLE[slot].limit, IDTR_TABLE[slot].base) }
+}
+
 /// Backwards-compat alias (returns the BSP's IDTR pointer address).
+/// TODO: remove once all call sites use `idt_pointer_for_slot` directly.
 pub fn idt_pointer_address() -> u64 {
     idt_pointer_for_slot(0)
 }
@@ -334,7 +342,7 @@ pub fn ticks() -> u64 {
 }
 
 /// Increment the LAPIC timer tick counter. Returns the new value.
-/// Used by the per-CPU wrapper in `src/percpu.rs` to funnel all
+/// Used by the per-CPU wrapper in `kernel/src/percpu.rs` to funnel all
 /// increments through this single source of truth.
 pub fn tick() -> u64 {
     TICKS.fetch_add(1, Ordering::Relaxed) + 1
@@ -603,7 +611,8 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
             // Preemptive context switch — every CPU runs the scheduler
             // on each timer tick.
             if crate::task::is_initialized() {
-                if crate::task::schedule(frame) {
+                let (switched, next_pml4) = crate::task::schedule(frame);
+                if switched {
                     let new_rsp = frame.rsp;
                     let rip = frame.rip;
                     log::info!("sched: switch RSP={:#x} RIP={:#x}", new_rsp, rip);
@@ -612,14 +621,23 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                         // after emulation) and iretq with CS=0x08 (#GP
                         // err=0x8).  Work around both by using sti + ret:
                         //
-                        //   1. Switch to the new task's stack + restore GPRs.
-                        //   2. sti sets IF=1 (interrupt gates enter with
+                        //   1. Switch to the new task's stack — MUST happen
+                        //      before CR3 switch so the old stack stays
+                        //      accessible during the log::info! above.
+                        //   2. Switch CR3 if the new task has a different PML4.
+                        //   3. Restore GPRs.
+                        //   4. sti sets IF=1 (interrupt gates enter with
                         //      IF=0, so this is always correct).
-                        //   3. A near ret jumps to the task's RIP — CS
+                        //   5. A near ret jumps to the task's RIP — CS
                         //      stays 0x08, no far transfer that could
                         //      trigger WHPX bugs.
                         core::arch::asm!(
                             "mov rsp, {rsp}",
+                            "cmp {pml4}, 0",
+                            "je 2f",
+                            "mfence",
+                            "mov cr3, {pml4}",
+                            "2:",
                             "mov r15, {r15}",
                             "mov r14, {r14}",
                             "mov r13, {r13}",
@@ -632,6 +650,7 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                             "sti",
                             "ret",
                             rsp = in(reg) new_rsp,
+                            pml4 = in(reg) next_pml4,
                             rip = in(reg) rip,
                             r15 = in(reg) frame.r15,
                             r14 = in(reg) frame.r14,

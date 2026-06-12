@@ -17,7 +17,7 @@ Kernel reads RSDP address from BootInfo
 
 ## RSDP (Root System Description Pointer)
 
-The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The chainloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
+The RSDP is a 36-byte (v2.0+) or 20-byte (v1.0) structure. The bootloader captures the UEFI configuration table pointer into `BootInfo.rsdp_addr` before `ExitBootServices`; the kernel prefers that hint and only falls back to scanning firmware regions if the hint is missing or invalid.
 
 Scanned regions, in order:
 1. The hint from `BootInfo.rsdp_addr` (validated by signature and checksum)
@@ -104,7 +104,7 @@ apic_id: u8
 flags: u32 (bit 0 = enabled)
 ```
 
-The kernel counts enabled CPUs (those with `flags & 1 != 0`) for future SMP support. Currently, CPUs beyond the BSP are noted but not started.
+The kernel parses MADT to find the LAPIC and I/O APIC base addresses. The APIC IDs used for SMP boot come from `BootInfo.ap_apic_ids`, populated by the bootloader via UEFI MP Services enumeration (not from the MADT). The BSP kernel later starts APs via LAPIC INIT-SIPI-SIPI.
 
 ### Entry 1: I/O APIC
 
@@ -134,7 +134,7 @@ ISOs are how ACPI tells the OS about deviations from the standard ISA IRQ→GSI 
 - ISA IRQ 0 usually overrides to GSI 2 (PIT)
 - ISA IRQ 2 often cascades differently
 
-The interrupt routing table (`src/intr/mod.rs`) is built from ISOs plus identity mappings for any ISA IRQ without an ISO.
+The interrupt routing table (`kernel/src/intr/mod.rs`) is built from ISOs plus identity mappings for any ISA IRQ without an ISO.
 
 ## GSI (Global System Interrupt) Routing
 
@@ -191,19 +191,23 @@ PCI bus enumeration will use:
 4. Device BARs (Base Address Registers) determine MMIO/I/O ranges
 5. MSI/MSI-X capabilities are detected and configured
 
-### Multi-Processor Startup
+### Multi-Processor Startup — Implemented
 
-Per the Intel Multiprocessor Specification, APs (Application Processors) are started via:
-1. Send INIT IPI to the AP
-2. Wait 10 ms
-3. Send STARTUP IPI with SIPI vector (0x467 = startup code at `0x8000`)
-4. Wait for AP to acknowledge
-5. AP executes trampoline code that:
-   a. Sets up page tables (BSP's PML4 is shared)
-   b. Loads GDT (BSP's GDT is shared)
-   c. Sets up per-CPU stack
-   d. Calls per-CPU initialization routine
-   e. Enters idle loop
+Per the Intel Multiprocessor Specification, APs (Application Processors) are started via `arch::smp::smp_boot_aps()`:
+1. Pre-load SIPI trampoline (compiled machine code) at `0x8000` (SIPI vector 0x08)
+2. Prepare per-CPU mailbox slots at `0x8400+` (GDT/IDT ptrs, PML4, stack top, entry, status bytes)
+3. Send INIT IPI to the AP via LAPIC ICR
+4. Wait ~10 ms (PIT-based busy-wait)
+5. Send STARTUP IPI with vector 0x08 (startup at `0x8000`)
+6. Wait ~1 ms (pause-based busy-wait loop)
+7. Send second STARTUP IPI
+8. AP executes trampoline code that:
+   a. Real-mode entry → A20 gate → protected mode → PAE → long mode
+   b. Reads mailbox at `0x8400+` for PML4, GDT pointer, IDT pointer, stack top, entry point
+   c. Loads kernel GDT/IDT, switches RSP to per-CPU kernel stack
+   d. Reads APIC ID from LAPIC MMIO, then jumps to `ap_entry()`
+   e. Per-CPU init: FPU/SSE, mark online, install GS base, LAPIC timer, idle task, `ltr`, `sti`
+   f. Enters per-CPU idle/scheduling loop
 
 ### ACPI Namespace (AML)
 

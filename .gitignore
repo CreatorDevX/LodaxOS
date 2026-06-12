@@ -7,3 +7,4 @@ memsave.md
 efi/*
 esp/*
 *.pyc
+nasm/*

@@ -16,7 +16,7 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 
 ### What Exists Today
 
-- 6-crate Rust workspace producing UEFI-compatible binaries
+- 5-crate Rust workspace producing UEFI-compatible binaries
 - Two-stage UEFI boot chain (chainloader → bootloader → kernel)
 - Bare-metal x86-64 kernel with full interrupt handling
 - 4-level page tables with higher-half mapping
@@ -27,15 +27,16 @@ LodaxOS currently implements only the kernel layer and the boot chain. The Secur
 - Preemptive CFS (Completely Fair Scheduler) task scheduler with syscall interface
 - Self-contained ext4 filesystem reader (bootloader only)
 - UEFI GOP framebuffer with bitmap font rendering
-- Secure Runtime (`sr`) stub binary loaded into a higher-half address (entry parsed, never jumped to)
+- SMP support via INIT-SIPI-SIPI (up to 4 CPUs)
+- Secure Runtime (planned): policy process with forked PML4 and shared mailbox for dynamic capability brokering
 
-### What Is Planned (see 08-future-architecture.md)
+### What Is Planned (see 10-future-architecture.md)
 
 - Secure Runtime: userspace service manager, policy engine, capability broker
 - PyI: JIT-compiled Python/WASM runtime for userspace applications
 - Agent model: first-class system domains with isolated userspace environments
 - Driver services: device-specific logic outside the kernel
-- PCI enumeration, MSI/MSI-X, SMP support
+- PCI enumeration, MSI/MSI-X
 - Layered recovery from application through kernel
 
 ## System Structure
@@ -93,4 +94,11 @@ Fault codes follow a flat hex numbering: `0x0x` = hard fault, `0x1x` = soft faul
 
 ## File Layout
 
-All kernel implementation lives in `src/` at the workspace root. The `shared/` crate re-exports `src/` code via `#[path]` and `include!` directives. Individual crate entry points are in `chain/src/`, `boot/src/`, and `kernel/src/`. This single-source layout avoids duplication while allowing independent compilation targets (UEFI PE32+ vs. bare-metal ELF).
+Each crate has its own `src/` directory with independent implementations:
+- `system/src/` — shared type definitions (BootInfo, Caps, Mailbox)
+- `chain/src/` — first-stage UEFI chainloader
+- `boot/src/` — second-stage UEFI bootloader (ext4 parser, ELF loader)
+- `kernel/src/` — bare-metal kernel
+
+
+There is no shared `src/` root directory or `shared/` crate. Each crate is self-contained and depends only on `lodaxos-system` for type definitions.

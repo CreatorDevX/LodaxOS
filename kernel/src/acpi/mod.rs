@@ -82,7 +82,7 @@ fn check_rsdp_at(addr: u64) -> Option<u64> {
 /// 2. Standard BIOS ROM area (0xE0000–0xFFFFF)
 /// 3. Common OVMF/UEFI firmware locations near top of 4 GB
 ///
-/// The chainloader captures the UEFI config-table RSDP address into BootInfo
+/// The bootloader captures the UEFI config-table RSDP address into BootInfo
 /// before ExitBootServices, so the kernel prefers passing it to `init` as
 /// a hint. This scan is the fallback when no hint is provided.
 pub fn find_rsdp() -> Option<u64> {
@@ -127,7 +127,7 @@ pub fn find_rsdp() -> Option<u64> {
 /// Parse the RSDP and return an AcpiContext with addresses of found tables.
 ///
 /// If `rsdp_addr` is `Some`, use it directly (e.g., from the UEFI config
-/// table captured by the chainloader). If `None`, scan memory for the
+/// table captured by the bootloader). If `None`, scan memory for the
 /// RSDP. Returns `None` if no valid RSDP can be located.
 pub fn init(rsdp_addr: Option<u64>) -> Option<AcpiContext> {
     let rsdp_addr = match rsdp_addr {

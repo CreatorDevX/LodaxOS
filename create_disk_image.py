@@ -86,14 +86,10 @@ def main():
     kernel_path = os.path.join(base, "kernel.elf")
     boot_path = os.path.join(base, "target", "x86_64-unknown-uefi", "debug", "lodaxos-boot.efi")
     chain_path = os.path.join(base, "target", "x86_64-unknown-uefi", "debug", "lodaxos-chain.efi")
-    exrun_path = os.path.join(base, "exrun.elf")
-
     for name, path in [("kernel.elf", kernel_path), ("Bootloader.efi", boot_path), ("Chainloader.efi", chain_path)]:
         if not os.path.exists(path):
             print(f"ERROR: {name} not found")
             sys.exit(1)
-    if not os.path.exists(exrun_path):
-        print(f"WARNING: exrun.elf not found; building without Executive Runtime")
 
     disk_mb = 600
     ext4_mb = 512
@@ -122,7 +118,6 @@ def main():
     ext4_wsl = to_wsl(ext4_part)
     kernel_wsl = to_wsl(kernel_path)
     boot_wsl = to_wsl(boot_path)
-    exrun_wsl = to_wsl(exrun_path) if os.path.exists(exrun_path) else None
     ext4_prep = (
         "set -euo pipefail; "
         f"dd if=/dev/zero of='{ext4_wsl}' bs=1M count={ext4_mb}; "
@@ -130,8 +125,6 @@ def main():
         f"cp '{kernel_wsl}' /tmp/lodaxos_ext4/kernel.elf; "
         f"cp '{boot_wsl}' /tmp/lodaxos_ext4/Bootloader.efi; "
     )
-    if exrun_wsl:
-        ext4_prep += f"cp '{exrun_wsl}' /tmp/lodaxos_ext4/exrun.elf; "
     ext4_prep += (
         f"mkfs.ext4 -F -L LodaxOS -d /tmp/lodaxos_ext4 '{ext4_wsl}'; "
         f"rm -rf /tmp/lodaxos_ext4"
@@ -171,7 +164,7 @@ def main():
 
     size_bytes = os.path.getsize(disk_path)
     print(f"\nDisk image: {disk_path} ({size_bytes // 1024} KB)")
-    print("  Partition 0: ext4 - kernel.elf, exrun.elf, Bootloader.efi")
+    print("  Partition 0: ext4 - kernel.elf, Bootloader.efi")
     print("  Partition 1: ESP - EFI/BOOT/BOOTX64.EFI, Bootloader.efi, kernel.elf")
 
 

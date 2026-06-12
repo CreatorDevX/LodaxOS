@@ -35,7 +35,7 @@ LodaxOS uses a four-tier memory model:
 
 The BootInfo struct itself is no longer at a fixed address. The chainloader allocates it dynamically via `Box::new(BootInfo)` (backed by UEFI's page allocator, which identity-maps the result) and stores the physical pointer at `0x1000`. The bootloader reads this pointer, updates the BootInfo fields, and passes the same pointer in RDI to the kernel. The kernel's `phys::init_from_regions` receives the pointer as its `boot_info_phys` argument and reserves the page(s) covering it from the buddy free lists; the same range is also checked by `is_reserved_page` on free paths.
 
-## Physical Page Allocator — Buddy System (`src/mm/phys.rs`)
+## Physical Page Allocator — Buddy System (`kernel/src/mm/phys.rs`)
 
 ### Data Structure
 
@@ -109,7 +109,7 @@ A `SpinLock` (implemented as `AtomicBool` with `compare_exchange_weak` + `pause`
 - Internal fragmentation: At most (2^n - 1) pages per allocation; worst case < 50% for misaligned sizes.
 - External fragmentation: None within the buddy system (coalescing is greedy and complete).
 
-## Virtual Memory (`src/mm/virt.rs`)
+## Virtual Memory (`kernel/src/mm/virt.rs`)
 
 ### Address Space Layout
 
@@ -162,7 +162,7 @@ Phase 1–5: Allocate PML4, map higher-half for all boot regions (mix 2 MB huge 
 
 The identity map uses 2 MB huge pages. Creating a 4 KB page at the same PD level would conflict (the CPU would see the 4 KB entry's flags, but the PD entry is marked as a huge page). Therefore, MMIO regions like LAPIC and IOAPIC are mapped only in the higher-half, with smaller pages that coexist at different virtual addresses referring to the same physical memory. This is a known workaround — the proper fix is to split the PDP entry into 512 PD entries and mark the MMIO 2 MB slot with cache-disable, but that has not been implemented yet.
 
-## Slab Heap Allocator (`src/mm/heap.rs`)
+## Slab Heap Allocator (`kernel/src/mm/heap.rs`)
 
 ### Design (SLUB-inspired)
 
@@ -246,7 +246,7 @@ The slab system does not pre-map a fixed heap arena. Each new slab allocates phy
 
 Each `KmemCache` has its own `SpinLock`. The `GlobalAllocator` dispatches to the correct cache by size. Different-size allocations can proceed in parallel on different cores (fine-grained locking), but same-size allocations on different cores serialize.
 
-## VMA / Demand Paging (`src/mm/vma.rs`)
+## VMA / Demand Paging (`kernel/src/mm/vma.rs`)
 
 ### Radix Tree
 
@@ -294,7 +294,7 @@ Additional VMAs may be inserted during kernel init (e.g., for framebuffer).
 
 ### Page Fault Handler (`handle_page_fault(addr, error_code)`)
 
-Called from the #PF handler in `src/arch/idt.rs`:
+Called from the #PF handler in `kernel/src/arch/idt.rs`:
 
 1. Read CR2 (the faulting address).
 2. If the fault originated in user mode (`error_code & 4`): walk the current process's `ProcessMemory` tree (future: per-process page tables).
@@ -351,12 +351,12 @@ The buddy allocator global lock is coarse but acceptable because buddy operation
 
 | File | Component |
 |---|---|
-| `src/mm/phys.rs` | Buddy allocator |
-| `src/mm/heap.rs` | Slab allocator |
-| `src/mm/vma.rs` | Radix tree, VMA, page fault handler |
-| `src/mm/virt.rs` | Page table management |
-| `src/mm/mod.rs` | Module declarations |
-| `src/arch/idt.rs` | IDT entry points (including #PF) |
+| `kernel/src/mm/phys.rs` | Buddy allocator |
+| `kernel/src/mm/heap.rs` | Slab allocator |
+| `kernel/src/mm/vma.rs` | Radix tree, VMA, page fault handler |
+| `kernel/src/mm/virt.rs` | Page table management |
+| `kernel/src/mm/mod.rs` | Module declarations |
+| `kernel/src/arch/idt.rs` | IDT entry points (including #PF) |
 
 ## Migration from Previous System
 

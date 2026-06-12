@@ -390,7 +390,13 @@ pub fn free_order(addr: u64, order: usize) {
             while !curr.is_null() {
                 let next = unsafe { (*curr).next };
                 if next as u64 == buddy_addr {
-                    unsafe { (*curr).next = (*next).next };
+                    unsafe {
+                        if !next.is_null() {
+                            (*curr).next = (*next).next;
+                        } else {
+                            (*curr).next = ptr::null_mut();
+                        }
+                    };
                     found = true;
                     break;
                 }

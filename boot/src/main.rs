@@ -98,21 +98,6 @@ fn main() -> Status {
     boot_info.kernel_image_addr = kernel_elf_data.as_ptr() as u64;
     boot_info.kernel_image_size = kernel_elf_data.len() as u64;
 
-    // --- Load ExRun ELF from ext4 partition ---
-    log::info!("Loading exrun.elf from ext4 partition");
-    let exrun_elf_data = match load_kernel::load_exrun_from_ext4() {
-        Some(data) => data,
-        None => {
-            log::warn!("exrun.elf not found; continuing without Executive Runtime");
-            alloc::vec::Vec::new()
-        }
-    };
-    if !exrun_elf_data.is_empty() {
-        boot_info.exrun_image_addr = exrun_elf_data.as_ptr() as u64;
-        boot_info.exrun_image_size = exrun_elf_data.len() as u64;
-        log::info!("exrun.elf: {} bytes, at {:#x}", exrun_elf_data.len(), boot_info.exrun_image_addr);
-    }
-
     // --- Capture RSDP from UEFI config table (before exit_boot_services — UEFI addresses valid) ---
     log::info!("Capturing RSDP from UEFI config table");
     let rsdp_addr: u64 = {
@@ -137,19 +122,13 @@ fn main() -> Status {
     }
     log::info!("BootInfo updated at {:#x}", boot_info_addr);
 
-    // Record the AP trampoline physical address so the kernel can reserve it.
-    boot_info.ap_trampoline_phys = mp::ap_trampoline as *const () as u64;
-
-    // --- Bring up APs via UEFI MP Services (BEFORE exit_boot_services) ---
+    // --- Enumerate APs via UEFI MP Services ---
     //
-    // MP Services survives the call to ExitBootServices in the sense that
-    // the protocol interface remains mapped, but the proper sequence is to
-    // call StartupThisAP first, then ExitBootServices. The trampoline
-    // installed on each AP will spin on `go` in ApArg until the kernel
-    // releases it.
-    log::info!("Bringing up APs via UEFI MP Services");
-    if let Err(e) = mp::bring_up_aps(&mut boot_info) {
-        log::warn!("MP Services bring-up failed: {:?} (continuing with BSP only)", e.status());
+    // We only read the LAPIC IDs — the kernel brings APs up via
+    // LAPIC INIT-SIPI-SIPI after ExitBootServices.
+    log::info!("Enumerating APs via UEFI MP Services");
+    if let Err(e) = mp::enumerate_aps(&mut boot_info) {
+        log::warn!("MP Services enumeration failed: {:?} (continuing with BSP only)", e.status());
     }
     unsafe {
         (*boot_info_ptr) = boot_info;

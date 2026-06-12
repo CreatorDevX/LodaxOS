@@ -170,16 +170,12 @@ static mut GDT_TABLE: [Gdt; MAX_CPUS] = [const {
 static mut GDT_PTR_TABLE: [GdtPtr; MAX_CPUS] = [const { GdtPtr { limit: 0, base: 0 } }; MAX_CPUS];
 
 /// Return the higher-half virtual address of the GDT pointer for `slot`.
-/// Used by the SMP bring-up code to write `target_gdt_ptr` into each
-/// AP's ApArg.
+/// Used by the SMP bring-up code to copy the GDT pointer into the
+/// SIPI trampoline mailbox.
+///
+/// Note: `smp.rs` now calls `gdt_ptr_limit_base(slot)` directly instead
+/// of copying from this address. This function is kept for compatibility.
 pub fn gdt_pointer_address() -> u64 {
-    // The "current" CPU's GDT_PTR is what the caller wants — main.rs
-    // calls this from BSP context, and ap_start.rs fills per-AP
-    // `target_gdt_ptr` from this address.  The BSP slot is typically 0
-    // (LAPIC ID 0), but the function returns the address of the BSP's
-    // own GDT_PTR which is what the BSP just loaded.  ap_start then
-    // overwrites each AP's `target_gdt_ptr` field with the address of
-    // the *AP's* GDT_PTR slot (see `gdt_pointer_for_slot`).
     unsafe { &raw const GDT_PTR_TABLE[0] as u64 }
 }
 
@@ -317,15 +313,16 @@ pub unsafe fn init_for_slot(slot: usize) {
 }
 
 /// Backwards-compat wrapper for the BSP. Calls `init_for_slot(0)`.
+/// TODO: remove once all call sites use `init_for_slot` directly.
 pub fn load() {
     unsafe { init_for_slot(0); }
 }
 
 /// Initialise the GDT's TSS descriptor for `slot` to point at the
 /// per-CPU TSS for that slot, and set the per-CPU IST1 stack.  This
-/// is called by the BSP *before* `release_aps` so that the AP
-/// trampoline's `lgdt` finds a fully-formed TSS descriptor and
-/// `lidt`-then-`ltr` works on first try.
+/// is called by the BSP *before* `smp_boot_aps` so that the AP
+/// trampoline's `lgdt` finds a fully-formed TSS descriptor and the AP's
+/// subsequent `ltr` works on first try.
 ///
 /// Does NOT `lgdt` or `ltr` on the calling CPU — that's the
 /// responsibility of the AP itself (or `init_for_slot` for the BSP).
@@ -370,6 +367,15 @@ pub unsafe fn tss_set_rsp0_for_slot(slot: usize, rsp0: u64) {
 }
 
 /// Backwards-compat: update the BSP's RSP0.
+/// TODO: remove once all call sites use `tss_set_rsp0_for_slot` directly.
 pub unsafe fn tss_set_rsp0(rsp0: u64) {
     tss_set_rsp0_for_slot(0, rsp0);
+}
+
+/// Return the limit and base of the GDT pointer for `slot`.
+/// Used by the SMP init code to copy the GDT pointer into the
+/// SIPI mailbox.
+pub fn gdt_ptr_limit_base(slot: usize) -> (u16, u64) {
+    let slot = slot % MAX_CPUS;
+    unsafe { (GDT_PTR_TABLE[slot].limit, GDT_PTR_TABLE[slot].base) }
 }

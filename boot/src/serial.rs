@@ -17,11 +17,16 @@ pub fn init() {
 
 fn write_byte(byte: u8) {
     unsafe {
+        let mut timeout: u32 = 0xFFFF;
         loop {
             let lsr: u8;
             core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1 + 5, options(nostack, nomem));
             if lsr & 0x20 != 0 {
                 break;
+            }
+            timeout -= 1;
+            if timeout == 0 {
+                return;
             }
         }
         core::arch::asm!("out dx, al", in("dx") COM1 + 0, in("al") byte, options(nostack, nomem));

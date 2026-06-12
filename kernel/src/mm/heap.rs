@@ -166,6 +166,38 @@ impl KmemCache {
         let obj = (*slab).alloc_obj();
         let is_full = (*slab).is_full();
         let _g = HEAP_LOCK.lock();
+        // Double-check: another thread may have added a slab while we
+        // were allocating. If so, free our redundant slab and use the
+        // existing one.
+        if !self.partial.is_null() {
+            phys::free_pages(phys_addr, num_pages as u64);
+            let existing = self.partial;
+            let real_obj = (*existing).alloc_obj();
+            let was_full = (*existing).is_full();
+            if was_full {
+                Self::remove_partial_ptr(self, existing);
+                Self::push_full_ptr(self, existing);
+            }
+            return real_obj;
+        }
+        if !self.free.is_null() {
+            phys::free_pages(phys_addr, num_pages as u64);
+            let existing = self.free;
+            self.free = (*existing).next;
+            if !self.free.is_null() {
+                (*self.free).prev = ptr::null_mut();
+            }
+            (*existing).next = ptr::null_mut();
+            (*existing).prev = ptr::null_mut();
+            let real_obj = (*existing).alloc_obj();
+            let was_full = (*existing).is_full();
+            if was_full {
+                Self::push_full_ptr(self, existing);
+            } else {
+                Self::push_partial_ptr(self, existing);
+            }
+            return real_obj;
+        }
         if is_full {
             Self::push_full_ptr(self, slab);
         } else {
@@ -412,11 +444,9 @@ impl CacheAllocator {
         match idx {
             Some(i) => self.caches[i].free(ptr),
             None => {
-                // For direct page allocations, free the pages
-                // (We don't track the order, so free as order-0 pages)
+                let _g = HEAP_LOCK.lock();
                 let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
                 for i in 0..pages {
-                    // ptr is the higher-half virt (HIGHER_HALF + phys); convert back.
                     let phys_addr = (ptr as u64) - virt::HIGHER_HALF
                         + (i as u64) * phys::PAGE_SIZE;
                     phys::free_page(phys_addr);

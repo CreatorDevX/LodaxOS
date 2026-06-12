@@ -44,7 +44,10 @@ pub static TLB_ACK: [AtomicU64; MAX_CPUS] =
 
 /// Send TLB shootdown IPI to all other CPUs and wait for their ack.
 /// The address to flush must already be stored in `TLB_FLUSH_ADDR`.
+/// Falls back to a full CR3 reload if a target CPU doesn't respond
+/// within `TIMEOUT` iterations (it may have interrupts disabled).
 fn tlb_shootdown() {
+    const TIMEOUT: u64 = 1_000_000;
     let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
     // Clear acks for all other CPUs.
     for i in 0..MAX_CPUS {
@@ -60,8 +63,18 @@ fn tlb_shootdown() {
     for i in 0..MAX_CPUS {
         if i == cpu { continue; }
         if !crate::percpu::is_online(i) { continue; }
+        let mut spins = 0u64;
         while TLB_ACK[i].load(Ordering::Acquire) == 0 {
             core::hint::spin_loop();
+            spins += 1;
+            if spins >= TIMEOUT {
+                // Target CPU may have interrupts disabled; fall back
+                // to a full TLB flush by reloading CR3 on this CPU.
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3) };
+                return;
+            }
         }
     }
 }
@@ -98,7 +111,11 @@ fn ensure_table(entry: &mut u64, flags: u64, level: usize) -> u64 {
 
     // Split huge pages so the caller can map at a finer granularity.
     if *entry & (1 << 7) != 0 {
-        let orig_flags = *entry & !(PRESENT | (1 << 7)); // strip present + PS
+        // Only preserve flag bits from the original entry — NX (bit 63) and
+        // the lower 12 flag bits (excluding PRESENT and PS).  Do NOT carry
+        // physical-address bits (51:12) into the sub-entries: those come
+        // from `entry_phys` computed below.
+        let orig_flags = (*entry & (1 << 63)) | ((*entry & 0xFFF) & !(1 | (1 << 7)));
 
         let new_page = phys::alloc_page().expect("out of memory for page table split");
         let new_table = phys_to_virtual(new_page);
@@ -107,30 +124,34 @@ fn ensure_table(entry: &mut u64, flags: u64, level: usize) -> u64 {
         match level {
             2 => {
                 // 1 GB → 512 × 2 MB entries (each with PS bit set).
-                let base = *entry & 0x000F_FFFF_FFC0_0000; // 1 GB aligned
+                // In practice, callers pass level=2 for PML4 entries which
+                // can never be huge, so this arm is dead code.
+                let base = *entry & 0x000F_FFC0_0000_0000; // 1 GB aligned (bits 51:30)
                 for i in 0..512usize {
                     let entry_phys = base + (i as u64) * 0x20_0000;
                     unsafe {
-                        (*new_table).0[i] = entry_phys | orig_flags | (1 << 7);
+                        (*new_table).0[i] = entry_phys | orig_flags | PRESENT | (1 << 7);
                     }
                 }
             }
-            1 => {
+            1 | 0 => {
                 // 2 MB → 512 × 4 KB entries (PS clear, normal PT entries).
-                let base = *entry & 0x000F_FFFF_FFFF_0000; // 2 MB aligned
+                // Level 1 is for PDP entries (1 GB huge pages reached in
+                // a 1 GB→2 MB split, though currently unused).  Level 0 is
+                // for PD entries (2 MB huge pages encountered by map_page/
+                // map_contiguous during heap allocation).
+                let base = *entry & 0x000F_FFFF_FE00_0000; // 2 MB aligned (bits 51:21)
                 for i in 0..512usize {
                     let entry_phys = base + (i as u64) * 0x1000;
                     unsafe {
-                        (*new_table).0[i] = entry_phys | orig_flags;
+                        (*new_table).0[i] = entry_phys | orig_flags | PRESENT;
                     }
                 }
             }
-            _ => {
-                panic!(
-                    "ensure_table: huge page at unexpected level {} (entry={:#x})",
-                    level, *entry
-                );
-            }
+            _ => panic!(
+                "ensure_table: huge page at unexpected level {} (entry={:#x})",
+                level, *entry
+            ),
         }
 
         // Point the parent entry to the new table (preserve caller's flags).
@@ -239,7 +260,7 @@ pub unsafe fn init(regions: &[(u64, u64)], fb_phys: Option<(u64, u64)>) {
 
 /// Identity-mapped helpers for use during init (before CR3 switch).
 /// Uses physical addresses directly since UEFI page tables identity-map all memory.
-fn id_ensure_table(entry: &mut u64, flags: u64) -> u64 {
+fn id_ensure_table(entry: &mut u64, flags: u64, level: usize) -> u64 {
     if *entry & PRESENT == 0 {
         let page = phys::alloc_page().expect("out of memory for page tables");
         let target = page as *mut PageTable;
@@ -248,6 +269,41 @@ fn id_ensure_table(entry: &mut u64, flags: u64) -> u64 {
         }
         *entry = page | flags | PRESENT;
     }
+
+    if *entry & (1 << 7) != 0 {
+        let orig_flags = (*entry & (1 << 63)) | ((*entry & 0xFFF) & !(1 | (1 << 7)));
+        let new_page = phys::alloc_page().expect("out of memory for page table split");
+        let new_table = new_page as *mut PageTable;
+        unsafe { (*new_table) = PageTable::new_zeroed(); }
+
+        match level {
+            2 => {
+                let base = *entry & 0x000F_FFC0_0000_0000;
+                for i in 0..512usize {
+                    let entry_phys = base + (i as u64) * 0x20_0000;
+                    unsafe {
+                        (*new_table).0[i] = entry_phys | orig_flags | PRESENT | (1 << 7);
+                    }
+                }
+            }
+            1 | 0 => {
+                let base = *entry & 0x000F_FFFF_FE00_0000;
+                for i in 0..512usize {
+                    let entry_phys = base + (i as u64) * 0x1000;
+                    unsafe {
+                        (*new_table).0[i] = entry_phys | orig_flags | PRESENT;
+                    }
+                }
+            }
+            _ => panic!(
+                "id_ensure_table: huge page at unexpected level {} (entry={:#x})",
+                level, *entry
+            ),
+        }
+
+        *entry = new_page | flags | PRESENT;
+    }
+
     *entry & !0xFFF
 }
 
@@ -258,13 +314,13 @@ fn id_map_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     let pd_idx = index_for_addr(virt, 1);
     let pt_idx = index_for_addr(virt, 0);
 
-    let pdp_phys = id_ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE);
+    let pdp_phys = id_ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE, 2);
     let pdp = pdp_phys as *mut PageTable;
 
-    let pd_phys = id_ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE);
+    let pd_phys = id_ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE, 1);
     let pd = pd_phys as *mut PageTable;
 
-    let pt_phys = id_ensure_table(unsafe { &mut (*pd).0[pd_idx] }, WRITABLE);
+    let pt_phys = id_ensure_table(unsafe { &mut (*pd).0[pd_idx] }, WRITABLE, 0);
     let pt = pt_phys as *mut PageTable;
 
     unsafe {
@@ -279,10 +335,10 @@ fn id_map_huge_2mb(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
     let pdp_idx = index_for_addr(virt, 2);
     let pd_idx = index_for_addr(virt, 1);
 
-    let pdp_phys = id_ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE);
+    let pdp_phys = id_ensure_table(unsafe { &mut (*pml4).0[pml4_idx] }, WRITABLE, 2);
     let pdp = pdp_phys as *mut PageTable;
 
-    let pd_phys = id_ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE);
+    let pd_phys = id_ensure_table(unsafe { &mut (*pdp).0[pdp_idx] }, WRITABLE, 1);
     let pd = pd_phys as *mut PageTable;
 
     unsafe {
@@ -432,8 +488,8 @@ pub fn current_pml4() -> u64 {
     cr3 & !0xFFF
 }
 
-/// Backward-compat alias for `current_pml4()`.  Will be deprecated
-/// once all call sites are updated.
+/// Backward-compat alias for `current_pml4()`.  Prefer `current_pml4()`
+/// or `kernel_pml4()` for the kernel's shared page table.
 #[inline]
 pub fn pml4_address() -> u64 {
     current_pml4()

@@ -54,7 +54,7 @@ Each boot stage has its own panic handler:
 
 ### Exception Handling
 
-The kernel's exception handler (vector 0–31) logs detailed register state and halts for all exceptions except breakpoints (#BP, vector 3) and page faults (#PF, vector 14 — which logs but the kernel currently cannot resolve them).
+The kernel's exception handler (vector 0–31) logs detailed register state and halts for all exceptions except breakpoints (#BP, vector 3) and page faults (#PF, vector 14 — which the kernel resolves via `mm::vma::handle_page_fault` for kernel VMA regions).
 
 Double Faults (#DF, vector 8) use IST1 (Interrupt Stack Table 1) — a dedicated 16 KB stack. This ensures that if the kernel's stack is corrupted, the double fault handler still has a valid stack. The handler logs and halts.
 

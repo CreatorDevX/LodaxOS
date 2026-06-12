@@ -27,15 +27,16 @@ const ICR_FIXED: u32 = 0;
 const ICR_INIT: u32 = 5 << 8;
 const ICR_STARTUP: u32 = 6 << 8;
 
-/// ICR destination shorthand
+/// ICR destination shorthand (bits 19:18)
 const ICR_DEST_PHYSICAL: u32 = 0;
 const ICR_DEST_LOGICAL: u32 = 1 << 11;
-const ICR_SELF: u32 = 1 << 16;
-const ICR_ALL_INCLUDING_SELF: u32 = 2 << 16;
-const ICR_ALL_EXCLUDING_SELF: u32 = 3 << 16;
+const ICR_SELF: u32 = 1 << 18;
+const ICR_ALL_INCLUDING_SELF: u32 = 2 << 18;
+const ICR_ALL_EXCLUDING_SELF: u32 = 3 << 18;
 
-/// ICR assert / level bits (must be 0 for edge-triggered fixed IPIs)
+/// ICR assert / level / trigger-mode bits
 const ICR_ASSERT: u32 = 1 << 14;
+const ICR_LEVEL: u32 = 1 << 15;   // level-triggered (vs edge)
 const ICR_EDGE: u32 = 0;
 
 /// Spurious vector — bit 8 enables LAPIC software, bits 0–7 = vector.
@@ -134,9 +135,9 @@ pub fn init_mmio() {
 const APIC_LVT_ERROR: usize = 0x370;
 
 /// BSP (Bootstrap Processor) LAPIC ID. Set by `set_bsp_lapic_id`
-/// during early init. The BSP is the CPU that boots first and runs
-/// the kernel's main idle loop; APs run a separate per-CPU idle loop
-/// and don't participate in the scheduler.
+/// during early init. The BSP is the CPU that boots first; APs run
+/// a separate per-CPU idle loop and participate in scheduling via
+/// their own LAPIC timer ISR (every CPU calls `schedule()`).
 static BSP_LAPIC_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Record the BSP's LAPIC ID. Must be called once during init,
@@ -146,7 +147,8 @@ pub fn set_bsp_lapic_id(apic_id: u32) {
 }
 
 /// True if the current CPU is the BSP. Used by the LAPIC timer ISR
-/// to decide whether to run the scheduler (only the BSP runs tasks).
+/// to decide whether to run BSP-specific work (idle-loop stats logging).
+/// Every CPU calls `schedule()` on each timer tick, not just the BSP.
 /// If the BSP ID has not yet been set, assumes we're on the BSP
 /// (the only CPU at that point).
 pub fn is_bsp() -> bool {
@@ -325,18 +327,29 @@ pub fn set_timer_count(ms: u32) {
 /// which CPU's tick counter to increment.
 pub fn ap_enable_timer(_apic_id: u32) {
     unsafe {
+        let phys_base = read_apic_base();
+
+        macro_rules! ap_write32 {
+            ($reg:expr, $val:expr) => {
+                let addr = (phys_base + $reg as u64) as *mut u32;
+                addr.write_volatile($val);
+            };
+        }
+
         // Each AP must enable its own LAPIC (the BSP's enable() only
-        // affects the BSP's LAPIC).
-        write32(APIC_LVT_LINT0, APIC_LVT_MASKED);
-        write32(APIC_LVT_LINT1, APIC_LVT_MASKED);
-        write32(APIC_LVT_ERROR, APIC_LVT_MASKED | 0xFF);
-        write32(APIC_SVR, APIC_SVR_ENABLE | 0xFF);
-        write32(APIC_TPR, 0);
+        // affects the BSP's LAPIC).  Use the physical / identity-mapped
+        // address directly — the AP's page tables may lack the higher-half
+        // LAPIC mapping created by init_mmio() on the BSP.
+        ap_write32!(APIC_LVT_LINT0, APIC_LVT_MASKED);
+        ap_write32!(APIC_LVT_LINT1, APIC_LVT_MASKED);
+        ap_write32!(APIC_LVT_ERROR, APIC_LVT_MASKED | 0xFF);
+        ap_write32!(APIC_SVR, APIC_SVR_ENABLE | 0xFF);
+        ap_write32!(APIC_TPR, 0);
 
         let count = TICKS_PER_MS * 1; // 1 ms period
-        write32(APIC_LVT_TIMER, 32 | APIC_LVT_PERIODIC);
-        write32(APIC_TDCR, 0b0011); // divide by 16
-        write32(APIC_TICR, count);
+        ap_write32!(APIC_LVT_TIMER, 32 | APIC_LVT_PERIODIC);
+        ap_write32!(APIC_TDCR, 0b0011); // divide by 16
+        ap_write32!(APIC_TICR, count);
     }
 }
 
@@ -391,6 +404,46 @@ pub fn send_ipi_others(vector: u8) {
     }
 }
 
+/// Broadcast INIT IPI to all APs (excluding self). Uses the same ICR
+/// pattern as `send_init_ipi` but with All-Excluding-Self shorthand.
+pub fn send_init_ipi_all() {
+    unsafe {
+        let mut timeout = 1_000_000u32;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+        write32(APIC_ICR_LOW, ICR_ALL_EXCLUDING_SELF | ICR_INIT | ICR_ASSERT | ICR_EDGE);
+        timeout = 1_000_000;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+    }
+}
+
+/// Broadcast SIPI to all APs (excluding self). All APs start executing
+/// at `vector * 0x1000`.
+pub fn send_sipi_all(vector: u8) {
+    unsafe {
+        let mut timeout = 1_000_000u32;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+        write32(APIC_ICR_LOW, (vector as u32) | ICR_ALL_EXCLUDING_SELF | ICR_STARTUP | ICR_EDGE);
+        timeout = 1_000_000;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+    }
+}
+
 /// Send End-Of-Interrupt to the LAPIC. Must be called at the end of every
 /// LAPIC interrupt handler to acknowledge the interrupt.
 #[inline]
@@ -404,17 +457,30 @@ pub fn send_eoi() {
 /// CPU. After receiving INIT, the AP waits for a SIPI.
 pub fn send_init_ipi(dest_apic_id: u32) {
     unsafe {
-        // Wait for delivery status to clear.
+        // Wait for earlier IPI delivery to complete.
+        let mut timeout = 1_000_000u32;
         while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
         }
-        // Write destination APIC ID to ICR high.
+        if timeout == 0 {
+            log::warn!("INIT IPI: timeout waiting for ICR idle (dest={})", dest_apic_id);
+        }
         write32(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
-        // INIT IPI: delivery mode = INIT, level assert, edge triggered.
+        // INIT: delivery=INIT, assert, edge-triggered (same pattern used
+        // by Linux and most other kernels for INIT IPIs under TCG/WHPX).
         write32(APIC_ICR_LOW, ICR_INIT | ICR_ASSERT | ICR_EDGE);
-        // Wait for delivery to complete.
+        timeout = 1_000_000;
         while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                log::warn!("INIT IPI: timeout waiting for delivery (dest={})", dest_apic_id);
+                break;
+            }
         }
     }
 }
@@ -423,17 +489,25 @@ pub fn send_init_ipi(dest_apic_id: u32) {
 /// the physical address where the AP starts executing (vector * 0x1000).
 pub fn send_sipi(dest_apic_id: u32, vector: u8) {
     unsafe {
-        // Wait for delivery status to clear.
+        let mut timeout = 1_000_000u32;
         while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                log::warn!("SIPI: timeout waiting for ICR idle (dest={})", dest_apic_id);
+                break;
+            }
         }
-        // Write destination APIC ID to ICR high.
         write32(APIC_ICR_HIGH, (dest_apic_id as u32) << 24);
-        // STARTUP IPI: delivery mode = STARTUP, level assert, edge triggered.
-        write32(APIC_ICR_LOW, (vector as u32) | ICR_STARTUP | ICR_ASSERT | ICR_EDGE);
-        // Wait for delivery to complete.
+        write32(APIC_ICR_LOW, (vector as u32) | ICR_STARTUP | ICR_EDGE);
+        timeout = 1_000_000;
         while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                log::warn!("SIPI: timeout waiting for delivery (dest={})", dest_apic_id);
+                break;
+            }
         }
     }
 }

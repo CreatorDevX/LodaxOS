@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Intentionally depends only on lodaxos-system (BootInfo types). The chain
 # runs at firmware time before any kernel module exists, so it must not pull
-# in lodaxos-core / lodaxos-kernel / lodaxos-exrun.
+# in lodaxos-core / lodaxos-kernel.
 lodaxos-system = { path = "../system" }
 uefi = { version = "0.37", default-features = false, features = ["alloc"] }
 log = "0.4"

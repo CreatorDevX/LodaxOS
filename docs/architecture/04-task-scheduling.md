@@ -44,6 +44,7 @@ pub struct Task {
     pub id: usize,
     pub saved_frame: TrapFrame,      // snapshot of registers when not running
     pub kernel_stack_base: u64,      // bottom of allocated 8 KB stack
+    pub kernel_stack_top: u64,       // top of allocated 8 KB stack
     pub state: TaskState,            // Ready or Blocked
     pub vruntime: u64,               // CFS virtual runtime (lower = scheduled sooner)
 }
@@ -53,11 +54,12 @@ pub struct Task {
 
 ```rust
 pub struct TaskManager {
-    tasks: [Option<Task>; MAX_TASKS],  // max 16 tasks
-    current: usize,                     // current running task index
+    tasks: [Option<Task>; MAX_TASKS],  // max 32 tasks
     count: usize,                       // total tasks registered
     initialized: bool,
 }
+
+// Note: There is no `current` field â€” per-CPU tracking is in `percpu.rs`.
 ```
 
 ## Stack Layout
@@ -84,12 +86,14 @@ When the scheduler first switches to this task, it restores the TrapFrame and ex
 
 ## The Idle Task (Task 0)
 
-Task 0 is the idle task, created during kernel initialization (`init_main_task`). It has a special role:
+Task 0 is the idle task, created during kernel initialization (`init_idle_task`). It has a special role:
 
 1. It is registered as the current execution context
-2. It gets its own 8 KB kernel stack (the kernel switches RSP to this stack after initialization)
+2. The BSP uses its own identity-mapped kernel stack (from page table init) rather than a separately allocated stack
 3. Its entry point is the idle loop (`hlt` + periodic logging)
 4. It runs whenever no other task is ready
+
+Each AP also creates an idle task during its own `ap_entry()` init (one idle task per CPU).
 
 The idle loop:
 ```rust
@@ -107,7 +111,7 @@ Blocking task 0 is explicitly refused by `block_current` (logged as an error) â€
 
 `task::create_task(entry: u64) -> Option<usize>`
 
-1. Check if `MAX_TASKS` (16) would be exceeded
+1. Check if `MAX_TASKS` (32) would be exceeded
 2. Allocate 2 contiguous physical pages (8 KB) for the kernel stack
 3. Map them at `HIGHER_HALF + phys_addr`
 4. Zero the stack
@@ -146,41 +150,42 @@ Blocking task 0 is explicitly refused by `block_current` (logged as an error) â€
 ### Schedule Algorithm (CFS)
 
 ```rust
-pub fn schedule(frame: &mut TrapFrame) -> bool {
-    if count < 2 { return false; }  // nothing to schedule
+pub fn schedule(frame: &mut TrapFrame) -> (bool, u64) {
+    let cpu = crate::percpu::current_apic_id() as usize % MAX_CPUS;
+    if crate::percpu::task_count(cpu) < 2 { return (false, 0); }
 
     // 1. Save current task's state
-    let cur = current;
+    let cur = crate::percpu::current_task();
     tasks[cur].saved_frame = *frame;
-    tasks[cur].saved_frame.rsp = frame_addr + 0xA0;  // correct RSP
+    // The original RSP is at TrapFrame offset 0xA0;
+    // save it directly rather than recomputing from the frame address.
+    tasks[cur].saved_frame.rsp = frame.rsp;
+    let cur_vruntime = tasks[cur].vruntime;
 
-    // 2. Find the next ready task with the smallest vruntime.
-    let next = pick_next_ready(&*m, cur);
+    // 2. Find next ready task with smallest vruntime, preferring
+    //    tasks from this CPU's ready queue.
+    let next = find_least_loaded(cur, cpu);
 
-    // 3. If no other ready task exists, leave the current task in place
-    //    (vruntime is NOT advanced â€” see audit A5).
-    if next == cur { return false; }
+    // 3. If no other ready task exists, leave current in place.
+    if next == cur || tasks[next].state != TaskState::Ready {
+        return (false, 0);
+    }
 
-    // 4. Advance the current task's vruntime only when we actually
-    //    switch away. Updating it before the pick used to double-credit
-    //    the current task on every no-switch tick.
-    tasks[cur].vruntime = tasks[cur].vruntime.saturating_add(VRUNTIME_TICK);
+    // 4. Advance current task's vruntime only on actual switch.
+    tasks[cur].vruntime = cur_vruntime.saturating_add(VRUNTIME_TICK);
 
-    // 5. Restore next task's state and switch to it. Update TSS.RSP0
-    //    to the next task's kernel stack top (S1) so ring-0 IRQs
-    //    taken while the new task is running push their iretq frame
-    //    onto the new task's stack, not the 4 KiB boot DUMMY_STACK.
+    // 5. Restore next task's state and switch. Update TSS.RSP0
+    //    so ring-0 IRQs push onto the new task's stack.
     *frame = tasks[next].saved_frame;
     let next_stack_top = tasks[next].kernel_stack_top;
     if next_stack_top != 0 {
-        crate::arch::gdt::tss_set_rsp0(next_stack_top);
+        unsafe { crate::arch::gdt::tss_set_rsp0_for_slot(cpu, next_stack_top); }
     }
-    current = next;
-    true
+    crate::percpu::set_current_task(next);
+    let next_pml4 = tasks[next].pml4;
+    (true, next_pml4)
 }
 ```
-
-The RSP correction is critical: `frame_addr + 0xA0` is the address of the RSP field in the TrapFrame, which is where the hardware pushed the original RSP on ring-0 interrupt entry. The saved_frame's RSP field contains this value, but after the stub pushes all GPRs, `frame.rsp` is simply a memory location, not the actual stack pointer.
 
 ### Context Switch Mechanics
 
@@ -188,14 +193,25 @@ When `schedule()` returns `true` (a switch was made), the timer IRQ handler does
 
 ```asm
 mov rsp, frame.rsp     ; switch to new task's stack
-push frame.cs          ; push new CS
-push frame.rip         ; push new RIP
-push frame.rflags      ; push new RFLAGS
-popfq                  ; restore RFLAGS (enables interrupts if IF=1)
-retfq                  ; far return: pop RIP and CS
+cmp next_pml4, 0       ; skip if PML4 unchanged
+je 2f
+mfence
+mov cr3, next_pml4     ; switch page tables if needed
+2:
+mov r15, frame.r15     ; restore callee-saved regs
+mov r14, frame.r14
+mov r13, frame.r13
+mov r12, frame.r12
+mov rbx, frame.rbx
+mov rbp, frame.rbp
+mov rsi, frame.rsi
+mov rdi, frame.rdi
+push frame.rip          ; push new RIP
+sti                     ; enable interrupts (WHPX-safe)
+ret                     ; jump to the task's RIP
 ```
 
-This sequence avoids `iretq`'s strict CS descriptor checks (canonicality, DPL vs CPL), which sometimes reject a valid `0x08` kernel selector when reached via a synthetic frame path.
+This sequence avoids `iretq`'s strict CS descriptor checks (canonicality, DPL vs CPL) and WHPX bugs with `popfq` at CPL=0 (which clears IF after emulation).
 
 ## Blocking and Wake
 

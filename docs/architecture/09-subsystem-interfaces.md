@@ -4,7 +4,7 @@
 
 This document defines the API surfaces between kernel subsystems. The interfaces are designed to be minimal and flat — each subsystem exposes a small number of public functions, and subsystems interact through these narrow interfaces rather than through shared global state.
 
-## Serial Subsystem (`src/serial.rs`)
+## Serial Subsystem (`kernel/src/serial.rs`)
 
 ### Public API
 
@@ -29,7 +29,7 @@ pub fn write_str(s: &str);               // Write string (\n → \r\n)
 - Panic handler: calls `write_str` for error messages
 - GDT loader: uses `com1_trace` for early debug output (single-byte writes with 100K retry timeout)
 
-## Logger Subsystem (`src/logger.rs`)
+## Logger Subsystem (`kernel/src/logger.rs`)
 
 ### Public API
 
@@ -57,7 +57,7 @@ Uses `core::fmt::write` to render arguments without heap allocation.
 - All kernel code via `log::info!()`, `log::warn!()`, `log::error!()`, `log::debug!()`, `log::trace!()`
 - Panic handler uses `write` directly for panic message formatting
 
-## Font Subsystem (`src/font.rs`)
+## Font Subsystem (`kernel/src/font.rs`)
 
 ### Public API
 
@@ -75,7 +75,7 @@ Bitmap font for ASCII 32–126 (95 glyphs). Each glyph is 16 bytes (16 rows × 8
 
 - Framebuffer (`kernel::Framebuffer`): calls `get_glyph` for text rendering in `put_char`, `write_str`, `write_str_centered`
 
-## Physical Memory Allocator (`src/mm/phys.rs`)
+## Physical Memory Allocator (`kernel/src/mm/phys.rs`)
 
 ### Public API
 
@@ -103,7 +103,7 @@ pub fn free_pages(addr: u64, count: u64);
 - Task manager (`task.rs`): allocates pages for task kernel stacks
 - IOAPIC/LAPIC MMIO mapping utilities
 
-## Virtual Memory Manager (`src/mm/virt.rs`)
+## Virtual Memory Manager (`kernel/src/mm/virt.rs`)
 
 ### Public API
 
@@ -140,7 +140,7 @@ pub fn map_region_higher_half(pml4, phys, size, flags);
 - Task init: maps kernel stack pages
 - (Future) Userspace: manages per-process page tables
 
-## Heap Allocator (`src/mm/heap.rs`)
+## Heap Allocator (`kernel/src/mm/heap.rs`)
 
 ### Public API
 
@@ -166,7 +166,7 @@ static ALLOCATOR: GlobalAllocator;
 - All code that uses `alloc::vec::Vec`, `alloc::boxed::Box`, `alloc::string::String`, `alloc::format!`, etc.
 - Bootloader uses UEFI allocator (`uefi::allocator::Allocator`), not this kernel heap
 
-## ACPI Subsystem (`src/acpi/mod.rs`)
+## ACPI Subsystem (`kernel/src/acpi/mod.rs`)
 
 ### Public API
 
@@ -198,7 +198,7 @@ pub struct AcpiContext {
 - Kernel main: calls `acpi::init(info.rsdp_addr)` → parses MADT → configures IOAPICs and interrupt routing
 - MADT parser: called by ACPI subsystem with physical address
 
-## Interrupt Routing (`src/intr/mod.rs`)
+## Interrupt Routing (`kernel/src/intr/mod.rs`)
 
 ### Public API
 
@@ -234,7 +234,7 @@ Output: IrqRoute instances used by:
 - Kernel main: routes IOAPIC entries, enables PIT/keyboard
 - IDT irq_handler: maps vector back to ISA source for PIT/keyboard handling
 
-## IOAPIC Driver (`src/arch/ioapic.rs`)
+## IOAPIC Driver (`kernel/src/arch/ioapic.rs`)
 
 ### Public API
 
@@ -259,7 +259,7 @@ pub fn make_redir_high(apic_id: u8) -> u32;
 - Interrupt routing: calls `set_entry`, `mask_entry`, `unmask_entry`
 - Kernel main: calls `init` with IOAPIC info from MADT
 
-## LAPIC Driver (`src/arch/apic.rs`)
+## LAPIC Driver (`kernel/src/arch/apic.rs`)
 
 ### Public API
 
@@ -272,21 +272,29 @@ pub fn calibrate_pit();
 pub fn set_timer_count(ms: u32);
 pub fn pit_enable_periodic(freq_hz: u32);
 pub fn send_eoi();
+pub fn send_init_ipi(apic_id: u32);
+pub fn send_sipi(apic_id: u32, vector: u8);
+pub fn ap_enable_timer(apic_id: u32);
 ```
 
 ### Dependents
 
 - Kernel main: calls `init_mmio` → `enable` → `calibrate_pit` → `configure_timer` → `set_timer_count`
+- SMP AP boot: calls `send_init_ipi` / `send_sipi` for INIT-SIPI-SIPI sequence
+- AP entry: calls `ap_enable_timer` for per-CPU LAPIC timer enable
 - IDT irq_handler: calls `send_eoi` if LAPIC is initialized
 - Kernel idle loop: relies on timer for scheduling
 
-## GDT Subsystem (`src/arch/gdt.rs`)
+## GDT Subsystem (`kernel/src/arch/gdt.rs`)
 
 ### Public API
 
 ```rust
 pub fn load();
 pub fn set_ist1(addr: u64);
+pub fn tss_set_rsp0(rsp0: u64);
+pub fn tss_set_rsp0_for_slot(slot: usize, rsp0: u64);
+pub fn init_tss_descriptor_for_slot(slot: usize);
 
 // Exported selectors:
 pub const KERNEL_CODE_SEL: u16 = 0x08;
@@ -297,8 +305,10 @@ pub const KERNEL_CODE_SEL: u16 = 0x08;
 - Kernel main: calls `load` (which also calls `set_ist1` from the IDT's perspective; `gdt::load` does not call it)
 - IDT init: calls `set_ist1` to wire the double-fault IST1 stack into the TSS
 - Task creation: uses `KERNEL_CODE_SEL` (0x08) for task CS
+- AP boot: calls `init_tss_descriptor_for_slot` for each AP before release
+- Scheduler: calls `tss_set_rsp0` on context switch to update per-CPU RSP0
 
-## IDT Subsystem (`src/arch/idt.rs`)
+## IDT Subsystem (`kernel/src/arch/idt.rs`)
 
 ### Public API
 
@@ -329,22 +339,22 @@ pub fn key_scancode() -> u16;
 - Syscall handlers: process syscall requests
 - Idle loop: reads `ticks()`, `pit_ticks()`, `key_count()`
 
-## Task Manager (`src/task.rs`)
+## Task Manager (`kernel/src/task.rs`)
 
 ### Public API
 
 ```rust
 pub fn init();
-pub fn init_main_task();
-pub fn task0_stack_top() -> u64;
+pub fn init_idle_task();
 pub fn is_initialized() -> bool;
 pub fn current_task_id() -> usize;
 pub fn task_count() -> usize;
 pub fn create_task(entry: u64) -> Option<usize>;
-pub fn schedule(frame: &mut TrapFrame) -> bool;
+pub fn schedule(frame: &mut TrapFrame) -> (bool, u64);
 pub fn block_current(frame: &mut TrapFrame);
 pub fn wake(task_id: usize);
 pub fn yield_now();
+pub fn steal_task(hungry_cpu: usize);
 ```
 
 ### Data Flow
@@ -357,7 +367,7 @@ Timer IRQ (vector 32)
       → finds next ready task (CFS: minimum `vruntime`)
       → overwrites TrapFrame with next task's state
       → returns true
-    → context switch via mov rsp + popfq/retfq
+    → context switch via mov rsp + sti + push rip + ret (WHPX-safe)
 
 Syscall (int 0x80)
   → syscall_handler()
@@ -370,7 +380,9 @@ Syscall (int 0x80)
 ### Dependents
 
 - IDT: calls `schedule` from timer IRQ handler
-- Kernel main: calls `init`, `init_main_task`, `create_task` for test tasks
+- Kernel main: calls `init`, `init_idle_task`, `create_task` for test tasks
+- AP entry: calls `init_idle_task` for per-CPU idle task
+- AP scheduling loop: calls `steal_task` for work stealing
 - Syscall handlers: call block_current, wake, current_task_id
 
 ## Framebuffer (`kernel/src/main.rs`)
@@ -417,21 +429,28 @@ Phase 1C: Physical allocator init           (regions from 1A)
 Phase 1D: ACPI init                        (regions from 1A, phys alloc)
 Phase 1E: Page tables init                 (regions, phys alloc, optionally fb)
 Phase 1F: Heap init                        (page tables, phys alloc)
+Phase 1G: VMA tree init                    (heap)
 Phase 2A: cli + mask PIC                    (no dependencies)
 Phase 2B: LAPIC MMIO init                  (page tables)
 Phase 2C: IOAPIC init + INTR routing       (page tables, ACPI/MADT)
+Phase 2D: Reserve AP pages                 (phys alloc)
+Phase 2E: SIPI trampoline init             (phys alloc — loads trampoline to 0x8000)
+Phase 2F: Framebuffer re-map in higher-half (page tables)
 Phase 3A: GDT load                         (page tables)
 Phase 3B: IDT init                         (GDT)
-Phase 3C: Task init                        (IDT, page tables, phys alloc)
-Phase 3D: Create test tasks                (task init)
-Phase 3E: Install IOAPIC routes            (IOAPIC + INTR init)
-Phase 3F: Enable LAPIC                     (LAPIC MMIO, IOAPIC)
-Phase 3G: Calibrate LAPIC timer            (LAPIC)
-Phase 3H: Configure LAPIC timer            (LAPIC calibrated)
-Phase 3I: Enable PIT periodic              (IOAPIC routes)
-Phase 3J: sti + int 32 test               (everything above)
-Phase 3K: Unmask device routes             (IOAPIC routes)
+Phase 3C: Percpu BSP init                  (mark online, install gs_base)
+Phase 3D: Task init + init_idle_task       (IDT, page tables, phys alloc)
+Phase 3E: Create test tasks                (task init)
+Phase 3F: Install IOAPIC routes            (IOAPIC + INTR init)
+Phase 3H: Enable LAPIC                     (LAPIC MMIO, IOAPIC)
+Phase 3I: Calibrate LAPIC timer            (LAPIC)
+Phase 3J: Configure LAPIC timer            (LAPIC calibrated)
+Phase 3K: Enable PIT periodic              (IOAPIC routes)
+Phase 3L: SMP AP boot (arch::smp::smp_boot_aps) — INIT-SIPI-SIPI via LAPIC ICR (page tables, LAPIC)
+Phase 3M: release_all_aps                  — sets kernel_ready=true for all CPUs
+Phase 3N: sti + int 32 test               (everything above)
+Phase 3O: Unmask device routes             (IOAPIC routes)
 Phase 4: Idle loop                         (all of the above)
 ```
 
-This order ensures that each subsystem's dependencies are initialized before it runs. For example, heap depends on page tables (to map heap pages) which depends on the physical allocator (to allocate page table pages).
+This order ensures that each subsystem's dependencies are initialized before it runs. For example, heap depends on page tables (to map heap pages) which depends on the physical allocator (to allocate page table pages). APs are released after all kernel state is ready so they can immediately participate in scheduling.

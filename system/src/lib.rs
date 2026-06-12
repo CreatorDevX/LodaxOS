@@ -30,65 +30,19 @@ pub struct BootInfo {
     /// Physical address of the RSDP (Root System Description Pointer),
     /// captured from UEFI config table before exit_boot_services.
     pub rsdp_addr: u64,
-    /// Physical address of the MADT (APIC) table, discovered by bootloader.
+    /// Physical address of the MADT (APIC) table, discovered by kernel from RSDP.
     pub madt_addr: u64,
-    /// Physical address of the Executive Runtime ELF image in the staging buffer.
-    pub exrun_image_addr: u64,
-    /// Size in bytes of the Executive Runtime ELF image.
-    pub exrun_image_size: u64,
     /// Maximum number of CPUs the kernel will bring up.
     pub max_cpus: u32,
     /// BSP LAPIC ID (always 0 on x86).
     pub bsp_apic_id: u32,
-    /// Physical address of the AP trampoline function (in bootloader memory).
-    /// The kernel must reserve this page so the buddy allocator does not
-    /// overwrite code that APs are currently executing.
-    pub ap_trampoline_phys: u64,
     /// Number of enabled application processors (APs) reported by UEFI MP Services.
     pub ap_count: u32,
     /// LAPIC ID of each AP, indexed 0..ap_count.
     pub ap_apic_ids: [u32; MAX_CPUS],
-    /// Physical address of each AP's `ApArg` block (boot-services memory,
-    /// survives ExitBootServices). Indexed 0..ap_count.
-    pub ap_arg_phys: [u64; MAX_CPUS],
 }
 
-/// Per-AP handoff block. Allocated by the bootloader in UEFI Loader-Data
-/// memory (survives ExitBootServices) and mapped in the kernel's PML4 via
-/// the identity map (the kernel identity-maps the first 4 GB using 2 MB
-/// huge pages).
-///
-/// Field layout is fixed — it is read by inline ASM in the boot trampoline
-/// and by the kernel's BSP release loop. Do not reorder or repack.
-///
-/// | Offset | Field                 | Written by | Read by              |
-/// |--------|-----------------------|------------|----------------------|
-/// | 0x00   | `target_pml4_phys`    | kernel BSP | trampoline (mov cr3) |
-/// | 0x08   | `target_gdt_ptr`      | kernel BSP | trampoline (lgdt)    |
-/// | 0x10   | `target_idt_ptr`      | kernel BSP | trampoline (lidt)    |
-/// | 0x18   | `target_kernel_stack` | boot       | trampoline (mov rsp) |
-/// | 0x20   | `target_entry`        | kernel BSP | trampoline (jmp rax) |
-/// | 0x28   | `ready`               | trampoline | kernel BSP (poll)    |
-/// | 0x2C   | `go`                  | kernel BSP | trampoline (spin)    |
-/// | 0x30   | `lapic_id`            | boot       | (informational)      |
-#[repr(C)]
-pub struct ApArg {
-    pub target_pml4_phys:    u64,
-    pub target_gdt_ptr:      u64,
-    pub target_idt_ptr:      u64,
-    pub target_kernel_stack: u64,
-    pub target_entry:        u64,
-    pub ready:               core::sync::atomic::AtomicU32,
-    pub go:                  core::sync::atomic::AtomicU32,
-    pub lapic_id:            u32,
-    _pad:                    u32,
-}
 
-// Compile-time layout guard: if any of these fail, the offsets in
-// boot/src/mp.rs `ap_trampoline` ASM are wrong.
-const _: [(); 1] = [(); (core::mem::offset_of!(ApArg, go) == 0x2C) as usize];
-const _: [(); 1] = [(); (core::mem::offset_of!(ApArg, lapic_id) == 0x30) as usize];
-const _: [(); 1] = [(); (core::mem::size_of::<ApArg>() == 0x38) as usize];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -113,12 +67,11 @@ pub struct FramebufferInfo {
 // =====================================================================
 //
 // The capability system is the policy boundary between the kernel and
-// Executive Runtime. Mechanism (who can do what check) lives in the
-// kernel (`src/cap.rs`); policy is decided by ExRun, which runs as a
-// separate ring-0 process. v1 has no IPC, so the cap check is
+// the policy process (future). Mechanism (who can do what check) lives in the
+// kernel (`kernel/src/cap.rs`); v1 has no IPC, so the cap check is
 // **static-only** (does the subject hold the cap bit?). When IPC is
 // implemented, the dynamic check will write a `CapRequest` to the
-// shared mailbox, IPI-wake ExRun, and wait for a `CapResponse`.
+// shared mailbox, IPI-wake the policy process, and wait for a `CapResponse`.
 //
 // On ring 0, subjects are kernel tasks (no userspace yet). The cap set
 // lives in the `Task` struct and is updated atomically.
@@ -225,7 +178,7 @@ pub enum CapError {
     UnknownSubject(SubjectId),
     /// CapId > 63.
     InvalidCap(CapId),
-    /// No policy provider is installed (e.g. ExRun is not running).
+    /// No policy provider is installed (e.g. policy process not running).
     NoPolicyProvider,
     /// Dynamic policy hook returned Deny.
     PolicyDenied { subject: SubjectId, op: CapOp },
@@ -234,22 +187,19 @@ pub enum CapError {
 }
 
 // =====================================================================
-// Kernel ↔ Executive Runtime mailbox
+// Kernel ↔ policy-process mailbox (reserved for future use)
 // =====================================================================
 //
-// Executive Runtime runs as a separate ring-0 process with its own
-// PML4. The kernel and ExRun communicate via a single shared 4 KiB
-// page (the "mailbox") that is mapped into both address spaces at
-// fixed virtual addresses:
+// The mailbox protocol is reserved for a future policy process
+// (Secure Runtime or similar). When implemented, it will use a single
+// shared 4 KiB page mapped at fixed virtual addresses:
 //
-//   - kernel higher-half: 0xFFFF_8000_0040_0000
-//   - ExRun address space: 0x0000_0000_0040_0000
+//   - kernel higher-half: 0xFFFF_A000_0000_0000
+//   - policy-process address space: 0x0000_4000_0000_0000
 //
-// Both sides see the same physical bytes. The page is laid out as a
-// tagged request/response protocol with two atomic flags for
-// ready-signaling. IPC is **deferred** in v1 (see memory.md) — the
-// mailbox is allocated and mapped in both PML4s, but the kernel does
-// not read or write it. The cap system is static-only for v1.
+// v1 uses static-only capability checks (no IPC). The mailbox
+// types and constants are defined here so they don't need to be
+// revisited when the policy process is added.
 
 /// Fixed higher-half virtual address where the kernel maps the mailbox
 /// page. We pick an address that's **outside** the kernel's existing
@@ -258,14 +208,13 @@ pub enum CapError {
 /// a fresh slot beyond the physical-memory range.
 pub const MAILBOX_KERNEL_VIRT: u64 = 0xFFFF_A000_0000_0000;
 
-/// Fixed virtual address where ExRun maps the mailbox page (in ExRun's
-/// own address space). We pick an address that's **outside** the
-/// identity map (which covers `0..4 GB` as 2 MB huge pages at PML4[0x1FF])
-/// and outside ExRun's ELF region (which is linked at
-/// `0xFFFF_8000_4000_0000`, also in PML4[0x1FF]). For ExRun's forked
-/// PML4, this means a fresh PML4 entry (PML4[8]) — no conflict with
-/// existing huge pages, so the ELF loader can map it as a 4 KB page.
-pub const MAILBOX_EXRUN_VIRT: u64 = 0x0000_4000_0000_0000;
+/// Fixed virtual address where a future policy process maps the mailbox
+/// page (in its own address space). We pick an address that's **outside**
+/// the identity map (which covers `0..4 GB` as 2 MB huge pages at
+/// PML4[0x1FF]). This is a fresh PML4 entry (PML4[8]) — no conflict
+/// with existing huge pages, so a future ELF loader can map it as a
+/// 4 KB page.
+pub const MAILBOX_POLICY_VIRT: u64 = 0x0000_4000_0000_0000;
 
 /// CapOp discriminator — matches the order of the `CapOp` variants.
 /// Used to serialise `CapOp` over the mailbox without depending on
@@ -297,7 +246,7 @@ pub mod cap_op_kind {
 
 /// Fixed-size serialised form of `CapOp`. The `kind` field is a
 /// `cap_op_kind` constant. The remaining 56 bytes are a payload
-/// (little-endian, host order — the kernel and ExRun must agree).
+/// (little-endian, host order — the kernel and policy process must agree).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CapOpWire {
@@ -311,13 +260,13 @@ impl CapOpWire {
     }
 }
 
-/// Fixed-size request packet. Written by the kernel, read by ExRun.
+/// Fixed-size request packet. Written by the kernel, read by the policy process.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CapRequest {
     pub subject: u32,
     pub op: CapOpWire,
-    /// Sequence number — ExRun echoes this in the response so the
+    /// Sequence number — policy process echoes this in the response so the
     /// kernel can match replies to outstanding requests.
     pub seq: u64,
     _pad: [u8; 16],
@@ -334,7 +283,7 @@ impl CapRequest {
     }
 }
 
-/// Fixed-size response packet. Written by ExRun, read by the kernel.
+/// Fixed-size response packet. Written by the policy process, read by the kernel.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CapResponse {
@@ -355,13 +304,13 @@ impl CapResponse {
     }
 }
 
-/// The 4 KiB mailbox page. Both kernel and ExRun map this and access
+/// The 4 KiB mailbox page. Both kernel and policy process map this and access
 /// the same physical bytes.
 ///
 /// Layout:
 /// ```text
-/// 0x000  request_ready:  AtomicU32  (kernel sets, ExRun reads)
-/// 0x004  response_ready: AtomicU32  (ExRun sets, kernel reads)
+/// 0x000  request_ready:  AtomicU32  (kernel sets, policy process reads)
+/// 0x004  response_ready: AtomicU32  (policy process sets, kernel reads)
 /// 0x008  request:        CapRequest
 /// 0x088  response:       CapResponse
 /// ```
@@ -405,7 +354,7 @@ impl Mailbox {
 const _: [(); 4096] = [(); core::mem::size_of::<Mailbox>()];
 const _: () = {
     // The `Mailbox` size includes trailing padding. If a new field is
-    // added, the explicit `3756` in `_pad2` will be wrong and the
+    // added, the explicit `3752` in `_pad2` will be wrong and the
     // build will fail. Update `_pad2` to keep the total at 4096.
     if core::mem::size_of::<Mailbox>() != 4096 {
         panic!("Mailbox size is not 4096 — update _pad2");

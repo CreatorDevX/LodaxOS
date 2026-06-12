@@ -682,8 +682,7 @@ fn read_file(
     Some(data)
 }
 
-/// Load kernel.elf from the ext4 partition via UEFI Block I/O.
-/// Load a file from the ext4 root directory by name.
+/// Load a file from the ext4 root directory by name via UEFI Block I/O.
 fn load_file_from_ext4(filename: &[u8]) -> Option<Vec<u8>> {
     log::info!("Finding ext4 partition...");
     let (ext4_handle, partition_lba) = find_ext4_partition()?;
@@ -847,8 +846,4 @@ fn load_file_from_ext4(filename: &[u8]) -> Option<Vec<u8>> {
 
 pub fn load_kernel_from_ext4() -> Option<Vec<u8>> {
     load_file_from_ext4(b"kernel.elf")
-}
-
-pub fn load_exrun_from_ext4() -> Option<Vec<u8>> {
-    load_file_from_ext4(b"exrun.elf")
 }

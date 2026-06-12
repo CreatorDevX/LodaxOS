@@ -1,23 +1,17 @@
 /// Capability system — the kernel's policy boundary.
 ///
-/// Mechanism lives here (who can do what check). Policy lives in
-/// Executive Runtime (ExRun) — a separate ring-0 process. The
-/// kernel and ExRun communicate via a single shared 4 KiB mailbox
-/// page that is mapped into both address spaces (see
-/// `system::Mailbox`).
+/// Mechanism lives here (who can do what check). Policy is
+/// **static-only** in v1 — each task's cap set is granted at
+/// creation time and checked against requested operations.
 ///
-/// ## v1: static-only
-///
-/// IPC is **deferred** (see `memory.md`). For v1, the kernel's cap
-/// check is **static-only** — the dynamic policy check (via the
-/// mailbox) is a no-op. When IPC is implemented, the dynamic check
-/// will write a `CapRequest` to the mailbox, IPI-wake ExRun, and
-/// spin on `response_ready`.
+/// When IPC and a separate policy process are added later, the
+/// static check will be augmented with a dynamic policy hook
+/// via the shared mailbox.
 ///
 /// The static check is always run:
 ///   - early-init bypass: if `!task::is_initialized()`, allow
 ///   - BSP bypass: if subject 0 isn't registered, allow (during
-///     `task::init_main_task` the stack is allocated BEFORE the
+///     `task::init_idle_task` the stack is allocated BEFORE the
 ///     Task struct is written)
 ///   - normal: check the cap bits in the subject's `Caps` field
 ///
@@ -43,9 +37,9 @@ pub fn caps_of(subject: u32) -> Option<Caps> {
 /// Static-only authorization check.
 ///
 /// Returns `Ok(())` if the subject holds the required cap bits. v1
-/// does not consult ExRun (no IPC). The function name is kept as
-/// `check_and_authorize` for forward compatibility — when IPC is
-/// implemented, the dynamic check will be added here.
+/// is static-only. The function name is kept as `check_and_authorize`
+/// for forward compatibility — when IPC is implemented, the dynamic
+/// check will be added here.
 pub fn check_and_authorize(
     subject: u32,
     required: Caps,
@@ -79,8 +73,8 @@ pub fn check_static(subject: u32, required: Caps) -> Result<(), CapError> {
 }
 
 /// Grant `add` to `target`. The caller (current subject) must hold
-/// `CAP_POLICY_WRITE`. (v1 has no ExRun `on_grant` hook — when IPC is
-/// added, the hook will be consulted here.)
+/// `CAP_POLICY_WRITE`. (v1 is static-only; a future IPC-based
+/// policy hook will be consulted here.)
 pub fn grant_caps(target: u32, add: Caps) -> Result<(), CapError> {
     let caller = current_subject();
     check_and_authorize(
@@ -119,8 +113,8 @@ pub fn inspect_caps(target: u32) -> Result<Caps, CapError> {
 /// Apply the default cap set for a newly created task.
 ///
 /// v1 default: `Caps::empty()` unless the parent is task 0 (BSP), in
-/// which case the child gets `Caps::all()`. When IPC is added, this
-/// will consult ExRun's `on_create` hook.
+/// which case the child gets `Caps::all()`. A future IPC-based
+/// policy hook will be consulted here.
 pub fn apply_default_caps(_child: u32, parent: Option<u32>) -> Caps {
     if parent == Some(0) {
         Caps::all()
