@@ -1,15 +1,21 @@
-use core::arch::asm;
 use lodaxos_system::{BootInfo, MAX_CPUS};
 use crate::mm;
+use crate::consts;
 
-/// Physical address of the SIPI trampoline page (SIPI vector = 0x08).
-const TRAMP_PHYS: u64 = 0x8000;
+use consts::TRAMPOLINE_PHYS as TRAMP_PHYS;
 
 /// Offset from trampoline base to the first mailbox slot.
 const MAILBOX_OFF: u64 = 0x400;
 
 /// Size of each per-AP mailbox slot (0x80 bytes = 128 bytes).
 const MAILBOX_SLOT_SIZE: u64 = 0x80;
+
+/// Physical address of the APIC-ID-to-slot mapping table (256 bytes,
+/// one u8 per APIC ID, 0xFF = unassigned).  Written by the BSP before
+/// sending IPIs; read by the real-mode trampoline, and by
+/// `ap_start::ap_entry` (long mode) to discover its pre-allocated
+/// PERCPU slot.
+pub(crate) const SLOT_MAP_PHYS: u64 = TRAMP_PHYS + 0x300;
 
 /// Mailbox field offsets within each slot (must match smp_trampoline.S):
 const MB_STACK:     u64 = 0x40;
@@ -49,8 +55,9 @@ fn slot_base(slot: usize) -> *mut u8 {
     (TRAMP_PHYS + MAILBOX_OFF + (slot as u64) * MAILBOX_SLOT_SIZE) as *mut u8
 }
 
-/// Write a per-AP mailbox slot.  Each AP identifies its slot by APIC ID,
-/// so all mailboxes can be written before any IPIs are sent.
+/// Write a per-AP mailbox slot.  All mailboxes are written before any
+/// IPIs are sent.  The AP locates its slot via the pre-populated slot
+/// mapping table at SLOT_MAP_PHYS.
 unsafe fn write_mailbox_slot(
     slot: usize,
     stack_top: u64,
@@ -82,18 +89,20 @@ unsafe fn write_mailbox_slot(
 /// Returns `true` if the AP responded, `false` on timeout (~10 s).
 fn poll_ap_slot(slot: usize) -> bool {
     let status_ptr = unsafe { slot_base(slot).add(MB_STATUS as usize) } as *const u8;
-    for _ in 0..1000 {
+        for _ in 0..1000 {
         let status = unsafe { status_ptr.read_volatile() };
         if status != 0 {
             return true;
         }
-        unsafe { asm!("mov ecx, 1000000\n2: pause\nsub ecx, 1\njnz 2b", options(nomem, preserves_flags)) };
+        for _ in 0..1000000 { core::hint::spin_loop(); }
     }
     false
 }
 
 /// Start all APs in parallel via INIT-SIPI-SIPI.
 ///
+/// Phase 0 — zero the slot map table and write pre-allocated PERCPU
+///           slot numbers (assigned sequentially by `smp_boot_aps`).
 /// Phase 1 — write all AP mailboxes.
 /// Phase 2 — send INIT to all APs.
 /// Phase 3 — single 10 ms wait.
@@ -104,7 +113,10 @@ fn poll_ap_slot(slot: usize) -> bool {
 ///
 /// `ap_stacks` — physical address of each AP's kernel stack top (one per
 /// enabled AP, indexed by AP index from BootInfo).
-pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64]) {
+/// `ap_slots`  — pre-allocated PERCPU slot for each AP (set by the BSP
+/// in `smp_boot_aps` to avoid the race of APs calling `find_slot`
+/// concurrently).
+pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64], ap_slots: &[usize]) {
     let count = boot_info.ap_count as usize;
     if count == 0 {
         return;
@@ -113,14 +125,40 @@ pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64]) {
         log::error!("SMP: not enough stacks ({}) for {} APs", ap_stacks.len(), count);
         return;
     }
+    if ap_slots.len() < count {
+        log::error!("SMP: not enough slots ({}) for {} APs", ap_slots.len(), count);
+        return;
+    }
 
     let pml4_phys = crate::mm::virt::pml4_address();
     let ap_entry_fn = crate::ap_start::ap_entry as *const () as u64;
 
+    // ---- Phase 0: write the slot mapping table ----
+    // The BSP has already pre-allocated PERCPU slots via `find_slot`
+    // (serial, no race).  We write those into the physical SLOT_MAP
+    // table so the real-mode trampoline and the long-mode `ap_entry`
+    // can discover the slot for their APIC ID.
+    unsafe {
+        core::ptr::write_bytes(SLOT_MAP_PHYS as *mut u8, 0xFF, 256);
+    }
+
+    // Clamp count to MAX_CPUS to avoid overflowing stack arrays.
+    let count = count.min(MAX_CPUS - 1);
+
     // ---- Phase 1: write all mailboxes ----
     for i in 0..count {
         let apic_id = boot_info.ap_apic_ids[i];
-        let slot = (apic_id as usize) % MAX_CPUS;
+        let slot = ap_slots[i];
+
+        if (apic_id as usize) < 256 {
+            unsafe {
+                core::ptr::write_volatile(
+                    (SLOT_MAP_PHYS + apic_id as u64) as *mut u8,
+                    slot as u8,
+                );
+            }
+        }
+
         let (gdt_limit, gdt_base) = gdt_ptr_contents(slot);
         let (idt_limit, idt_base) = idt_ptr_contents(slot);
 
@@ -160,7 +198,7 @@ pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64]) {
     // ---- Phase 5: poll all APs in parallel ----
     for i in 0..count {
         let apic_id = boot_info.ap_apic_ids[i];
-        let slot = (apic_id as usize) % MAX_CPUS;
+        let slot = ap_slots[i];
         log::info!("SMP: waiting for AP[{}] (slot {})...", i, slot);
         if poll_ap_slot(slot) {
             log::info!("SMP: AP[{}] ready (apic_id={})", i, apic_id);
@@ -192,11 +230,11 @@ fn idt_ptr_contents(slot: usize) -> (u16, u64) {
     crate::arch::idt::idt_ptr_limit_base(slot)
 }
 
-/// Crude busy-loop delay (approximate milliseconds using pause).
+/// Crude busy-loop delay (approximate milliseconds using spin_loop).
 fn delay_ms(ms: u32) {
     for _ in 0..ms {
-        unsafe {
-            asm!("mov ecx, 1000000\n2: pause\nsub ecx, 1\njnz 2b", options(nomem, preserves_flags));
+        for _ in 0..1000000 {
+            core::hint::spin_loop();
         }
     }
 }

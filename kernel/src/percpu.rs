@@ -16,70 +16,67 @@
 //! which is the per-CPU entry point in long mode with kernel state fully
 //! set up.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::IrqSaveSpinLock;
 use lodaxos_system::MAX_CPUS;
 
-/// Maximum total tasks across all CPUs (matches task.rs).
-pub const MAX_TASKS: usize = 32;
+/// Capacity of each per-CPU ready queue (entries per pCPU).
+pub const QUEUE_CAPACITY: usize = 256;
 
-/// Per-CPU ready queue: fixed-size circular buffer of task IDs.
-/// Lock-free for single-producer (timer ISR on this CPU) and
-/// single-consumer (schedule on this CPU). Cross-CPU wake/steal
-/// uses the global task table lock.
-///
-/// Uses the standard SPSC pattern: the producer writes the entry
-/// *then* advances `tail` (release) to publish; the consumer reads
-/// `tail` (acquire) *then* reads the entry.  `pop` advances `head`
-/// (release) to vacate the slot for the producer's full-check.
+struct QueueInner {
+    buf: [usize; QUEUE_CAPACITY],
+    head: usize,
+    tail: usize,
+}
+
+/// Per-CPU ready queue: fixed-size circular buffer of entity IDs.
+/// Protected by a per-queue spinlock to avoid ABA issues inherent in
+/// lock-free MPMC designs.  The lock is IRQ-safe so it can be used
+/// from both normal context and timer ISRs.
 pub struct ReadyQueue {
-    pub buf: [AtomicUsize; MAX_TASKS],
-    pub head: AtomicUsize,
-    pub tail: AtomicUsize,
+    inner: IrqSaveSpinLock<QueueInner>,
 }
 
 impl ReadyQueue {
     pub const fn empty() -> Self {
         Self {
-            buf: [const { AtomicUsize::new(0) }; MAX_TASKS],
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            inner: IrqSaveSpinLock::new(QueueInner {
+                buf: [0; QUEUE_CAPACITY],
+                head: 0,
+                tail: 0,
+            }),
         }
     }
 
-    /// Push a task ID onto this CPU's ready queue.
-    /// Returns `false` if the queue is full.
     pub fn push(&self, id: usize) -> bool {
-        let t = self.tail.load(Ordering::Relaxed);
-        let h = self.head.load(Ordering::Acquire);
-        if t.wrapping_sub(h) >= MAX_TASKS {
+        let mut q = self.inner.lock();
+        let next = q.tail.wrapping_sub(q.head);
+        if next >= QUEUE_CAPACITY {
             return false;
         }
-        self.buf[t % MAX_TASKS].store(id, Ordering::Relaxed);
-        self.tail.store(t.wrapping_add(1), Ordering::Release);
+        let idx = q.tail % QUEUE_CAPACITY;
+        q.buf[idx] = id;
+        q.tail = q.tail.wrapping_add(1);
         true
     }
 
-    /// Pop a task ID from this CPU's ready queue.
-    /// Returns `None` if the queue is empty.
     pub fn pop(&self) -> Option<usize> {
-        let h = self.head.load(Ordering::Relaxed);
-        let t = self.tail.load(Ordering::Acquire);
-        if h == t {
+        let mut q = self.inner.lock();
+        if q.head == q.tail {
             return None;
         }
-        let id = self.buf[h % MAX_TASKS].load(Ordering::Relaxed);
-        self.head.store(h.wrapping_add(1), Ordering::Release);
+        let idx = q.head % QUEUE_CAPACITY;
+        let id = q.buf[idx];
+        q.head = q.head.wrapping_add(1);
         Some(id)
     }
 
-    /// Peek at the front without removing.
     pub fn peek(&self) -> Option<usize> {
-        let h = self.head.load(Ordering::Relaxed);
-        let t = self.tail.load(Ordering::Acquire);
-        if h == t {
+        let q = self.inner.lock();
+        if q.head == q.tail {
             return None;
         }
-        Some(self.buf[h % MAX_TASKS].load(Ordering::Relaxed))
+        Some(q.buf[q.head % QUEUE_CAPACITY])
     }
 }
 
@@ -126,8 +123,12 @@ pub struct PerCpu {
     /// Per-CPU tick counter. Increments from the LAPIC timer ISR.
     pub ticks: AtomicU64,
     /// The currently-running task on this CPU. Index into the global
-    /// `TASKS` table.
+    /// `TASKS` table (legacy — will be replaced by current_vcpu).
     pub current_task: AtomicUsize,
+    /// The currently-running vCPU on this CPU (replaces current_task in SEDS).
+    pub current_vcpu: AtomicUsize,
+    /// The idle Vcpu for this CPU (the hlt-loop Vcpu).
+    pub idle_vcpu_id: AtomicU32,
     /// Number of ready+blocked tasks assigned to this CPU.
     pub task_count: AtomicUsize,
     /// Per-CPU ready queue (lock-free circular buffer of task IDs).
@@ -141,6 +142,14 @@ pub struct PerCpu {
     pub need_resched: AtomicBool,
     /// Per-CPU timer fire count for rate-limited logging.
     pub timer_fires: AtomicU64,
+    /// Address of a TLB entry that still needs flushing on this CPU.
+    /// Set by a remote CPU when a TLB shootdown IPI times out.
+    /// Checked and cleared on the next interrupt entry.
+    pub pending_tlb_flush: AtomicU64,
+    /// CR3 saved at interrupt entry (before any scheduler can change it).
+    /// Used by the fault diagnostic dump to probe the faulting context's
+    /// page tables instead of the (possibly switched) current CR3.
+    pub saved_cr3: AtomicU64,
 }
 
 impl PerCpu {
@@ -152,11 +161,15 @@ impl PerCpu {
             kernel_stack_top: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             current_task: AtomicUsize::new(0),
+            current_vcpu: AtomicUsize::new(0),
+            idle_vcpu_id: AtomicU32::new(u32::MAX),
             task_count: AtomicUsize::new(0),
             ready_queue: ReadyQueue::empty(),
             self_ptr: AtomicU64::new(0),
             need_resched: AtomicBool::new(false),
             timer_fires: AtomicU64::new(0),
+            pending_tlb_flush: AtomicU64::new(0),
+            saved_cr3: AtomicU64::new(0),
         }
     }
 }
@@ -164,15 +177,85 @@ impl PerCpu {
 /// The per-CPU array. Indexed by LAPIC ID (a small integer, 0..MAX_CPUS-1).
 pub static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 
-/// Register a CPU as online. Called by `ap_start::ap_entry` (per CPU)
-/// and by the BSP at the end of `_start` init.
-pub fn mark_online(apic_id: u32) {
-    let slot = (apic_id as usize) % MAX_CPUS;
+/// APIC-ID-to-slot lookup table. Initialised with 0xFF (invalid).
+/// When a CPU is marked online, the BSP or the AP itself writes
+/// `APIC_TO_SLOT[apic_id] = slot`. This gives O(1) lookup from APIC ID
+/// to slot without modulo collisions.
+pub static APIC_TO_SLOT: [AtomicU8; 256] = [const { AtomicU8::new(0xFF) }; 256];
+
+/// Fast slot lookup: map APIC ID to PERCPU index using the lookup table.
+/// Falls back to a linear search if the APIC ID is ≥ 256.
+#[inline]
+pub fn apic_id_to_slot(apic_id: u32) -> usize {
+    if apic_id < 256 {
+        let slot = APIC_TO_SLOT[apic_id as usize].load(Ordering::Relaxed);
+        if slot != 0xFF {
+            return slot as usize;
+        }
+    }
+    // Fallback: linear search (rare, only for APIC IDs ≥ 256).
+    slot_for(apic_id)
+}
+
+/// Find a PERCPU slot for the given APIC ID using linear search.
+/// First tries to match an existing online slot with the same APIC ID;
+/// if none found, atomically claims the first offline slot. Returns
+/// `None` if all slots are occupied (should not happen if caller
+/// respects MAX_CPUS).
+///
+/// This avoids collisions that would occur with `apic_id % MAX_CPUS`
+/// when APIC IDs differ by multiples of MAX_CPUS.
+///
+/// Thread-safe: multiple APs can call this concurrently during SIPI boot.
+pub fn find_slot(apic_id: u32) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+
+    // Phase 1: match an existing slot with this APIC ID (re-boot of same CPU).
+    for slot in 0..MAX_CPUS {
+        if PERCPU[slot].apic_id.load(Ordering::Relaxed) == apic_id {
+            return Some(slot);
+        }
+    }
+    // Phase 2: atomically claim the first offline slot.
+    for slot in 0..MAX_CPUS {
+        if PERCPU[slot]
+            .online
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+/// Return the preferred slot for an APIC ID (the one currently assigned
+/// or the first free slot). Panics if all slots are exhausted.
+pub fn slot_for(apic_id: u32) -> usize {
+    find_slot(apic_id).expect("PERCPU slots exhausted")
+}
+
+/// Register a CPU as online at a caller-specified slot (bypasses
+/// `find_slot` / `slot_for`).  Used by APs during SIPI boot where
+/// the BSP has already pre-allocated the slot and written it into
+/// the AP's mailbox/SLOT_MAP table, avoiding the race of multiple
+/// APs calling `find_slot` concurrently.
+pub fn mark_online_for_slot(apic_id: u32, slot: usize) {
+    if apic_id < 256 {
+        APIC_TO_SLOT[apic_id as usize].store(slot as u8, Ordering::Release);
+    }
     unsafe {
         let p = &PERCPU[slot] as *const PerCpu as *mut PerCpu;
         (*p).apic_id.store(apic_id, Ordering::Release);
         (*p).online.store(true, Ordering::Release);
     }
+}
+
+/// Register a CPU as online. Called by `ap_start::ap_entry` (per CPU)
+/// and by the BSP at the end of `_start` init.
+pub fn mark_online(apic_id: u32) {
+    let slot = slot_for(apic_id);
+    mark_online_for_slot(apic_id, slot);
 }
 
 pub fn is_online(cpu: usize) -> bool {
@@ -181,11 +264,19 @@ pub fn is_online(cpu: usize) -> bool {
 
 /// Wait until `kernel_ready` is set on this CPU. APs call this after
 /// `mark_online` and before entering the scheduler.
-pub fn wait_for_kernel_ready(apic_id: u32) {
-    let slot = (apic_id as usize) % MAX_CPUS;
-    while !PERCPU[slot].kernel_ready.load(Ordering::Acquire) {
+///
+/// Returns `false` on timeout (~10 s) so the caller can halt instead
+/// of entering the scheduler unreleased.
+pub fn wait_for_kernel_ready(apic_id: u32) -> bool {
+    let slot = apic_id_to_slot(apic_id);
+    for _ in 0..10_000_000 {
+        if PERCPU[slot].kernel_ready.load(Ordering::Acquire) {
+            return true;
+        }
         core::hint::spin_loop();
     }
+    log::error!("AP[lapic={}]: kernel_ready timeout — BSP may have crashed", apic_id);
+    false
 }
 
 /// Release all APs by setting `kernel_ready` for every slot, even those
@@ -294,17 +385,12 @@ pub fn current_apic_id() -> u32 {
         }
         aux
     } else {
-        // LAPIC is architecturally at 0xFEE00000, identity-mapped during
-        // UEFI boot and by the kernel's own page tables.
-        let raw: u32;
+        let lapic_base = crate::arch::apic::read_apic_base();
         unsafe {
-            core::arch::asm!(
-                "mov eax, dword ptr [{addr}]",
-                addr = in(reg) (0xFEE00000u64 + 0x20) as *const u32,
-                out("eax") raw,
-            );
+            let addr = (lapic_base + 0x20) as *const u32;
+            let raw = core::ptr::read_volatile(addr);
+            raw >> 24
         }
-        raw >> 24
     }
 }
 
@@ -337,11 +423,8 @@ pub fn self_slot() -> *mut PerCpu {
 pub fn current_apic_id_lapic() -> u32 {
     let raw: u32;
     unsafe {
-        core::arch::asm!(
-            "mov eax, dword ptr [{addr}]",
-            addr = in(reg) (crate::arch::apic::LAPIC_BASE + 0x20) as *const u32,
-            out("eax") raw,
-        );
+        let addr = (*crate::arch::apic::LAPIC_BASE.get()) + 0x20;
+        raw = core::ptr::read_volatile(addr as *const u32);
     }
     raw >> 24
 }
@@ -391,25 +474,59 @@ pub fn is_bsp() -> bool {
 /// Return the currently-running task ID for `cpu`.
 pub fn current_task(cpu: usize) -> usize {
     let slot = cpu % MAX_CPUS;
-    PERCPU[slot].current_task.load(Ordering::Relaxed)
+    PERCPU[slot].current_task.load(Ordering::Acquire)
 }
 
 /// Set the currently-running task ID for `cpu`.
 pub fn set_current(cpu: usize, id: usize) {
     let slot = cpu % MAX_CPUS;
-    PERCPU[slot].current_task.store(id, Ordering::Relaxed);
+    PERCPU[slot].current_task.store(id, Ordering::Release);
+}
+
+/// Return the currently-running vCPU ID for `cpu` (SEDS).
+pub fn current_vcpu(cpu: usize) -> usize {
+    let slot = cpu % MAX_CPUS;
+    PERCPU[slot].current_vcpu.load(Ordering::Acquire)
+}
+
+/// Set the currently-running vCPU ID for `cpu` (SEDS).
+pub fn set_current_vcpu(cpu: usize, id: usize) {
+    let slot = cpu % MAX_CPUS;
+    PERCPU[slot].current_vcpu.store(id, Ordering::Release);
 }
 
 /// Return the number of tasks assigned to `cpu`.
 pub fn task_count(cpu: usize) -> usize {
     let slot = cpu % MAX_CPUS;
-    PERCPU[slot].task_count.load(Ordering::Relaxed)
+    PERCPU[slot].task_count.load(Ordering::Acquire)
 }
 
 /// Set the number of tasks assigned to `cpu`.
 pub fn set_task_count(cpu: usize, count: usize) {
     let slot = cpu % MAX_CPUS;
-    PERCPU[slot].task_count.store(count, Ordering::Relaxed);
+    PERCPU[slot].task_count.store(count, Ordering::Release);
+}
+
+/// Atomically add `delta` to the task count for `cpu` (Bug 7).
+pub fn add_task_count(cpu: usize, delta: isize) {
+    let slot = cpu % MAX_CPUS;
+    if delta >= 0 {
+        PERCPU[slot].task_count.fetch_add(delta as usize, Ordering::AcqRel);
+    } else {
+        PERCPU[slot].task_count.fetch_sub((-delta) as usize, Ordering::AcqRel);
+    }
+}
+
+/// Set the idle Vcpu for `cpu`.
+pub fn set_idle_vcpu(cpu: usize, id: u32) {
+    let slot = cpu % MAX_CPUS;
+    PERCPU[slot].idle_vcpu_id.store(id, Ordering::Relaxed);
+}
+
+/// Return the idle Vcpu for `cpu`.
+pub fn idle_vcpu(cpu: usize) -> u32 {
+    let slot = cpu % MAX_CPUS;
+    PERCPU[slot].idle_vcpu_id.load(Ordering::Relaxed)
 }
 
 /// Find the CPU with the fewest tasks. Used by `create_task_in` for
@@ -417,15 +534,19 @@ pub fn set_task_count(cpu: usize, count: usize) {
 pub fn find_least_loaded() -> usize {
     let mut best = 0;
     let mut best_count = usize::MAX;
+    let mut found = false;
     for cpu in 0..MAX_CPUS {
         if !PERCPU[cpu].online.load(Ordering::Acquire) {
             continue;
         }
+        found = true;
         let cnt = PERCPU[cpu].task_count.load(Ordering::Relaxed);
         if cnt < best_count {
             best_count = cnt;
             best = cpu;
         }
     }
-    best
+    // If no CPUs are online (should not happen in normal operation),
+    // return CPU 0 as a safe default.
+    if !found { 0 } else { best }
 }

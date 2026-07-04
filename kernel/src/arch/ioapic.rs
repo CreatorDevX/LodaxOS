@@ -195,6 +195,9 @@ pub fn init(ioapic_infos: &[crate::acpi::madt::IoApicInfo]) {
             // IOAPIC delivers an interrupt with vector 0, which QEMU prints as
             // a warning and the CPU ignores (but the LAPIC may also fire its
             // uninitialised Error LVT).
+            // Cap max_redir at a safe upper bound (239 = absolute max per spec)
+            // to avoid accessing unimplemented registers on malformed hardware.
+            let max_redir = max_redir.min(239);
             for pin in 0..=max_redir {
                 hw_ioapic.set_entry(pin, IoApic::make_redir_low(0xFF, 0, true), 0);
             }

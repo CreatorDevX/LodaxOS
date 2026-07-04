@@ -3,7 +3,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{phys, virt};
-use crate::sync::IrqSaveSpinLock;
+use crate::sync::{IrqSaveSpinLock, SyncUnsafeCell};
 
 #[repr(C)]
 struct Slab {
@@ -22,7 +22,11 @@ impl Slab {
         let objects_start = base.add(core::mem::size_of::<Slab>());
         let page_count = 1usize << order;
         let slab_bytes = page_count * phys::PAGE_SIZE as usize;
-        let avail = slab_bytes - core::mem::size_of::<Slab>();
+        let header = core::mem::size_of::<Slab>();
+        if slab_bytes <= header || obj_size < core::mem::size_of::<*mut u8>() {
+            return ptr::null_mut();
+        }
+        let avail = slab_bytes - header;
         let total = (avail / obj_size) as u16;
         let mut cur = objects_start;
         for i in 0..total as usize {
@@ -87,11 +91,13 @@ struct KmemCache {
     full: *mut Slab,
 }
 
-/// One global IRQ-safe spinlock for the slab allocator. A single global
-/// lock is sufficient for v1 (the per-cache list is the contended data,
-/// not the cache table itself). Will be replaced with per-cache locks
-/// once we have a per-cache slot layout.
-static HEAP_LOCK: IrqSaveSpinLock<()> = IrqSaveSpinLock::new(());
+static CACHE_LOCKS: [IrqSaveSpinLock<()>; 9] = [
+    IrqSaveSpinLock::new(()), IrqSaveSpinLock::new(()),
+    IrqSaveSpinLock::new(()), IrqSaveSpinLock::new(()),
+    IrqSaveSpinLock::new(()), IrqSaveSpinLock::new(()),
+    IrqSaveSpinLock::new(()), IrqSaveSpinLock::new(()),
+    IrqSaveSpinLock::new(()),
+];
 
 impl KmemCache {
     const fn new_const(obj_size: usize, slab_order: u8, objs_per_slab: u16) -> Self {
@@ -105,10 +111,10 @@ impl KmemCache {
         }
     }
 
-    unsafe fn alloc(&mut self) -> *mut u8 {
+    unsafe fn alloc(&mut self, cache_idx: usize) -> *mut u8 {
         // Fast path: try partial first.
         {
-            let _g = HEAP_LOCK.lock();
+            let _g = CACHE_LOCKS[cache_idx].lock();
             if !self.partial.is_null() {
                 let slab = self.partial;
                 let obj = (*slab).alloc_obj();
@@ -156,7 +162,7 @@ impl KmemCache {
         let num_pages = 1usize << self.slab_order;
         let virt_base = virt::HIGHER_HALF + phys_addr;
         virt::map_contiguous(
-            virt::pml4_address(),
+            virt::kernel_pml4(),
             virt_base,
             phys_addr,
             num_pages as u64,
@@ -165,12 +171,11 @@ impl KmemCache {
         let slab = Slab::init(virt_base as *mut u8, self.slab_order, self.obj_size);
         let obj = (*slab).alloc_obj();
         let is_full = (*slab).is_full();
-        let _g = HEAP_LOCK.lock();
+        let _g = CACHE_LOCKS[cache_idx].lock();
         // Double-check: another thread may have added a slab while we
-        // were allocating. If so, free our redundant slab and use the
-        // existing one.
+        // were allocating. So if used, and free our
+        // redundant pages after dropping the cache lock (avoid heap→phys lock order).
         if !self.partial.is_null() {
-            phys::free_pages(phys_addr, num_pages as u64);
             let existing = self.partial;
             let real_obj = (*existing).alloc_obj();
             let was_full = (*existing).is_full();
@@ -178,10 +183,14 @@ impl KmemCache {
                 Self::remove_partial_ptr(self, existing);
                 Self::push_full_ptr(self, existing);
             }
+            drop(_g);
+            for p in 0..num_pages {
+                virt::unmap(virt_base + (p as u64) * phys::PAGE_SIZE);
+            }
+            phys::free_pages(phys_addr, num_pages as u64);
             return real_obj;
         }
         if !self.free.is_null() {
-            phys::free_pages(phys_addr, num_pages as u64);
             let existing = self.free;
             self.free = (*existing).next;
             if !self.free.is_null() {
@@ -196,6 +205,11 @@ impl KmemCache {
             } else {
                 Self::push_partial_ptr(self, existing);
             }
+            drop(_g);
+            for p in 0..num_pages {
+                virt::unmap(virt_base + (p as u64) * phys::PAGE_SIZE);
+            }
+            phys::free_pages(phys_addr, num_pages as u64);
             return real_obj;
         }
         if is_full {
@@ -206,8 +220,8 @@ impl KmemCache {
         obj
     }
 
-    unsafe fn free(&mut self, obj: *mut u8) {
-        let _g = HEAP_LOCK.lock();
+    unsafe fn free(&mut self, obj: *mut u8, cache_idx: usize) {
+        let _g = CACHE_LOCKS[cache_idx].lock();
 
         // Find slab via raw pointer to avoid borrow conflicts
         let slab_ptr = self.find_slab_ptr(obj);
@@ -225,10 +239,20 @@ impl KmemCache {
             Self::push_partial_ptr(self, slab_ptr);
         }
         if now_empty {
-            // All freed: move to free list
-            // Check partial list first, then full
             Self::remove_from_any_list(self, slab_ptr);
-            Self::push_free_ptr(self, slab_ptr);
+            // Reclaim: return empty slab pages to the physical allocator
+            let slab_base = (*slab_ptr).slab_base as u64;
+            let order = (*slab_ptr).order;
+            let num_pages = 1usize << order;
+            let phys_addr = slab_base - virt::HIGHER_HALF;
+            // Pass the virtual address to virt::unmap (Bug 5 fix:
+            // previously passed phys_addr = slab_base - HIGHER_HALF,
+            // which is a physical address — virt::unmap expects a
+            // virtual address).
+            for p in 0..num_pages {
+                virt::unmap(slab_base + (p as u64) * phys::PAGE_SIZE);
+            }
+            phys::free_pages(phys_addr, num_pages as u64);
         }
     }
 
@@ -382,16 +406,15 @@ impl CacheAllocator {
     }
 
     unsafe fn init(&mut self) {
-        if self.initialized.load(Ordering::SeqCst) {
+        if self.initialized.load(Ordering::Acquire) {
             return;
         }
-        // Recalculate params for each cache based on actual obj_size
         let sizes = [32usize, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
         for (i, &size) in sizes.iter().enumerate() {
             let (order, objs) = cache_params(size);
             self.caches[i] = KmemCache::new_const(size, order, objs);
         }
-        self.initialized.store(true, Ordering::SeqCst);
+        self.initialized.store(true, Ordering::Release);
     }
 
     fn cache_index(size: usize) -> Option<usize> {
@@ -410,9 +433,43 @@ impl CacheAllocator {
     }
 
     unsafe fn kmalloc(&mut self, size: usize) -> *mut u8 {
+        self.kmalloc_aligned(size, 1)
+    }
+
+    /// Allocate with a minimum alignment.  For alignments that exceed the
+    /// slab allocator's natural alignment (≤16), fall through to direct
+    /// page allocation which provides 4 KB alignment.
+    unsafe fn kmalloc_aligned(&mut self, size: usize, align: usize) -> *mut u8 {
+        // Slab caches only guarantee object-size alignment (≤ 16 B for 32 B objs).
+        // Larger alignments require direct page allocation (4 KB aligned).
+        if align > 16 {
+            let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
+            let order = {
+                let mut o = 0usize;
+                while (1usize << o) < pages { o += 1; }
+                if o > 10 { return ptr::null_mut(); }
+                o
+            };
+            let Some(phys_addr) = phys::alloc_order(order) else {
+                return ptr::null_mut();
+            };
+            let virt_base = virt::HIGHER_HALF + phys_addr;
+            // Use kernel_pml4() for kernel heap mappings (Bug 7 fix:
+            // pml4_address() reads CR3, which may be a per-process PML4
+            // when called from a non-scheduler context, making the mapping
+            // invisible under the kernel PML4).
+            virt::map_contiguous(
+                virt::kernel_pml4(),
+                virt_base,
+                phys_addr,
+                pages as u64,
+                virt::DATA,
+            );
+            return virt_base as *mut u8;
+        }
         let idx = Self::cache_index(size);
         match idx {
-            Some(i) => self.caches[i].alloc(),
+            Some(i) => self.caches[i].alloc(i),
             None => {
                 // For very large allocations, allocate pages directly
                 let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
@@ -428,7 +485,7 @@ impl CacheAllocator {
                 // Map into higher-half (see comment in KmemCache::alloc).
                 let virt_base = virt::HIGHER_HALF + phys_addr;
                 virt::map_contiguous(
-                    virt::pml4_address(),
+                    virt::kernel_pml4(),
                     virt_base,
                     phys_addr,
                     pages as u64,
@@ -442,13 +499,17 @@ impl CacheAllocator {
     unsafe fn kfree(&mut self, ptr: *mut u8, size: usize) {
         let idx = Self::cache_index(size);
         match idx {
-            Some(i) => self.caches[i].free(ptr),
+            Some(i) => self.caches[i].free(ptr, i),
             None => {
-                let _g = HEAP_LOCK.lock();
                 let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
+                let virt_base = ptr as u64;
                 for i in 0..pages {
-                    let phys_addr = (ptr as u64) - virt::HIGHER_HALF
-                        + (i as u64) * phys::PAGE_SIZE;
+                    let addr = virt_base + (i as u64) * phys::PAGE_SIZE;
+                    let phys_addr = addr - virt::HIGHER_HALF;
+                    // Unmap the virtual mapping before freeing the physical
+                    // page (Bug 6 fix: previously only freed physical pages,
+                    // leaving stale PTEs pointing to now-free memory).
+                    virt::unmap(addr);
                     phys::free_page(phys_addr);
                 }
             }
@@ -456,11 +517,14 @@ impl CacheAllocator {
     }
 }
 
+unsafe impl Send for CacheAllocator {}
+unsafe impl Sync for CacheAllocator {}
+
 fn allocator_ptr() -> *mut CacheAllocator {
-    &raw mut ALLOCATOR
+    ALLOCATOR.get()
 }
 
-static mut ALLOCATOR: CacheAllocator = CacheAllocator::new();
+static ALLOCATOR: SyncUnsafeCell<CacheAllocator> = SyncUnsafeCell::new(CacheAllocator::new());
 
 pub fn init() {
     unsafe {
@@ -474,16 +538,22 @@ pub struct GlobalAllocator;
 unsafe impl GlobalAlloc for GlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let a = allocator_ptr();
-        if !(*a).initialized.load(Ordering::SeqCst) {
+        if !(*a).initialized.load(Ordering::Acquire) {
             return ptr::null_mut();
         }
-        unsafe { (*a).kmalloc(layout.size()) }
+        // Pass alignment alongside size so the slab allocator can
+        // guarantee the returned pointer satisfies the requested alignment.
+        unsafe { (*a).kmalloc_aligned(layout.size(), layout.align()) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let a = allocator_ptr();
-        if (*a).initialized.load(Ordering::SeqCst) {
-            unsafe { (*a).kfree(ptr, layout.size()) };
+        if ptr.is_null() {
+            return;
         }
+        let a = allocator_ptr();
+        if !(*a).initialized.load(Ordering::Acquire) {
+            return;
+        }
+        unsafe { (*a).kfree(ptr, layout.size()) };
     }
 }

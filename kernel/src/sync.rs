@@ -7,10 +7,6 @@
 //!   critical section and restores them on drop. This is required for SMP:
 //!   a plain `cli` does *not* prevent an IPI from delivering to the same CPU.
 //!
-//! - **`without_interrupts(f)`** — RAII helper that disables interrupts for
-//!   the body and restores on return. Use for short critical sections that
-//!   don't need a mutex (e.g. read-modify-write of a single atomic).
-//!
 //! - **Lock order** (lower levels acquired first):
 //!   `phys → heap → vma → virt → task → cap`
 //!   Violating this order can deadlock under load. The order is enforced by
@@ -28,18 +24,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 ///
 /// On `lock()`: save rflags, `cli`, CAS-spin until acquired, return guard.
 /// On `drop()`: store false, restore IF if it was set on entry.
+#[repr(C, align(8))]
 pub struct IrqSaveSpinLock<T> {
     state: UnsafeCell<LockedState<T>>,
 }
 
+#[repr(C, align(8))]
 struct LockedState<T> {
     locked: AtomicBool,
     value: T,
 }
 
-// SAFETY: The lock serialises access; the only shared state is the AtomicBool
-// used for mutual exclusion. T must itself be `Send` to be moved across
-// threads; the lock doesn't introduce new aliases.
 unsafe impl<T: Send> Send for IrqSaveSpinLock<T> {}
 unsafe impl<T: Send> Sync for IrqSaveSpinLock<T> {}
 
@@ -54,7 +49,6 @@ impl<T> IrqSaveSpinLock<T> {
     }
 
     /// Acquire the lock, disabling interrupts on this CPU for the duration.
-    /// Returns a guard that releases the lock and restores rflags on drop.
     pub fn lock(&self) -> IrqSaveGuard<'_, T> {
         let rflags = save_and_disable_interrupts();
         let state = unsafe { &*self.state.get() };
@@ -71,7 +65,7 @@ impl<T> IrqSaveSpinLock<T> {
         }
     }
 
-    /// Try to acquire the lock once. Returns None if contended.
+    /// Try to acquire the lock. Returns None if already held.
     pub fn try_lock(&self) -> Option<IrqSaveGuard<'_, T>> {
         let rflags = save_and_disable_interrupts();
         let state = unsafe { &*self.state.get() };
@@ -80,14 +74,22 @@ impl<T> IrqSaveSpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            Some(IrqSaveGuard {
-                lock: self,
-                rflags,
-            })
+            Some(IrqSaveGuard { lock: self, rflags })
         } else {
             restore_interrupts(rflags);
             None
         }
+    }
+
+    /// Unsafe direct access to the inner value without locking.
+    /// Caller must guarantee exclusive access via external synchronization.
+    ///
+    /// # Safety
+    /// - Caller must ensure no other code accesses the inner value concurrently.
+    /// - Must not be called concurrently with `lock()` or other `unsafe_get()` calls.
+    /// - Must not re-enter: calling `lock()` while a lock is already held deadlocks.
+    pub unsafe fn unsafe_get(&self) -> &mut T {
+        &mut (*self.state.get()).value
     }
 }
 
@@ -100,22 +102,18 @@ pub struct IrqSaveGuard<'a, T> {
 impl<'a, T> Deref for IrqSaveGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: the lock invariant guarantees exclusive access.
         unsafe { &(*self.lock.state.get()).value }
     }
 }
 
 impl<'a, T> DerefMut for IrqSaveGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: the lock invariant guarantees exclusive access.
         unsafe { &mut (*self.lock.state.get()).value }
     }
 }
 
 impl<'a, T> Drop for IrqSaveGuard<'a, T> {
     fn drop(&mut self) {
-        // Release the lock *before* restoring rflags, so other CPUs can take
-        // the lock while we re-enable interrupts.
         unsafe {
             (*self.lock.state.get())
                 .locked
@@ -125,12 +123,27 @@ impl<'a, T> Drop for IrqSaveGuard<'a, T> {
     }
 }
 
-/// Backwards-compatible alias of the old simple lock. Most existing call
-/// sites will be migrated to `IrqSaveSpinLock<T>`; the alias remains for
-/// the rare case where a no-data lock is needed (e.g. a flag).
 pub type SpinLockIrq = IrqSaveSpinLock<()>;
 
-// ---- Inline helpers ----
+/// A `Sync`-safe wrapper around `UnsafeCell` for use in `static` items.
+/// This is appropriate when the inner value is only accessed from a single
+/// CPU at a time (e.g., per-CPU data) or when external synchronization
+/// (e.g., an outer lock) prevents concurrent access.
+#[repr(transparent)]
+pub struct SyncUnsafeCell<T>(UnsafeCell<T>);
+
+unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
+unsafe impl<T: Send> Send for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    pub const fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+
+    pub fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
 
 #[inline]
 fn save_and_disable_interrupts() -> u64 {
@@ -141,7 +154,7 @@ fn save_and_disable_interrupts() -> u64 {
             "pop {rflags}",
             "cli",
             rflags = out(reg) rflags,
-            options(nomem, preserves_flags),
+            options(preserves_flags),
         );
     }
     rflags
@@ -149,25 +162,10 @@ fn save_and_disable_interrupts() -> u64 {
 
 #[inline]
 fn restore_interrupts(rflags: u64) {
-    unsafe {
-        if rflags & 0x200 != 0 {
-            core::arch::asm!("sti", options(nomem, preserves_flags));
-        } else {
-            core::arch::asm!("push {rflags}; popfq", rflags = in(reg) rflags, options(nomem, preserves_flags));
-        }
+    use x86_64::instructions::interrupts;
+    if rflags & 0x200 != 0 {
+        interrupts::enable();
+    } else {
+        unsafe { x86_64::registers::rflags::write(x86_64::registers::rflags::RFlags::from_bits_truncate(rflags)); }
     }
-}
-
-/// Run `f` with interrupts disabled on this CPU. Restores the previous
-/// state on return. Use for short critical sections that don't need a
-/// mutex.
-#[inline]
-pub fn without_interrupts<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let rflags = save_and_disable_interrupts();
-    let result = f();
-    restore_interrupts(rflags);
-    result
 }

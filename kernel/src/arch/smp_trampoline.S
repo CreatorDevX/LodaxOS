@@ -1,21 +1,25 @@
 ; SIPI trampoline — real-mode → 64-bit long mode AP startup.
-; Parallel-boot version: each AP reads its APIC ID via CPUID and uses it
-; to index a per-AP mailbox slot.  All mailboxes are pre-written by the
-; BSP before any IPIs are sent.
+; Parallel-boot version: each AP looks up its mailbox slot via a
+; pre-populated mapping table written by the BSP.  All mailboxes are
+; written before any IPIs are sent.
 ;
-; Assembled with NASM to a flat binary, placed at TRAMP_BASE (0x8000).
+; Assembled with NASM to a flat binary, placed at TRAMP_BASE (must match
+; `consts::TRAMPOLINE_PHYS` in kernel).
+; Slot map table at TRAMP_BASE + 0x300 (256 bytes, one u8 per APIC ID).
 ; Mailbox slots start at TRAMP_BASE + 0x400, each 0x80 bytes.
 ; After the trampoline finishes it writes status=1 to its slot and
 ; jumps to ap_entry.
 ;
 ; SIPI sets CS.base = SIPI_VECTOR * 0x1000 = TRAMP_BASE.
 
-; Constants (must match smp.rs):
+; Constants (must match consts.rs and smp.rs):
 TRAMP_BASE       equ 0x8000
+SLOT_MAP_OFF     equ 0x300
+SLOT_MAP         equ TRAMP_BASE + SLOT_MAP_OFF
 MAILBOX_OFF      equ 0x400
 MAILBOX_BASE     equ TRAMP_BASE + MAILBOX_OFF
 MAILBOX_SLOT_SIZE equ 0x80
-MAX_CPUS_MASK    equ 3      ; (MAX_CPUS - 1)  where MAX_CPUS = 4
+MAX_CPUS_MASK    equ 3      ; (MAX_CPUS - 1) where MAX_CPUS = 4
 
 ; Mailbox field offsets (must match smp.rs):
 MB_STACK     equ 0x40   ; u64
@@ -56,16 +60,31 @@ pm_entry:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov esp, TRAMP_BASE - 16         ; temp stack (same loc, 32-bit mode)
 
-    ; Get APIC ID → mailbox slot offset in ESI (preserved through
-    ; mode transitions into 64-bit long mode).
+    ; Get APIC ID → mailbox slot offset (via pre-populated mapping table).
+    ; The BSP writes one byte per APIC ID at SLOT_MAP before sending IPIs.
+    ; Falls back to (apic_id & MAX_CPUS_MASK) if the entry is 0xFF.
     mov eax, 1
     cpuid
     shr ebx, 24                      ; EBX[31:24] = initial APIC ID
-    and ebx, MAX_CPUS_MASK           ; slot = apic_id & (MAX_CPUS - 1)
-    imul ebx, ebx, MAILBOX_SLOT_SIZE ; slot_offset = slot * 0x80
-    mov esi, ebx                     ; ESI = slot_offset
+    xor ecx, ecx
+    mov cl, [SLOT_MAP + ebx]         ; cl = slot_map[apic_id]
+    cmp cl, 0xFF
+    jne .got_slot
+    and ebx, MAX_CPUS_MASK           ; fallback: apic_id & (MAX_CPUS - 1)
+    mov cl, bl
+.got_slot:
+    ; ecx = per-CPU slot number (0-3).
+    ; Give each AP its own temp stack so concurrent SIPI trampolines
+    ; don't corrupt each other's lgdt/lidt data on the shared stack.
+    ; Stack layout: TRAMP_BASE - 16 - (slot * 256), 256 bytes each.
+    mov eax, ecx
+    shl eax, 8                       ; eax = slot * 256
+    mov esp, TRAMP_BASE - 16
+    sub esp, eax                     ; per-AP temp stack
+
+    imul ecx, ecx, MAILBOX_SLOT_SIZE ; slot_offset = slot * 0x80
+    mov esi, ecx                     ; ESI = slot_offset
 
     ; Enable PAE
     mov eax, cr4

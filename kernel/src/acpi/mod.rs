@@ -87,6 +87,7 @@ fn check_rsdp_at(addr: u64) -> Option<u64> {
 /// a hint. This scan is the fallback when no hint is provided.
 pub fn find_rsdp() -> Option<u64> {
     // 1. EBDA
+    // Read via identity-mapped low memory (PML4[0] covers 0..4GB).
     unsafe {
         let ebda_seg = *(0x40E as *const u16) as u64;
         if ebda_seg != 0 {

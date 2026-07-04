@@ -1,0 +1,23 @@
+[package]
+name = "lodaxos-drivers"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "framebuffer"
+path = "src/bin/framebuffer.rs"
+
+[[bin]]
+name = "ahci"
+path = "src/bin/ahci.rs"
+
+[[bin]]
+name = "ext4"
+path = "src/bin/ext4.rs"
+
+[[bin]]
+name = "ide"
+path = "src/bin/ide.rs"
+
+[dependencies]
+x86_64 = "0.14"

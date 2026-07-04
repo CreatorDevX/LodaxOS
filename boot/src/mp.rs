@@ -26,16 +26,17 @@ pub fn enumerate_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
     );
 
     if count.enabled > MAX_CPUS {
-        log::warn!(
-            "MP Services: {} enabled CPUs exceeds MAX_CPUS={}, only first {} will be recorded",
+        log::error!(
+            "MP Services: {} enabled CPUs exceeds MAX_CPUS={}, clamping to {}",
             count.enabled, MAX_CPUS, MAX_CPUS
         );
     }
     let to_record = count.enabled.min(MAX_CPUS);
+    let ap_slots = MAX_CPUS - 1; // one slot reserved for BSP if needed
 
     let mut ap_index = 0usize;
     for proc_num in 0..count.total {
-        if ap_index >= to_record {
+        if ap_index >= to_record.min(ap_slots) {
             break;
         }
         let info = mp.get_processor_info(proc_num)?;
@@ -48,8 +49,8 @@ pub fn enumerate_aps(boot_info: &mut BootInfo) -> uefi::Result<()> {
             log::debug!("MP Services: BSP lapic_id={}", info.processor_id);
             continue;
         }
-        if ap_index >= MAX_CPUS - 1 {
-            log::warn!("MP Services: ran out of AP slots");
+        if ap_index >= ap_slots {
+            log::error!("MP Services: ran out of AP slots (max {} APs)", ap_slots);
             break;
         }
 

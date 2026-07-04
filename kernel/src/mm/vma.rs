@@ -1,3 +1,6 @@
+extern crate alloc;
+use alloc::boxed::Box;
+
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,12 +50,15 @@ struct RadixNode {
 
 impl RadixNode {
     fn new_zeroed() -> *mut Self {
-        // RadixNode has 1024 entries × 8 bytes = 8 KB
         let page = phys::alloc_order(1).expect("radix tree: OOM");
         unsafe {
             ptr::write_bytes(page as *mut u8, 0, 2 * phys::PAGE_SIZE as usize);
         }
         page as *mut RadixNode
+    }
+
+    unsafe fn free_node(node: *mut Self) {
+        phys::free_order(node as u64, 1);
     }
 }
 
@@ -112,7 +118,9 @@ impl VmaTree {
     }
 
     /// Look up a VMA by virtual address. Returns the VMA if found at the exact address.
-    pub fn lookup(&self, addr: u64) -> Option<&mut Vma> {
+    /// Takes `&mut self` to enforce exclusive access (interior mutability is used via the
+    /// `IrqSaveSpinLock` that guards the tree).
+    pub fn lookup(&mut self, addr: u64) -> Option<&mut Vma> {
         if self.root.is_null() {
             return None;
         }
@@ -121,7 +129,7 @@ impl VmaTree {
         for level in (1..RADIX_LEVELS).rev() {
             let idx = radix_index(addr, level);
             unsafe {
-                let entry = &(*node).entries[idx];
+                let entry = &mut (*node).entries[idx];
                 if entry.child.is_null() {
                     return None;
                 }
@@ -142,7 +150,8 @@ impl VmaTree {
 
     /// Find the VMA that covers `addr` (addr ∈ [vma.start, vma.end)).
     /// Uses linear search since VMAs are typically few.
-    pub fn find_covering(&self, addr: u64) -> Option<&mut Vma> {
+    /// Takes `&mut self` to enforce exclusive access.
+    pub fn find_covering(&mut self, addr: u64) -> Option<&mut Vma> {
         if self.root.is_null() {
             return None;
         }
@@ -156,19 +165,26 @@ impl VmaTree {
         result.map(|p| unsafe { &mut *p })
     }
 
-    /// Remove the VMA at the given start address.
-    pub fn remove(&mut self, start: u64) -> Option<*mut Vma> {
+    /// Remove the VMA at the given start address and free its memory.
+    /// Also frees intermediate radix tree nodes that become empty.
+    pub fn remove(&mut self, start: u64) -> bool {
         if self.root.is_null() {
-            return None;
+            return false;
         }
+
+        // Track path for cleanup
+        let mut path_nodes: [*mut RadixNode; RADIX_LEVELS] = [ptr::null_mut(); RADIX_LEVELS];
+        let mut path_indices: [usize; RADIX_LEVELS] = [0; RADIX_LEVELS];
 
         let mut node = self.root;
         for level in (1..RADIX_LEVELS).rev() {
             let idx = radix_index(start, level);
+            path_nodes[level] = node;
+            path_indices[level] = idx;
             unsafe {
                 let entry = &mut (*node).entries[idx];
                 if entry.child.is_null() {
-                    return None;
+                    return false;
                 }
                 node = entry.child;
             }
@@ -179,15 +195,46 @@ impl VmaTree {
             let vma_ptr = (*node).entries[leaf_idx].vma;
             (*node).entries[leaf_idx].vma = ptr::null_mut();
             if vma_ptr.is_null() {
-                None
-            } else {
-                Some(vma_ptr)
+                return false;
             }
+            drop(Box::from_raw(vma_ptr));
+
+            // Check if leaf node is now empty and free it upward
+            let mut cur_node = node;
+            for level in 0..RADIX_LEVELS {
+                let mut has_entries = false;
+                for i in 0..RADIX_SIZE {
+                    if level == 0 {
+                        if !(*cur_node).entries[i].vma.is_null() {
+                            has_entries = true;
+                            break;
+                        }
+                    } else {
+                        if !(*cur_node).entries[i].child.is_null() {
+                            has_entries = true;
+                            break;
+                        }
+                    }
+                }
+                if !has_entries {
+                    RadixNode::free_node(cur_node);
+                    if level + 1 < RADIX_LEVELS {
+                        let parent = path_nodes[level + 1];
+                        let pidx = path_indices[level + 1];
+                        (*parent).entries[pidx].child = ptr::null_mut();
+                        cur_node = parent;
+                    } else {
+                        self.root = ptr::null_mut();
+                    }
+                } else {
+                    break;
+                }
+            }
+            true
         }
     }
 
-    /// Visit all VMAs in the tree.
-    pub fn visit_all<F, R>(&self, mut f: F) -> Option<R>
+    pub fn visit_all<F, R>(&mut self, mut f: F) -> Option<R>
     where
         F: FnMut(&mut Vma) -> Option<R>,
     {
@@ -198,7 +245,7 @@ impl VmaTree {
     }
 
     unsafe fn visit_node<F, R>(
-        &self,
+        &mut self,
         node: *mut RadixNode,
         level: usize,
         f: &mut F,
@@ -252,18 +299,24 @@ impl ProcessMemory {
             perm,
             flags: 0,
         };
-        let boxed = unsafe {
-            let ptr = phys::alloc_page().unwrap() as *mut Vma;
-            ptr::write(ptr, vma);
-            &mut *ptr
-        };
-        self.vma_tree.insert(boxed);
-        boxed
+        let boxed = Box::into_raw(Box::new(vma));
+        unsafe {
+            self.vma_tree.insert(&mut *boxed);
+            &mut *boxed
+        }
     }
 
     /// Handle a page fault. Returns true if the fault was handled (page mapped).
     pub fn handle_page_fault(&mut self, fault_addr: u64, write: bool) -> bool {
-        let vma = match self.vma_tree.find_covering(fault_addr) {
+        if write {
+        if let Some(pte) = super::virt::read_pte(self.pml4_phys, fault_addr) {
+            if pte & super::virt::COW != 0 {
+                return self.handle_cow_fault(fault_addr);
+            }
+        }
+    }
+
+    let vma = match self.vma_tree.find_covering(fault_addr) {
             Some(v) => v,
             None => return false,
         };
@@ -284,12 +337,43 @@ impl ProcessMemory {
             phys_page,
             super::virt::DATA,
         );
-        unsafe {
-            core::arch::asm!("invlpg [{}]", in(reg) page_addr);
-        }
+        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
 
         true
     }
+
+    fn handle_cow_fault(&mut self, fault_addr: u64) -> bool {
+        let page_addr = fault_addr & !0xFFF;
+        let old_pte = match super::virt::read_pte(self.pml4_phys, page_addr) {
+            Some(p) => p,
+            None => return false,
+        };
+        resolve_cow(self.pml4_phys, page_addr, old_pte)
+    }
+}
+
+/// Shared COW resolution: allocates a new page, copies content from the
+/// old physical page, and maps it writable in the given PML4.
+/// Returns true on success.
+fn resolve_cow(pml4_phys: u64, page_addr: u64, old_pte: u64) -> bool {
+    let old_phys = old_pte & 0x000F_FFFF_FFFF_F000;
+    let new_phys = match phys::alloc_page() {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            old_phys as *const u8,
+            new_phys as *mut u8,
+            phys::PAGE_SIZE as usize,
+        );
+    }
+    let new_pte = new_phys | ((old_pte & 0xFFF) & !super::virt::COW) | super::virt::WRITABLE;
+    super::virt::write_pte(pml4_phys, page_addr, new_pte);
+    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
+    // Note: the old physical page is NOT freed here — it may still be
+    // mapped in the parent process's PML4 (with COW+RO).
+    true
 }
 
 // ---- Global kernel VMA tree for demand paging ----
@@ -322,11 +406,7 @@ pub fn init_kernel_vmas() {
         perm: VmaPerm::ReadWrite,
         flags: 0,
     };
-    let ptr = unsafe {
-        let p = phys::alloc_page().unwrap() as *mut Vma;
-        ptr::write(p, vma);
-        p
-    };
+    let ptr = Box::into_raw(Box::new(vma));
     with_kernel_vma_tree(|tree| {
         tree.insert(unsafe { &mut *ptr });
     });
@@ -336,35 +416,31 @@ pub fn init_kernel_vmas() {
 }
 
 pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
-    use lodaxos_system::{CapOp, Caps};
-    use crate::cap;
-
-    let _is_write = error_code & (1 << 1) != 0;
+    let is_write = error_code & (1 << 1) != 0;
     let is_user = error_code & (1 << 2) != 0;
     let is_present = error_code & 1 != 0;
 
+    if is_present && is_write {
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+        if let Some(pte) = super::virt::read_pte(cr3 & !0xFFF, fault_addr) {
+            if pte & super::virt::COW != 0 {
+                let page_addr = fault_addr & !0xFFF;
+                return resolve_cow(cr3 & !0xFFF, page_addr, pte);
+            }
+        }
+        return false;
+    }
+
     if is_present {
-        // Protection violation (page exists but wrong permissions)
         return false;
     }
 
     if is_user {
-        // User-mode fault — would need per-process VMA tree
-        // For now, reject (will be handled later with capability system)
         return false;
     }
 
-    // Kernel-mode fault — check kernel VMA tree
-    if let Err(e) = cap::check_and_authorize(
-        cap::current_subject(),
-        if fault_addr >= 0xFFFF_8000_0000_0000 { Caps::CAP_MM_MAP_KERNEL } else { Caps::CAP_MM_MAP },
-        CapOp::MmMap { vaddr: fault_addr, paddr: 0, flags: 0, kernel_half: fault_addr >= 0xFFFF_8000_0000_0000 },
-    ) {
-        log::warn!("vma::handle_page_fault: cap denied: {:?}", e);
-        return false;
-    }
-
-    // Check the kernel VMA tree under the lock.
+    // Kernel-mode fault — check kernel VMA tree.
     let found = with_kernel_vma_tree(|tree| {
         tree.find_covering(fault_addr).is_some()
     });
@@ -375,11 +451,8 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
             Some(p) => p,
             None => return false,
         };
-        // Zero the freshly-allocated page so the kernel never sees
-        // stale (and possibly sensitive) physical-memory contents through
-        // a new VMA mapping.
         unsafe {
-            core::ptr::write_bytes(phys_page as *mut u8, 0, phys::PAGE_SIZE as usize);
+            core::ptr::write_bytes((super::virt::HIGHER_HALF + phys_page) as *mut u8, 0, phys::PAGE_SIZE as usize);
             let cr3: u64;
             core::arch::asm!("mov {}, cr3", out(reg) cr3);
             super::virt::map_page_explicit(

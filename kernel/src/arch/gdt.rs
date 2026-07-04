@@ -1,10 +1,18 @@
 #![allow(dead_code)]
 
-use core::arch::asm;
+use x86_64::instructions::port::Port;
 use lodaxos_system::MAX_CPUS;
+use crate::sync::SyncUnsafeCell;
 
 /// TSS (Task State Segment) — 104 bytes on x86-64.
-#[repr(C)]
+///
+/// IMPORTANT: This struct uses `repr(C, packed)` to match the exact Intel TSS
+/// layout. `repr(C)` would insert 4 bytes of padding after `reserved0` (u32)
+/// to align `rsp0` (u64), shifting ALL fields by 4 bytes. The CPU interprets
+/// the TSS using the Intel format (no padding), so the `ist2` field (used by
+/// the timer interrupt's IST2 stack switch) would be read from the wrong
+/// memory offset, producing a non-canonical stack pointer → #SS(0).
+#[repr(C, packed)]
 struct Tss {
     reserved0: u32,
     rsp0: u64,
@@ -18,9 +26,11 @@ struct Tss {
     ist5: u64,
     ist6: u64,
     ist7: u64,
-    reserved2: u64,
+    reserved2: u32,
     reserved3: u16,
     iomap_base: u16,
+    /// Padding to 104 bytes — Intel requires TSS limit >= 67h (103).
+    _padding: [u8; 4],
 }
 
 impl Tss {
@@ -40,7 +50,8 @@ impl Tss {
             ist7: 0,
             reserved2: 0,
             reserved3: 0,
-            iomap_base: core::mem::size_of::<Tss>() as u16,
+            iomap_base: 0,
+            _padding: [0; 4],
         }
     }
 }
@@ -138,23 +149,33 @@ const TSS_SEL: u16 = 0x28;
 /// AP would try to switch to a stack whose "top" pointer is unrelated
 /// to the AP's current stack, producing a #GP on the very first
 /// instruction of the #DF handler.  Per-CPU IST1 stacks fix this.
+///
+/// IST2 is used for regular hardware interrupts (IRQs, IPI, syscall).
+/// Keeping interrupts on a separate stack prevents deep interrupt
+/// nesting from overflowing the task kernel stack.
 #[repr(C, align(16))]
 pub struct AlignedIstStack(pub [u8; 16384]);
 
-static mut IST1_STACKS: [AlignedIstStack; MAX_CPUS] = [const { AlignedIstStack([0; 16384]) }; MAX_CPUS];
+static IST1_STACKS: SyncUnsafeCell<[AlignedIstStack; MAX_CPUS]> = SyncUnsafeCell::new([const { AlignedIstStack([0; 16384]) }; MAX_CPUS]);
+
+/// Per-CPU IST2 stack (16 KiB) for regular interrupt handlers.
+static IST2_STACKS: SyncUnsafeCell<[AlignedIstStack; MAX_CPUS]> = SyncUnsafeCell::new([const { AlignedIstStack([0; 16384]) }; MAX_CPUS]);
+
+/// Per-CPU IST3 stack (16 KiB) for NMI handler (Bug 33).
+static IST3_STACKS: SyncUnsafeCell<[AlignedIstStack; MAX_CPUS]> = SyncUnsafeCell::new([const { AlignedIstStack([0; 16384]) }; MAX_CPUS]);
 
 /// Per-CPU dummy kernel stack used as the initial TSS.rsp0.  The
 /// scheduler overwrites TSS.rsp0 on every context switch.
 #[repr(C, align(16))]
 struct AlignedStack([u8; 4096]);
 
-static mut DUMMY_STACKS: [AlignedStack; MAX_CPUS] = [const { AlignedStack([0; 4096]) }; MAX_CPUS];
+static DUMMY_STACKS: SyncUnsafeCell<[AlignedStack; MAX_CPUS]> = SyncUnsafeCell::new([const { AlignedStack([0; 4096]) }; MAX_CPUS]);
 
 /// Per-CPU TSS instance. Indexed by LAPIC ID slot.
-static mut TSS_TABLE: [Tss; MAX_CPUS] = [const { Tss::empty() }; MAX_CPUS];
+static TSS_TABLE: SyncUnsafeCell<[Tss; MAX_CPUS]> = SyncUnsafeCell::new([const { Tss::empty() }; MAX_CPUS]);
 
 /// Per-CPU GDT instance.
-static mut GDT_TABLE: [Gdt; MAX_CPUS] = [const {
+static GDT_TABLE: SyncUnsafeCell<[Gdt; MAX_CPUS]> = SyncUnsafeCell::new([const {
     Gdt {
         null: 0,
         kernel_code: make_descriptor(0, 0xFFFFF, access::KERNEL_CODE, granularity::LONG_MODE),
@@ -164,10 +185,10 @@ static mut GDT_TABLE: [Gdt; MAX_CPUS] = [const {
         tss_low: 0,
         tss_high: 0,
     }
-}; MAX_CPUS];
+}; MAX_CPUS]);
 
 /// Per-CPU GDT pointer (loaded by `lgdt`).
-static mut GDT_PTR_TABLE: [GdtPtr; MAX_CPUS] = [const { GdtPtr { limit: 0, base: 0 } }; MAX_CPUS];
+static GDT_PTR_TABLE: SyncUnsafeCell<[GdtPtr; MAX_CPUS]> = SyncUnsafeCell::new([const { GdtPtr { limit: 0, base: 0 } }; MAX_CPUS]);
 
 /// Return the higher-half virtual address of the GDT pointer for `slot`.
 /// Used by the SMP bring-up code to copy the GDT pointer into the
@@ -176,7 +197,7 @@ static mut GDT_PTR_TABLE: [GdtPtr; MAX_CPUS] = [const { GdtPtr { limit: 0, base:
 /// Note: `smp.rs` now calls `gdt_ptr_limit_base(slot)` directly instead
 /// of copying from this address. This function is kept for compatibility.
 pub fn gdt_pointer_address() -> u64 {
-    unsafe { &raw const GDT_PTR_TABLE[0] as u64 }
+    unsafe { &raw const (*GDT_PTR_TABLE.get())[0] as u64 }
 }
 
 /// Return the higher-half virtual address of the GDT pointer for the
@@ -185,7 +206,7 @@ pub fn gdt_pointer_address() -> u64 {
 /// (and the BSP's IST1 stack) on every AP.
 pub fn gdt_pointer_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
-    unsafe { &raw const GDT_PTR_TABLE[slot] as u64 }
+    unsafe { &raw const (*GDT_PTR_TABLE.get())[slot] as u64 }
 }
 
 /// Return the higher-half virtual address of the GDT table for the
@@ -193,7 +214,7 @@ pub fn gdt_pointer_for_slot(slot: usize) -> u64 {
 /// (clflush) the GDT entries so the AP sees valid data under WHPX.
 pub fn gdt_table_address_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
-    unsafe { &raw const GDT_TABLE[slot] as u64 }
+    unsafe { &raw const (*GDT_TABLE.get())[slot] as u64 }
 }
 
 /// Return the higher-half virtual address of the TSS for the given
@@ -202,21 +223,35 @@ pub fn gdt_table_address_for_slot(slot: usize) -> u64 {
 /// initialised.
 pub fn tss_address_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
-    unsafe { &raw const TSS_TABLE[slot] as u64 }
+    unsafe { &raw const (*TSS_TABLE.get())[slot] as u64 }
 }
 
 /// IST1 stack top for `slot`.  The CPU reads `TSS.ist1` and sets RSP
 /// to this value when a #DF fires on that CPU.
 pub fn ist1_top_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
-    unsafe { &raw const IST1_STACKS[slot].0 as u64 + 16384 }
+    unsafe { crate::mm::virt::HIGHER_HALF + &raw const (*IST1_STACKS.get())[slot].0 as u64 + 16384 }
+}
+
+/// IST2 stack top for `slot`.  Used for regular interrupt handlers
+/// (IRQs, IPI, syscall) so deep interrupt nesting does not overflow
+/// the task kernel stack.
+pub fn ist2_top_for_slot(slot: usize) -> u64 {
+    let slot = slot % MAX_CPUS;
+    unsafe { crate::mm::virt::HIGHER_HALF + &raw const (*IST2_STACKS.get())[slot].0 as u64 + 16384 }
+}
+
+/// IST3 stack top for `slot`.  Dedicated NMI stack (Bug 33).
+pub fn ist3_top_for_slot(slot: usize) -> u64 {
+    let slot = slot % MAX_CPUS;
+    unsafe { crate::mm::virt::HIGHER_HALF + &raw const (*IST3_STACKS.get())[slot].0 as u64 + 16384 }
 }
 
 /// Initial dummy RSP0 for `slot`.  The scheduler replaces this on
 /// the first context switch.
 pub fn dummy_rsp0_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
-    unsafe { &raw const DUMMY_STACKS[slot].0 as u64 + 4096 }
+    unsafe { crate::mm::virt::HIGHER_HALF + &raw const (*DUMMY_STACKS.get())[slot].0 as u64 + 4096 }
 }
 
 /// Write a single byte to COM1 for debug tracing.
@@ -224,21 +259,12 @@ pub fn dummy_rsp0_for_slot(slot: usize) -> u64 {
 unsafe fn com1_trace(ch: u8) -> bool {
     let mut retries = 100_000u32;
     loop {
-        let lsr: u8;
-        core::arch::asm!(
-            "in al, dx",
-            out("al") lsr,
-            in("dx") 0x3FDu16,
-        );
+        let lsr: u8 = Port::<u8>::new(0x3FD).read();
         if lsr & 0x20 != 0 { break; }
         retries = retries.saturating_sub(1);
         if retries == 0 { return false; }
     }
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") 0x3F8u16,
-        in("al") ch,
-    );
+    Port::<u8>::new(0x3F8).write(ch);
     true
 }
 
@@ -266,29 +292,31 @@ pub unsafe fn init_for_slot(slot: usize) {
     com1_trace_str(b"GDT START\r\n");
 
     // Initialise TSS.
-    TSS_TABLE[slot].rsp0 = dummy_rsp0_for_slot(slot);
-    TSS_TABLE[slot].ist1 = ist1_top_for_slot(slot);
+    (*TSS_TABLE.get())[slot].rsp0 = dummy_rsp0_for_slot(slot);
+    (*TSS_TABLE.get())[slot].ist1 = ist1_top_for_slot(slot);
+    (*TSS_TABLE.get())[slot].ist2 = ist2_top_for_slot(slot);
+    (*TSS_TABLE.get())[slot].ist3 = ist3_top_for_slot(slot);
     com1_trace_str(b"GDT STACK\r\n");
 
-    let tss_addr = &raw const TSS_TABLE[slot] as u64;
+    let tss_addr = &raw const (*TSS_TABLE.get())[slot] as u64;
 
     // Verify TSS address is canonical (bits 48–63 all same as bit 47).
     // Non-canonical addresses cause #GP on ltr.
-    let canonical = (tss_addr >> 47) & 1 == 0
-        || (tss_addr >> 47) & 0x1_FFFF == 0x1_FFFF;
+    let ext = tss_addr >> 47;
+    let canonical = ext == 0 || ext == 0x1_FFFF;
     assert!(canonical, "TSS address {:#x} is non-canonical", tss_addr);
 
     let tss_limit = (core::mem::size_of::<Tss>() - 1) as u32;
     let (tss_lo, tss_hi) = make_tss_descriptor(tss_addr, tss_limit);
-    GDT_TABLE[slot].tss_low = tss_lo;
-    GDT_TABLE[slot].tss_high = tss_hi;
+    (*GDT_TABLE.get())[slot].tss_low = tss_lo;
+    (*GDT_TABLE.get())[slot].tss_high = tss_hi;
     com1_trace_str(b"GDT TSS\r\n");
 
-    GDT_PTR_TABLE[slot].limit = (core::mem::size_of::<Gdt>() - 1) as u16;
-    GDT_PTR_TABLE[slot].base = &raw const GDT_TABLE[slot] as u64;
+    (*GDT_PTR_TABLE.get())[slot].limit = (core::mem::size_of::<Gdt>() - 1) as u16;
+    (*GDT_PTR_TABLE.get())[slot].base = &raw const (*GDT_TABLE.get())[slot] as u64;
     com1_trace_str(b"GDT PTR\r\n");
 
-    asm!(
+    core::arch::asm!(
         "cli",
         "lgdt [{gdt_ptr}]",
         // -- far return: reload CS --
@@ -308,7 +336,34 @@ pub unsafe fn init_for_slot(slot: usize) {
         // -- load TSS --
         "mov ax, 0x28",
         "ltr ax",
-        gdt_ptr = in(reg) &raw const GDT_PTR_TABLE[slot],
+        gdt_ptr = in(reg) &raw const (*GDT_PTR_TABLE.get())[slot],
+    );
+
+    init_syscall_msrs();
+}
+
+/// Set up syscall MSRs (IA32_STAR, IA32_LSTAR, IA32_FMASK).
+/// These are per-core MSRs, so every AP must call this after entering
+/// long mode, not just the BSP's `init_for_slot` path.
+pub unsafe fn init_syscall_msrs() {
+    let sycall_entry = crate::arch::idt::syscall_entry as *const () as u64;
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") 0xC0000081u32, // IA32_STAR
+        in("eax") 0u32,
+        in("edx") 0x08u32,
+    );
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") 0xC0000082u32, // IA32_LSTAR
+        in("eax") (sycall_entry as u32),
+        in("edx") ((sycall_entry >> 32) as u32),
+    );
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") 0xC0000084u32, // IA32_FMASK
+        in("eax") 0x200u32,
+        in("edx") 0u32,
     );
 }
 
@@ -329,17 +384,19 @@ pub fn load() {
 pub fn init_tss_descriptor_for_slot(slot: usize) {
     let slot = slot % MAX_CPUS;
     unsafe {
-        TSS_TABLE[slot].rsp0 = dummy_rsp0_for_slot(slot);
-        TSS_TABLE[slot].ist1 = ist1_top_for_slot(slot);
+        (*TSS_TABLE.get())[slot].rsp0 = dummy_rsp0_for_slot(slot);
+        (*TSS_TABLE.get())[slot].ist1 = ist1_top_for_slot(slot);
+        (*TSS_TABLE.get())[slot].ist2 = ist2_top_for_slot(slot);
+        (*TSS_TABLE.get())[slot].ist3 = ist3_top_for_slot(slot);
 
-        let tss_addr = &raw const TSS_TABLE[slot] as u64;
+        let tss_addr = &raw const (*TSS_TABLE.get())[slot] as u64;
         let tss_limit = (core::mem::size_of::<Tss>() - 1) as u32;
         let (tss_lo, tss_hi) = make_tss_descriptor(tss_addr, tss_limit);
-        GDT_TABLE[slot].tss_low = tss_lo;
-        GDT_TABLE[slot].tss_high = tss_hi;
+        (*GDT_TABLE.get())[slot].tss_low = tss_lo;
+        (*GDT_TABLE.get())[slot].tss_high = tss_hi;
 
-        GDT_PTR_TABLE[slot].limit = (core::mem::size_of::<Gdt>() - 1) as u16;
-        GDT_PTR_TABLE[slot].base = &raw const GDT_TABLE[slot] as u64;
+        (*GDT_PTR_TABLE.get())[slot].limit = (core::mem::size_of::<Gdt>() - 1) as u16;
+        (*GDT_PTR_TABLE.get())[slot].base = &raw const (*GDT_TABLE.get())[slot] as u64;
     }
 }
 
@@ -350,7 +407,7 @@ pub fn init_tss_descriptor_for_slot(slot: usize) {
 pub fn set_ist1_for_slot(slot: usize, addr: u64) {
     let slot = slot % MAX_CPUS;
     unsafe {
-        TSS_TABLE[slot].ist1 = addr;
+        (*TSS_TABLE.get())[slot].ist1 = addr;
     }
 }
 
@@ -363,7 +420,7 @@ pub fn set_ist1(addr: u64) {
 /// stack.  Called by the scheduler on every context switch.
 pub unsafe fn tss_set_rsp0_for_slot(slot: usize, rsp0: u64) {
     let slot = slot % MAX_CPUS;
-    TSS_TABLE[slot].rsp0 = rsp0;
+    (*TSS_TABLE.get())[slot].rsp0 = rsp0;
 }
 
 /// Backwards-compat: update the BSP's RSP0.
@@ -377,5 +434,5 @@ pub unsafe fn tss_set_rsp0(rsp0: u64) {
 /// SIPI mailbox.
 pub fn gdt_ptr_limit_base(slot: usize) -> (u16, u64) {
     let slot = slot % MAX_CPUS;
-    unsafe { (GDT_PTR_TABLE[slot].limit, GDT_PTR_TABLE[slot].base) }
+    unsafe { ((*GDT_PTR_TABLE.get())[slot].limit, (*GDT_PTR_TABLE.get())[slot].base) }
 }

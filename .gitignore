@@ -8,3 +8,5 @@ efi/*
 esp/*
 *.pyc
 nasm/*
+nasm.exe
+ndisasm.exe

@@ -1,5 +1,5 @@
 [workspace]
-members = ["system", "chain", "boot", "kernel"]
+members = ["system", "boot", "kernel", "drivers"]
 resolver = "2"
 
 [profile.dev]

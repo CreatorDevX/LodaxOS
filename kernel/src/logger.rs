@@ -1,4 +1,5 @@
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 
@@ -20,6 +21,11 @@ impl<'a> Write for BufWriter<'a> {
     }
 }
 
+/// Set to true once `install_gs_base` has completed on the BSP.
+/// Logger checks this before calling `current_apic_id()` to avoid
+/// reading uninitialized per-CPU state during early boot.
+pub static BSP_PERCPU_READY: AtomicBool = AtomicBool::new(false);
+
 struct SerialLogger;
 
 impl Log for SerialLogger {
@@ -28,7 +34,11 @@ impl Log for SerialLogger {
     }
 
     fn log(&self, record: &Record) {
-        let cpu = crate::percpu::current_apic_id();
+        let cpu = if BSP_PERCPU_READY.load(Ordering::Relaxed) {
+            crate::percpu::current_apic_id()
+        } else {
+            0 // BSP before per-CPU init — only one CPU running
+        };
         let level_padded = match record.level() {
             Level::Error => "ERROR",
             Level::Warn => "WARN ",
