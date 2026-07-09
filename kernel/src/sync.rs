@@ -2,13 +2,13 @@
 //!
 //! ## Locking discipline
 //!
-//! - **`IrqSaveSpinLock<T>`** — IRQ-disabling spinlock with interior mutability.
+//! - **`IrqSaveSpinLock<T>`** -- IRQ-disabling spinlock with interior mutability.
 //!   The lock disables interrupts on the calling CPU for the duration of the
 //!   critical section and restores them on drop. This is required for SMP:
 //!   a plain `cli` does *not* prevent an IPI from delivering to the same CPU.
 //!
 //! - **Lock order** (lower levels acquired first):
-//!   `phys → heap → vma → virt → task → cap`
+//!   `phys -> heap -> vma -> virt -> task -> cap`
 //!   Violating this order can deadlock under load. The order is enforced by
 //!   the call graph: code holds a higher-level lock only while *not* holding
 //!   a lower-level lock.

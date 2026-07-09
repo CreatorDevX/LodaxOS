@@ -18,8 +18,10 @@ pub const APIC_MMIO_SIZE: u64 = 0x40_0000;
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_SIZE: u64 = 0x1000;
 
-/// Kernel task stack size (8 KB).
-pub const KERNEL_STACK_SIZE: u64 = 8192;
+/// Kernel task stack size (16 KB).  Must be large enough to accommodate
+/// deep call chains in GDF crash recovery (fork_pml4 + load_elf +
+/// register_driver_vcpu can use 12+ KB of stack).
+pub const KERNEL_STACK_SIZE: u64 = 16384;
 
 /// AP kernel stack pages (4 × 4 KB = 16 KB per AP).
 pub const AP_STACK_PAGES: usize = 4;

@@ -4,7 +4,7 @@ use core::mem;
 
 pub mod madt;
 
-/// Standard ACPI SDT header — every system description table starts with this.
+/// Standard ACPI SDT header -- every system description table starts with this.
 #[repr(C, packed)]
 pub struct SdtHeader {
     signature: [u8; 4],
@@ -18,7 +18,7 @@ pub struct SdtHeader {
     creator_revision: u32,
 }
 
-/// RSDP (Root System Description Pointer) — ACPI v2.0+ extended format.
+/// RSDP (Root System Description Pointer) -- ACPI v2.0+ extended format.
 #[repr(C, packed)]
 struct Rsdp {
     signature: [u8; 8],
@@ -37,7 +37,7 @@ pub const MADT_SIG: [u8; 4] = *b"APIC";
 pub const FADT_SIG: [u8; 4] = *b"FACP";
 pub const MCFG_SIG: [u8; 4] = *b"MCFG";
 
-/// Parsed ACPI context — populated once during boot.
+/// Parsed ACPI context -- populated once during boot.
 pub struct AcpiContext {
     pub revision: u8,
     pub rsdp_addr: u64,
@@ -79,7 +79,7 @@ fn check_rsdp_at(addr: u64) -> Option<u64> {
 ///
 /// Order:
 /// 1. EBDA (Extended BIOS Data Area)
-/// 2. Standard BIOS ROM area (0xE0000–0xFFFFF)
+/// 2. Standard BIOS ROM area (0xE0000--0xFFFFF)
 /// 3. Common OVMF/UEFI firmware locations near top of 4 GB
 ///
 /// The bootloader captures the UEFI config-table RSDP address into BootInfo

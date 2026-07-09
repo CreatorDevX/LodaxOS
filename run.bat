@@ -5,5 +5,5 @@
   -serial stdio ^
   -serial tcp::4444,server,nowait ^
   -accel tcg -machine q35 -m 128M -smp 4 -vga std ^
-  -d int,cpu_reset -D qemu_smp.log
+  -d int,cpu_reset -D qemu_smp.log 
 PAUSE

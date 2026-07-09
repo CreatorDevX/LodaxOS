@@ -4,14 +4,14 @@ use x86_64::instructions::port::Port;
 use lodaxos_system::MAX_CPUS;
 use crate::sync::SyncUnsafeCell;
 
-/// TSS (Task State Segment) — 104 bytes on x86-64.
+/// TSS (Task State Segment) -- 104 bytes on x86-64.
 ///
 /// IMPORTANT: This struct uses `repr(C, packed)` to match the exact Intel TSS
 /// layout. `repr(C)` would insert 4 bytes of padding after `reserved0` (u32)
 /// to align `rsp0` (u64), shifting ALL fields by 4 bytes. The CPU interprets
 /// the TSS using the Intel format (no padding), so the `ist2` field (used by
 /// the timer interrupt's IST2 stack switch) would be read from the wrong
-/// memory offset, producing a non-canonical stack pointer → #SS(0).
+/// memory offset, producing a non-canonical stack pointer -> #SS(0).
 #[repr(C, packed)]
 struct Tss {
     reserved0: u32,
@@ -29,7 +29,7 @@ struct Tss {
     reserved2: u32,
     reserved3: u16,
     iomap_base: u16,
-    /// Padding to 104 bytes — Intel requires TSS limit >= 67h (103).
+    /// Padding to 104 bytes -- Intel requires TSS limit >= 67h (103).
     _padding: [u8; 4],
 }
 
@@ -56,7 +56,7 @@ impl Tss {
     }
 }
 
-/// GDT pointer structure for `lgdt` — 10 bytes: 2-byte limit + 8-byte base.
+/// GDT pointer structure for `lgdt` -- 10 bytes: 2-byte limit + 8-byte base.
 #[repr(C, packed)]
 struct GdtPtr {
     limit: u16,
@@ -145,7 +145,7 @@ const TSS_SEL: u16 = 0x28;
 /// IMPORTANT: the kernel's GDT/TSS system previously used a *single*
 /// global IST1 stack shared by all CPUs. This was safe in the SMP-CPU
 /// bring-up log because only the BSP took a #DF, but on a real AP the
-/// IST1 stack would belong to a different physical CPU — a #DF on the
+/// IST1 stack would belong to a different physical CPU -- a #DF on the
 /// AP would try to switch to a stack whose "top" pointer is unrelated
 /// to the AP's current stack, producing a #GP on the very first
 /// instruction of the #DF handler.  Per-CPU IST1 stacks fix this.
@@ -202,7 +202,7 @@ pub fn gdt_pointer_address() -> u64 {
 
 /// Return the higher-half virtual address of the GDT pointer for the
 /// given per-CPU slot.  Each AP needs to load its own GDT (pointing to
-/// its own TSS) — sharing the BSP's GDT would re-use the BSP's TSS
+/// its own TSS) -- sharing the BSP's GDT would re-use the BSP's TSS
 /// (and the BSP's IST1 stack) on every AP.
 pub fn gdt_pointer_for_slot(slot: usize) -> u64 {
     let slot = slot % MAX_CPUS;
@@ -296,11 +296,25 @@ pub unsafe fn init_for_slot(slot: usize) {
     (*TSS_TABLE.get())[slot].ist1 = ist1_top_for_slot(slot);
     (*TSS_TABLE.get())[slot].ist2 = ist2_top_for_slot(slot);
     (*TSS_TABLE.get())[slot].ist3 = ist3_top_for_slot(slot);
+
+    // Write canary values at the bottom of each IST stack so that stack
+    // overflow is detectable (the canary will be clobbered before the
+    // guard page is hit).
+    const IST_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    unsafe {
+        let ist1_base = ist1_top_for_slot(slot) - 16384; // bottom of stack
+        let ist2_base = ist2_top_for_slot(slot) - 16384;
+        let ist3_base = ist3_top_for_slot(slot) - 16384;
+        core::ptr::write_volatile(ist1_base as *mut u64, IST_CANARY);
+        core::ptr::write_volatile(ist2_base as *mut u64, IST_CANARY);
+        core::ptr::write_volatile(ist3_base as *mut u64, IST_CANARY);
+    }
+
     com1_trace_str(b"GDT STACK\r\n");
 
     let tss_addr = &raw const (*TSS_TABLE.get())[slot] as u64;
 
-    // Verify TSS address is canonical (bits 48–63 all same as bit 47).
+    // Verify TSS address is canonical (bits 48--63 all same as bit 47).
     // Non-canonical addresses cause #GP on ltr.
     let ext = tss_addr >> 47;
     let canonical = ext == 0 || ext == 0x1_FFFF;
@@ -342,15 +356,28 @@ pub unsafe fn init_for_slot(slot: usize) {
     init_syscall_msrs();
 }
 
-/// Set up syscall MSRs (IA32_STAR, IA32_LSTAR, IA32_FMASK).
+/// Set up syscall MSRs (IA32_STAR, IA32_LSTAR, IA32_FMASK, EFER.SCE).
 /// These are per-core MSRs, so every AP must call this after entering
 /// long mode, not just the BSP's `init_for_slot` path.
 pub unsafe fn init_syscall_msrs() {
+    // Enable SCE (System Call Enable) in EFER MSR (0xC0000080).
+    // Without SCE=1 the `syscall` instruction raises #UD.
+    core::arch::asm!(
+        "rdmsr",
+        "or eax, 1",       // set SCE bit
+        "wrmsr",
+        in("ecx") 0xC0000080u32,
+        out("eax") _,
+        out("edx") _,
+    );
+
     let sycall_entry = crate::arch::idt::syscall_entry as *const () as u64;
     core::arch::asm!(
         "wrmsr",
         in("ecx") 0xC0000081u32, // IA32_STAR
-        in("eax") 0u32,
+        // bits [31:0]  = SYSCALL CS (kernel code selector 0x08)
+        // bits [47:32] = SYSRET CS base (user code = base + 16)
+        in("eax") 0x08u32,
         in("edx") 0x08u32,
     );
     core::arch::asm!(
@@ -367,19 +394,13 @@ pub unsafe fn init_syscall_msrs() {
     );
 }
 
-/// Backwards-compat wrapper for the BSP. Calls `init_for_slot(0)`.
-/// TODO: remove once all call sites use `init_for_slot` directly.
-pub fn load() {
-    unsafe { init_for_slot(0); }
-}
-
 /// Initialise the GDT's TSS descriptor for `slot` to point at the
 /// per-CPU TSS for that slot, and set the per-CPU IST1 stack.  This
 /// is called by the BSP *before* `smp_boot_aps` so that the AP
 /// trampoline's `lgdt` finds a fully-formed TSS descriptor and the AP's
 /// subsequent `ltr` works on first try.
 ///
-/// Does NOT `lgdt` or `ltr` on the calling CPU — that's the
+/// Does NOT `lgdt` or `ltr` on the calling CPU -- that's the
 /// responsibility of the AP itself (or `init_for_slot` for the BSP).
 pub fn init_tss_descriptor_for_slot(slot: usize) {
     let slot = slot % MAX_CPUS;
@@ -421,12 +442,6 @@ pub fn set_ist1(addr: u64) {
 pub unsafe fn tss_set_rsp0_for_slot(slot: usize, rsp0: u64) {
     let slot = slot % MAX_CPUS;
     (*TSS_TABLE.get())[slot].rsp0 = rsp0;
-}
-
-/// Backwards-compat: update the BSP's RSP0.
-/// TODO: remove once all call sites use `tss_set_rsp0_for_slot` directly.
-pub unsafe fn tss_set_rsp0(rsp0: u64) {
-    tss_set_rsp0_for_slot(0, rsp0);
 }
 
 /// Return the limit and base of the GDT pointer for `slot`.

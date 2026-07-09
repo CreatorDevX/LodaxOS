@@ -39,16 +39,14 @@ pub unsafe fn clflush_range(addr: *const u8, len: usize) {
 ///   - switched RSP to the per-CPU kernel stack
 ///   - signalled `status=1` in the mailbox
 ///
-/// The trampoline does NOT pass an argument — LAPIC ID is read via CPUID.
+/// The trampoline does NOT pass an argument -- LAPIC ID is read via CPUID.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry() -> ! {
-    // Adjust RSP by -8 so it's 8-mod-16 (SysV ABI convention).
-    // The trampoline enters via `jmp` (no return address pushed),
-    // so RSP would otherwise be 16-byte-aligned at entry, causing
-    // SSE-aligned stores (MOVAPS) in called functions to #GP.
-    unsafe { core::arch::asm!("sub rsp, 8", options(nostack, preserves_flags)); }
+    // The trampoline sets RSP to ap_stacks[i] - 8, so RSP is 8-mod-16 at entry.
+    // The compiler-generated prologue (push rbp; mov rbp, rsp) will correctly
+    // 16-byte align the stack frame. No inline assembly is needed here.
 
-    // Read LAPIC ID via CPUID leaf 1 (no MMIO needed — avoids potential
+    // Read LAPIC ID via CPUID leaf 1 (no MMIO needed -- avoids potential
     // page-table or LAPIC-model issues on the AP after SIPI).
     let apic_id: u32 = unsafe {
         let ebx: u32;
@@ -67,7 +65,7 @@ pub extern "C" fn ap_entry() -> ! {
     };
 
     // 1. Read the pre-allocated PERCPU slot from the physical SLOT_MAP
-    //    table (written by the BSP before sending IPIs — serial, no
+    //    table (written by the BSP before sending IPIs -- serial, no
     //    race).  We use this directly instead of calling find_slot(),
     //    which would race with other APs arriving concurrently after
     //    the SIPI broadcast.
@@ -83,7 +81,7 @@ pub extern "C" fn ap_entry() -> ! {
     percpu::install_gs_base(slot);
     // Ensure the GS base / TSC_AUX write is globally visible before
     // enabling the LAPIC timer (which could fire an interrupt that calls
-    // current_apic_id() → rdtscp → IA32_TSC_AUX).
+    // current_apic_id() -> rdtscp -> IA32_TSC_AUX).
     unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
 
     // 2. Init FPU/SSE before any FPU/SSE-using code.
@@ -102,23 +100,23 @@ pub extern "C" fn ap_entry() -> ! {
 
     // 3. Wait for the BSP to release us (timeout ~10 s).
     if !percpu::wait_for_kernel_ready(apic_id) {
-        // BSP may have crashed — halt this AP.
+        // BSP may have crashed -- halt this AP.
         loop { x86_64::instructions::interrupts::disable(); x86_64::instructions::hlt(); }
     }
 
     // 4. Load the per-CPU TSS into TR (SIPI reset TR to 0).
     // Must happen before init_idle_vcpu (which may set TSS RSP0) and
-    // before enabling interrupts (which could use IST — Bug 75).
+    // before enabling interrupts (which could use IST -- Bug 75).
     unsafe {
         core::arch::asm!("ltr ax", in("ax") 0x28u16, options(nostack, preserves_flags));
         crate::arch::gdt::init_syscall_msrs();
     }
 
-    // 5. Register idle Vcpu (must be after ltr — Bug 75).
+    // 5. Register idle Vcpu (must be after ltr -- Bug 75).
     crate::scheduler::init_idle_vcpu();
 
     // 6. Initialise LAPIC timer on this CPU (must be after init_idle_task
-    //    so a timer interrupt doesn't find no idle task — Bug 74).
+    //    so a timer interrupt doesn't find no idle task -- Bug 74).
     // NOTE: ap_enable_timer uses physical LAPIC addresses directly (not
     // the higher-half LAPIC_BASE), so it works regardless of whether the
     // per-CPU higher-half mapping is installed on this AP.
@@ -155,7 +153,7 @@ fn ap_sched_loop(apic_id: u32) -> ! {
 /// BSP-side: bring up all APs via LAPIC INIT-SIPI-SIPI.
 ///
 /// For each AP:
-///   0. Pre-allocate a PERCPU slot (serial on BSP — no race).
+///   0. Pre-allocate a PERCPU slot (serial on BSP -- no race).
 ///   1. Initialise the per-CPU GDT/TSS (TSS descriptor, IST1 stack)
 ///      using the pre-allocated slot.
 ///   2. WHPX: clflush the per-CPU GDT/TSS/IDT structures from BSP cache.
@@ -255,8 +253,9 @@ pub fn smp_boot_aps(boot_info: &BootInfo) {
         );
     }
 
-    // Start the APs via SIPI trampoline (passes pre-allocated slots).
-    crate::arch::smp::start_aps(boot_info, &ap_stacks[..count], &ap_slots[..count]);
-
-    log::info!("SMP: all APs signalled ready");
+    // Send INIT-SIPI-SIPI and return immediately (non-blocking).
+    // The BSP will poll for AP readiness from the idle loop via
+    // smp::poll_aps_ready(), keeping katerm alive during boot.
+    crate::arch::smp::send_ipis(boot_info, &ap_stacks[..count], &ap_slots[..count]);
+    log::info!("SMP: IPIs sent, APs booting in background");
 }

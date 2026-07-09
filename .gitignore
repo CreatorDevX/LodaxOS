@@ -10,3 +10,17 @@ esp/*
 nasm/*
 nasm.exe
 ndisasm.exe
+/.chrononaut
+chrononaut.exe
+deunicode.py
+check_rip_scratch.py
+/target
+.disk_cache.json
+/nasm
+debugrun.bat
+debug-run.bat
+create_disk_image.sh
+genfont.py
+verify_disk.py
+/.cargo
+/.agents

@@ -49,7 +49,8 @@ sipi_entry:
     lgdt [gdtr32]                    ; load minimal GDT for protected mode
 
     mov eax, cr0
-    or al, 1                         ; PE=1
+    and eax, 0x9FFFFFFF              ; Clear CD (bit 30) and NW (bit 29) to enable caching
+    or eax, 0x00010001               ; Enable PE (bit 0) and WP (bit 16)
     mov cr0, eax
 
     jmp dword 0x08:pm_entry          ; far jump to 32-bit protected mode

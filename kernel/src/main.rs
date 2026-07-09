@@ -38,6 +38,15 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial::init();
     logger::init().unwrap_or(());
 
+    // Initialize COM2 UART registers early (no IOAPIC dependency).
+    #[cfg(debug_assertions)]
+    serial2::init_port();
+
+    // Early katerm probe: scan for "bootkaterm" handshake using polled UART.
+    // Runs before page tables, heap, or scheduler. Only does port I/O.
+    #[cfg(debug_assertions)]
+    crate::katerm::early_probe();
+
     // Enable FPU and SSE on the BSP.
     unsafe {
         core::arch::asm!("fninit", options(nostack, preserves_flags));
@@ -57,10 +66,21 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     log::info!("Phase 1: Memory initialization");
 
-    // Build exclude ranges for the physical allocator: framebuffer pages,
-    // kernel staging image, drivers ELF staging, and APIC MMIO.
+    // Build exclude ranges for the physical allocator: low 1 MiB (BIOS,
+    // trampoline, early page tables), framebuffer pages, kernel staging
+    // image, drivers ELF staging, and APIC MMIO.
     let mut exclude_list: [(u64, u64); 8] = [(0, 0); 8];
     let mut exclude_count = 0usize;
+
+    // Reserve the first 1 MiB of physical memory.  This covers the real-mode
+    // IVT/BDA, the SIPI trampoline (0x8000), the early page tables (e.g.
+    // 0xF000 used as AP bootstrap CR3), and other BIOS/firmware structures.
+    // Without this reservation the buddy allocator hands out these pages and
+    // driver loading or page-table creation can overwrite critical boot
+    // structures (leading to AP #GP faults and corrupted identity maps).
+    exclude_list[exclude_count] = (0x0, 0x100000);
+    exclude_count += 1;
+
     {
         let fb_base = info.framebuffer.phys_addr & !0xFFFu64;
         let fb_size = (info.framebuffer.height as u64)
@@ -88,7 +108,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     exclude_count += 1;
 
     log::info!("Initializing physical page allocator");
-    unsafe { mm::phys::init_from_regions(&regions[..region_count], boot_info as u64, &exclude_list[..exclude_count]) };
+    unsafe { mm::phys::init_from_regions(&regions[..region_count], boot_info as u64, kernel_start, kernel_size, &exclude_list[..exclude_count]) };
     log::info!("Physical allocator ready");
 
     let (ioapic_infos, ioapic_count, madt_parsed) = discover_acpi(info);
@@ -100,7 +120,16 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let fb_size = (info.framebuffer.height * info.framebuffer.stride * info.framebuffer.bytes_per_pixel) as u64;
     let kernel_phys_range = if kernel_size > 0 { Some((kernel_start, kernel_size)) } else { None };
     unsafe { mm::virt::init(&regions[..region_count], Some((fb_phys, fb_size)), kernel_phys_range) };
+    crate::katerm::termcmds::KATERM_FB_PHYS.store(fb_phys, core::sync::atomic::Ordering::SeqCst);
+    crate::katerm::termcmds::KATERM_FB_VIRT.store(crate::mm::virt::HIGHER_HALF + fb_phys, core::sync::atomic::Ordering::SeqCst);
     log::info!("Page tables ready");
+
+    // Create katerm rescue PML4 (deep copy of kernel page tables).
+    #[cfg(debug_assertions)]
+    {
+        let katerm_pml4 = crate::mm::virt::katerm_pml4_init(crate::mm::virt::kernel_pml4());
+        crate::mm::virt::KATERM_PML4.store(katerm_pml4, core::sync::atomic::Ordering::Release);
+    }
 
     log::info!("Initializing heap allocator");
     mm::heap::init();
@@ -115,7 +144,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     log::info!("Initializing SEDS scheduler");
     scheduler::init();
 
-    // Disable interrupts — UEFI may have left PIT/HPET active
+    // Disable interrupts -- UEFI may have left PIT/HPET active
     x86_64::instructions::interrupts::disable();
 
     // Mask the legacy 8259 PIC
@@ -147,14 +176,14 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     log::info!("Initializing IDT");
     arch::idt::init();
-    log::info!("IDT loaded — 256 vectors");
+    log::info!("IDT loaded -- 256 vectors");
 
     percpu::install_gs_base(bsp_slot);
     crate::logger::BSP_PERCPU_READY.store(true, Ordering::Release);
 
     scheduler::init_idle_vcpu();
 
-    // ── Compute framebuffer size for ACQUIRE command ────────────
+    // -- Compute framebuffer size for ACQUIRE command ------------
     let fb_size = (info.framebuffer.height as u64)
         .saturating_mul(info.framebuffer.stride as u64)
         .saturating_mul(info.framebuffer.bytes_per_pixel as u64);
@@ -164,7 +193,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         info.framebuffer.stride as u64 * info.framebuffer.bytes_per_pixel as u64,
         info.framebuffer.bytes_per_pixel, info.framebuffer.is_bgr, fb_size);
 
-    // ── Load and start the preloaded drivers ELF ──────────────────────
+    // -- Load and start the preloaded drivers ELF ----------------------
     if info.drivers_elf_addr != 0 && info.drivers_elf_size != 0 {
         let binary: &'static [u8] = unsafe {
             core::slice::from_raw_parts(
@@ -187,10 +216,10 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             log::error!("gdf: timed out trying to init package");
         }
     } else {
-        log::warn!("gdf: no drivers ELF in BootInfo — skipping");
+        log::warn!("gdf: no drivers ELF in BootInfo -- skipping");
     }
 
-    // ── IOAPIC routes (after GDF so drivers can register IRQs) ────
+    // -- IOAPIC routes (after GDF so drivers can register IRQs) ----
     if ioapic_count > 0 {
         let routes = intr::install_all_masked();
         log::info!("IOAPIC: {} routes installed (masked)", routes);
@@ -198,8 +227,11 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     #[cfg(debug_assertions)]
     {
-        serial2::init();
-        log::info!("COM2 debug serial init @ divisor=1 (115200 baud)");
+        serial2::init_irq();
+        log::info!("COM2 IRQ route configured");
+        // Switch from polled to interrupt-driven connector.
+        crate::katerm::connector::set_active(&crate::katerm::serial2int::SERIAL2_INT);
+        log::info!("COM2 switched to interrupt-driven connector");
     }
 
     log::info!("Enabling LAPIC");
@@ -222,17 +254,22 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     log::info!("Enabling interrupts");
     x86_64::instructions::interrupts::enable();
 
+    // Mark katerm as ready to process commands now that the system is
+    // fully initialized (heap, scheduler, page tables, interrupts all up).
+    #[cfg(debug_assertions)]
+    crate::katerm::set_ready();
+
     log::info!("Triggering int 32 (software) to test IRQ stub...");
     unsafe { core::arch::asm!("int 32") };
 
     // Unmask PIT IOAPIC route
     if let Some(route) = intr::lookup_isa(0) {
-        log::info!("PIT: GSI {} → IOAPIC[{}] pin {} → vector {}",
+        log::info!("PIT: GSI {} -> IOAPIC[{}] pin {} -> vector {}",
             route.gsi, route.ioapic_index, route.ioapic_pin, route.vector);
         intr::enable_route(route);
     }
 
-    // ── Read /file.txt via ext4 ──────────────────────────────────
+    // -- Read /file.txt via ext4 ----------------------------------
     log::info!("Waiting for ext4 driver...");
     let mut ext4_ready = false;
     for _ in 0..1000 {
@@ -284,7 +321,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         log::warn!("ext4 driver did not register within timeout");
     }
 
-    // ── Initialize framebuffer driver via capability protocol ────
+    // -- Initialize framebuffer driver via capability protocol ----
     log::info!("Waiting for framebuffer driver...");
     let mut fb_ready = false;
     for _ in 0..1000 {
@@ -331,7 +368,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
     }
 
-    // ── Send file content to framebuffer ─────────────────────────
+    // -- Send file content to framebuffer -------------------------
     if fb_ready && file_phys != 0 {
         log::info!("Sending FB_CMD_DRAW_TEXT to framebuffer ({} bytes)", file_size);
         let sent = gdf::send_cmd(b"framebuffer", FB_CMD_DRAW_TEXT, file_phys, file_size, 0);
@@ -341,7 +378,7 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             log::error!("Failed to send DRAW_TEXT (mailbox busy?)");
         }
     } else if fb_ready {
-        log::info!("No file content — sending empty DRAW_TEXT");
+        log::info!("No file content -- sending empty DRAW_TEXT");
         gdf::send_cmd(b"framebuffer", FB_CMD_DRAW_TEXT, 0, 0, 0);
     } else {
         log::warn!("Framebuffer driver not available");
@@ -349,15 +386,30 @@ extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     for _ in 0..50000 { core::hint::spin_loop(); }
 
-    log::info!("LodaxOS initialization complete — entering idle loop (task 0)");
+    log::info!("LodaxOS initialization complete -- entering idle loop (task 0)");
     bsp_idle_loop();
 }
 
-/// BSP idle loop: hlt-wait, periodic log.
+/// BSP idle loop: hlt-wait, periodic log, process deferred restarts.
 fn bsp_idle_loop() -> ! {
     let mut last_log = 0u64;
+    let mut trampoline_unmapped = false;
     let bsp_cpu = percpu::current_apic_id() as usize;
     loop {
+        // Process any driver crash restarts that were deferred from
+        // exception context.  This runs at CPL0 with interrupts enabled,
+        // which is safe for heavy memory allocation.
+        crate::gdf::process_deferred_restarts();
+
+        // Cooperatively poll AP readiness (non-blocking INIT-SIPI-SIPI).
+        if !trampoline_unmapped {
+            if crate::arch::smp::poll_aps_ready() {
+                crate::mm::virt::unmap_from_huge_page(crate::consts::TRAMPOLINE_PHYS);
+                log::info!("SMP: trampoline page unmapped");
+                trampoline_unmapped = true;
+            }
+        }
+
         katerm::process_input();
 
         x86_64::instructions::hlt();
@@ -413,7 +465,7 @@ fn build_memory_layout(info: &BootInfo) -> ([(u64, u64); 256], usize, u64, (u64,
             }
         } else {
             if nregions < 256 {
-                regions[nregions] = (rstart, rsize);
+                regions[nregions] = (rstart, rend - rstart);
                 nregions += 1;
             }
         }

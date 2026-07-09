@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use crate::sync::SyncUnsafeCell;
 use core::ptr;
 
@@ -14,6 +14,21 @@ pub const PAGE_SIZE: u64 = 0x1000;
 
 const MAX_ORDER: usize = 10;
 const BOOTINFO_HANDOFF_PAGE: u64 = 0x5000;
+
+/// Maximum physical address supported by the refcount array (128 MB).
+/// Pages beyond this have an implicit refcount of 1 (no tracking).
+const REFCOUNT_MAX_PAGES: usize = 128 * 1024 * 1024 / PAGE_SIZE as usize; // 32768
+
+/// Per-page reference count for COW tracking. Index = page frame number.
+/// Initialized to 1 for all pages (each free page has refcount 1).
+/// AtomicU16 supports up to 65535 references per page, which is ample.
+static REFCOUNTS: [AtomicU16; REFCOUNT_MAX_PAGES] = {
+    // AtomicU16::new(1) is const, but we need an array constructor.
+    // This const fn builds the array at compile time.
+    const ONE: AtomicU16 = AtomicU16::new(1);
+    [ONE; REFCOUNT_MAX_PAGES]
+};
+static REFCOUNT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct FreeBlock {
@@ -55,6 +70,13 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static BOOTINFO_RESERVED_PN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BOOTINFO_RESERVED_PAGES: AtomicUsize = AtomicUsize::new(0);
 
+/// Kernel image physical range (set once by `init_from_regions`).
+/// Protects the kernel's own code/data pages from being freed and
+/// re-allocated -- the kernel image is excluded from the initial free
+/// list, but a spurious `free_page` call would otherwise add it back.
+static KERNEL_RESERVED_PN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static KERNEL_RESERVED_PAGES: AtomicUsize = AtomicUsize::new(0);
+
 fn align_down(x: u64, align: u64) -> u64 {
     x & !(align - 1)
 }
@@ -71,13 +93,25 @@ fn is_reserved_page(pn: u64) -> bool {
     if pn == 0 || pn == BOOTINFO_HANDOFF_PAGE / PAGE_SIZE {
         return true;
     }
+    // Check BootInfo struct pages
     let base = BOOTINFO_RESERVED_PN.load(Ordering::Acquire);
     let pages = BOOTINFO_RESERVED_PAGES.load(Ordering::Acquire);
-    if base == usize::MAX || pages == 0 {
-        return false;
+    if base != usize::MAX && pages != 0 {
+        let pn_usize = pn as usize;
+        if pn_usize >= base && pn_usize < base + pages {
+            return true;
+        }
     }
-    let pn_usize = pn as usize;
-    pn_usize >= base && pn_usize < base + pages
+    // Check kernel image pages (never free these)
+    let kbase = KERNEL_RESERVED_PN.load(Ordering::Acquire);
+    let kpages = KERNEL_RESERVED_PAGES.load(Ordering::Acquire);
+    if kbase != usize::MAX && kpages != 0 {
+        let pn_usize = pn as usize;
+        if pn_usize >= kbase && pn_usize < kbase + kpages {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe fn phys_to_block(phys: u64) -> &'static mut FreeBlock {
@@ -164,11 +198,11 @@ unsafe fn coalesce(zone: &mut Zone, addr: u64, order: usize) {
 
     // Hold the per-order lock across the remove+add sequence
     // to prevent a concurrent alloc/free from interleaving:
-    //   remove buddy  →  (window closed)  →  add our block
+    //   remove buddy  ->  (window closed)  ->  add our block
     let _g = LOCKS[order].lock();
     if remove_block(zone, buddy, order) {
-        // Buddy was found — recurse to the next order.
-        // Release current lock before recursing (lock order: low→high).
+        // Buddy was found -- recurse to the next order.
+        // Release current lock before recursing (lock order: low->high).
         drop(_g);
         coalesce(zone, addr.min(buddy), order + 1);
     } else {
@@ -184,46 +218,67 @@ fn range_overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// Remove all blocks overlapping [rstart, rend) from the given order's free list.
 /// Non-overlapping portions of partially-covered blocks are re-inserted at
 /// lower orders so they remain available.
+///
+/// BUG 8 fix: collect all blocks to remove first, then release the lock
+/// before calling `carve_range` (which acquires lower-order locks).
+/// Holding `LOCKS[order]` while acquiring `LOCKS[lower]` is safe today,
+/// but fragile against future callers that might hold a lower-order lock.
 unsafe fn remove_range(zone: &mut Zone, rstart: u64, rend: u64, order: usize) {
-    let _g = LOCKS[order].lock();
-    let bsize = block_size(order);
-    let mut prev: *mut FreeBlock = ptr::null_mut();
-    let mut curr = zone.free_lists[order];
+    // Phase 1: walk the free list under the lock, collect blocks to split.
+    let mut to_carve: [(u64, u64); 64] = [(0, 0); 64]; // (start, end) pairs
+    let mut carve_count = 0usize;
+    {
+        let _g = LOCKS[order].lock();
+        let bsize = block_size(order);
+        let mut prev: *mut FreeBlock = ptr::null_mut();
+        let mut curr = zone.free_lists[order];
 
-    while !curr.is_null() {
-        let cphys = block_phys(curr);
-        let cend = cphys + bsize;
-        let next = (*curr).next;
+        while !curr.is_null() {
+            let cphys = block_phys(curr);
+            let cend = cphys + bsize;
+            let next = (*curr).next;
 
-        if range_overlaps(cphys, cend, rstart, rend) {
-            // Remove the block
-            if prev.is_null() {
-                zone.free_lists[order] = next;
+            if range_overlaps(cphys, cend, rstart, rend) {
+                // Remove the block
+                if prev.is_null() {
+                    zone.free_lists[order] = next;
+                } else {
+                    (*prev).next = next;
+                }
+                zone.free_pages.fetch_sub(1usize << order, Ordering::Relaxed);
+
+                // Record non-overlapping portions for re-insertion below
+                if cphys < rstart && carve_count < to_carve.len() {
+                    to_carve[carve_count] = (cphys, rstart);
+                    carve_count += 1;
+                }
+                if cend > rend && carve_count < to_carve.len() {
+                    to_carve[carve_count] = (rend, cend);
+                    carve_count += 1;
+                }
             } else {
-                (*prev).next = next;
+                prev = curr;
             }
-            zone.free_pages.fetch_sub(1usize << order, Ordering::Relaxed);
 
-            // Re-add non-overlapping portions as smaller blocks
-            if cphys < rstart {
-                carve_range(zone, cphys, rstart);
-            }
-            if cend > rend {
-                carve_range(zone, rend, cend);
-            }
-        } else {
-            prev = curr;
+            curr = next;
         }
+    } // LOCKS[order] released here
 
-        curr = next;
+    // Phase 2: re-add non-overlapping portions outside the lock.
+    // `carve_range` acquires lower-order locks, which is safe without
+    // holding the higher-order lock.
+    for i in 0..carve_count {
+        let (cs, ce) = to_carve[i];
+        carve_range(zone, cs, ce);
     }
 }
 
-/// Check whether a physical page falls within any of the exclude ranges.
+/// Check whether a physical page overlaps any of the exclude ranges.
 fn is_excluded(phys: u64, exclude_ranges: &[(u64, u64)]) -> bool {
+    let page_end = phys.saturating_add(PAGE_SIZE);
     for &(start, size) in exclude_ranges {
         let end = start.saturating_add(size);
-        if phys >= start && phys < end {
+        if phys < end && page_end > start {
             return true;
         }
     }
@@ -239,10 +294,20 @@ fn is_excluded(phys: u64, exclude_ranges: &[(u64, u64)]) -> bool {
 pub unsafe fn init_from_regions(
     regions: &[(u64, u64)],
     boot_info_phys: u64,
+    kernel_start: u64,
+    kernel_size: u64,
     exclude_ranges: &[(u64, u64)],
 ) {
     if INITIALIZED.load(Ordering::SeqCst) {
         return;
+    }
+
+    // Record kernel image range to protect from spurious free_page calls.
+    if kernel_size > 0 {
+        let kstart = align_down(kernel_start, PAGE_SIZE);
+        let kend = align_up(kernel_start.saturating_add(kernel_size), PAGE_SIZE);
+        KERNEL_RESERVED_PN.store((kstart / PAGE_SIZE) as usize, Ordering::Release);
+        KERNEL_RESERVED_PAGES.store(((kend - kstart) / PAGE_SIZE) as usize, Ordering::Release);
     }
 
     log::debug!("Physical allocator (buddy): {} regions", regions.len());
@@ -361,6 +426,14 @@ pub fn alloc_order(order: usize) -> Option<u64> {
     {
         let _g = LOCKS[order].lock();
         if let Some(phys) = unsafe { pop_block(zone, order) } {
+            // Reset refcount to 1 for freshly allocated pages.
+            // Pages that were freed had their refcount decremented to 0.
+            if order == 0 {
+                let pn = phys / PAGE_SIZE;
+                if (pn as usize) < REFCOUNT_MAX_PAGES {
+                    REFCOUNTS[pn as usize].store(1, Ordering::Relaxed);
+                }
+            }
             return Some(phys);
         }
     }
@@ -381,12 +454,52 @@ pub fn alloc_order(order: usize) -> Option<u64> {
                 drop(_g);
                 current += half;
             }
+            // Reset refcount for the returned page
+            if order == 0 {
+                let pn = current / PAGE_SIZE;
+                if (pn as usize) < REFCOUNT_MAX_PAGES {
+                    REFCOUNTS[pn as usize].store(1, Ordering::Relaxed);
+                }
+            }
             return Some(current);
         }
     }
 
     log::error!("alloc_order({}): out of memory!", order);
     None
+}
+
+/// Increment the reference count for a physical page.
+/// Used when a page is COW-shared between parent and child.
+pub fn ref_page(pn: u64) {
+    let idx = pn as usize;
+    if idx < REFCOUNT_MAX_PAGES {
+        // Saturating increment to prevent overflow
+        let old = REFCOUNTS[idx].fetch_add(1, Ordering::Relaxed);
+        if old == u16::MAX {
+            REFCOUNTS[idx].store(u16::MAX, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Decrement the reference count for a physical page.
+/// Returns true if the refcount reached zero (caller should free the page).
+pub fn unref_page(pn: u64) -> bool {
+    let idx = pn as usize;
+    if idx >= REFCOUNT_MAX_PAGES {
+        return true; // Beyond tracked range, safe to free
+    }
+    let prev = REFCOUNTS[idx].fetch_sub(1, Ordering::AcqRel);
+    prev == 1
+}
+
+/// Get the current reference count for a physical page.
+pub fn refcount(pn: u64) -> u16 {
+    let idx = pn as usize;
+    if idx >= REFCOUNT_MAX_PAGES {
+        return 1;
+    }
+    REFCOUNTS[idx].load(Ordering::Relaxed)
 }
 
 pub fn free_order(addr: u64, order: usize) {
@@ -402,6 +515,15 @@ pub fn free_order(addr: u64, order: usize) {
 
     if addr < zone.base || addr + block_size(order) > zone.top {
         return;
+    }
+
+    // For single pages (order 0), check the reference count.
+    // A page with refcount > 1 is still COW-shared and must not be freed.
+    if order == 0 {
+        let pn = addr / PAGE_SIZE;
+        if !unref_page(pn) {
+            return; // refcount > 0, page is still referenced
+        }
     }
 
     unsafe { coalesce(zone, addr, order) };
@@ -488,4 +610,20 @@ pub fn free_pages_count() -> usize {
 
 pub fn total_pages() -> usize {
     unsafe { (*ZONE.get()).total_pages.load(Ordering::Relaxed) }
+}
+
+/// Count free blocks at each allocator order. Returns [count; MAX_ORDER+1].
+/// Each lock is held only briefly to walk the linked list.
+pub fn free_counts_per_order() -> [usize; MAX_ORDER + 1] {
+    let zone = unsafe { &*ZONE.get() };
+    let mut counts = [0usize; MAX_ORDER + 1];
+    for order in 0..=MAX_ORDER {
+        let _g = LOCKS[order].lock();
+        let mut cur = zone.free_lists[order];
+        while !cur.is_null() {
+            counts[order] += 1;
+            cur = unsafe { (*cur).next };
+        }
+    }
+    counts
 }

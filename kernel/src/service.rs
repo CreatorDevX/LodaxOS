@@ -160,15 +160,15 @@ pub fn free(id: u32) {
     let idx = id as usize;
     if idx < MAX_SERVICES && t.entries[idx].is_some() {
         t.entries[idx] = None;
-        t.count -= 1;
+        t.count = t.count.saturating_sub(1);
     }
 }
 
-pub fn get(id: u32) -> Option<&'static Service> {
-    let t = unsafe { SERVICE_TABLE.unsafe_get() };
+pub fn get(id: u32) -> Option<Service> {
+    let t = SERVICE_TABLE.lock();
     let idx = id as usize;
     if idx < MAX_SERVICES {
-        t.entries[idx].as_ref()
+        t.entries[idx].clone()
     } else {
         None
     }
@@ -185,7 +185,7 @@ pub fn with_mut<R>(id: u32, f: impl FnOnce(Option<&mut Service>) -> R) -> R {
 }
 
 pub fn find_by_vcpu(vcpu_id: VcpuId) -> Option<u32> {
-    let t = unsafe { SERVICE_TABLE.unsafe_get() };
+    let t = SERVICE_TABLE.lock();
     for (i, slot) in t.entries.iter().enumerate() {
         if let Some(s) = slot {
             if s.vcpu_id == vcpu_id {
@@ -197,7 +197,7 @@ pub fn find_by_vcpu(vcpu_id: VcpuId) -> Option<u32> {
 }
 
 pub fn find_by_name(name: &[u8]) -> Option<u32> {
-    let t = unsafe { SERVICE_TABLE.unsafe_get() };
+    let t = SERVICE_TABLE.lock();
     let len = name.len().min(31);
     for (i, slot) in t.entries.iter().enumerate() {
         if let Some(s) = slot {
@@ -210,5 +210,5 @@ pub fn find_by_name(name: &[u8]) -> Option<u32> {
 }
 
 pub fn count() -> usize {
-    unsafe { SERVICE_TABLE.unsafe_get().count }
+    SERVICE_TABLE.lock().count
 }

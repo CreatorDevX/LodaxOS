@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use lodaxos_system::{BootInfo, MAX_CPUS};
 use crate::mm;
 use crate::consts;
@@ -85,71 +86,60 @@ unsafe fn write_mailbox_slot(
     }
 }
 
-/// Poll an AP's status byte until it signals ready (status == 1).
-/// Returns `true` if the AP responded, `false` on timeout (~10 s).
-fn poll_ap_slot(slot: usize) -> bool {
+/// Non-blocking check: read an AP's status byte once.
+/// Returns `true` if the AP has signalled ready (status != 0).
+fn check_ap_slot(slot: usize) -> bool {
     let status_ptr = unsafe { slot_base(slot).add(MB_STATUS as usize) } as *const u8;
-        for _ in 0..1000 {
-        let status = unsafe { status_ptr.read_volatile() };
-        if status != 0 {
-            return true;
-        }
-        for _ in 0..1000000 { core::hint::spin_loop(); }
-    }
-    false
+    unsafe { status_ptr.read_volatile() != 0 }
 }
 
-/// Start all APs in parallel via INIT-SIPI-SIPI.
-///
-/// Phase 0 — zero the slot map table and write pre-allocated PERCPU
-///           slot numbers (assigned sequentially by `smp_boot_aps`).
-/// Phase 1 — write all AP mailboxes.
-/// Phase 2 — send INIT to all APs.
-/// Phase 3 — single 10 ms wait.
-/// Phase 4 — send first SIPI to all APs.
-/// Phase 5 — 1 ms wait.
-/// Phase 6 — send second SIPI to all APs.
-/// Phase 7 — poll each AP for ready.
-///
-/// `ap_stacks` — physical address of each AP's kernel stack top (one per
-/// enabled AP, indexed by AP index from BootInfo).
-/// `ap_slots`  — pre-allocated PERCPU slot for each AP (set by the BSP
-/// in `smp_boot_aps` to avoid the race of APs calling `find_slot`
-/// concurrently).
-pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64], ap_slots: &[usize]) {
+// ---- Non-blocking AP boot state machine ----
+
+/// AP boot state: 0 = idle, 1 = IPIs sent, 2 = all APs ready, 3 = error.
+static AP_BOOT_STATE: AtomicU8 = AtomicU8::new(0);
+static AP_BOOT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Per-AP slot numbers and APIC IDs, stored for polling.
+static mut AP_BOOT_SLOTS: [usize; MAX_CPUS] = [0; MAX_CPUS];
+static mut AP_BOOT_APIC_IDS: [u8; MAX_CPUS] = [0; MAX_CPUS];
+
+/// Send INIT-SIPI-SIPI to all APs and return immediately.
+/// The BSP must later call `poll_aps_ready()` from the idle loop to
+/// check AP readiness cooperatively.
+pub fn send_ipis(boot_info: &BootInfo, ap_stacks: &[u64], ap_slots: &[usize]) {
     let count = boot_info.ap_count as usize;
     if count == 0 {
+        AP_BOOT_STATE.store(2, Ordering::Release); // nothing to wait for
         return;
     }
-    if ap_stacks.len() < count {
-        log::error!("SMP: not enough stacks ({}) for {} APs", ap_stacks.len(), count);
-        return;
-    }
-    if ap_slots.len() < count {
-        log::error!("SMP: not enough slots ({}) for {} APs", ap_slots.len(), count);
+    if ap_stacks.len() < count || ap_slots.len() < count {
+        log::error!("SMP: not enough stacks/slots for {} APs", count);
+        AP_BOOT_STATE.store(3, Ordering::Release);
         return;
     }
 
     let pml4_phys = crate::mm::virt::pml4_address();
     let ap_entry_fn = crate::ap_start::ap_entry as *const () as u64;
+    let count = count.min(MAX_CPUS - 1);
 
-    // ---- Phase 0: write the slot mapping table ----
-    // The BSP has already pre-allocated PERCPU slots via `find_slot`
-    // (serial, no race).  We write those into the physical SLOT_MAP
-    // table so the real-mode trampoline and the long-mode `ap_entry`
-    // can discover the slot for their APIC ID.
+    AP_BOOT_TOTAL.store(count, Ordering::Release);
+
+    // Store slot/apic_id for later polling.
+    unsafe {
+        for i in 0..count {
+            AP_BOOT_SLOTS[i] = ap_slots[i];
+            AP_BOOT_APIC_IDS[i] = boot_info.ap_apic_ids[i] as u8;
+        }
+    }
+
+    // Phase 0: write slot mapping table.
     unsafe {
         core::ptr::write_bytes(SLOT_MAP_PHYS as *mut u8, 0xFF, 256);
     }
 
-    // Clamp count to MAX_CPUS to avoid overflowing stack arrays.
-    let count = count.min(MAX_CPUS - 1);
-
-    // ---- Phase 1: write all mailboxes ----
+    // Phase 1: write all mailboxes.
     for i in 0..count {
         let apic_id = boot_info.ap_apic_ids[i];
         let slot = ap_slots[i];
-
         if (apic_id as usize) < 256 {
             unsafe {
                 core::ptr::write_volatile(
@@ -158,55 +148,94 @@ pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64], ap_slots: &[usize]) {
                 );
             }
         }
-
         let (gdt_limit, gdt_base) = gdt_ptr_contents(slot);
         let (idt_limit, idt_base) = idt_ptr_contents(slot);
-
         log::info!(
             "SMP: mailbox slot {} AP[{}] lapic={} stack={:#x}",
             slot, i, apic_id, ap_stacks[i]
         );
-
         unsafe {
             write_mailbox_slot(
-                slot,
-                ap_stacks[i],
-                gdt_limit,
-                gdt_base,
-                idt_limit,
-                idt_base,
-                ap_entry_fn,
-                pml4_phys,
+                slot, ap_stacks[i] - 8,
+                gdt_limit, gdt_base, idt_limit, idt_base,
+                ap_entry_fn, pml4_phys,
             );
         }
     }
 
-    // ---- Phase 2: broadcast INIT to all APs ----
+    // Phase 2: INIT IPI.
     log::info!("SMP: sending INIT IPI to all APs");
     crate::arch::apic::send_init_ipi_all();
-    delay_ms(10);
+    // ~10ms delay, polling katerm once per ms to keep it responsive.
+    // LAPIC timer is not yet firing (interrupts disabled), so we
+    // must use iteration-based delays.  process_input() does port I/O
+    // (~1µs per call), so calling it per-iteration would blow the delay.
+    for _ in 0..10 {
+        for _ in 0..crate::consts::BUSY_LOOP_PER_MS {
+            core::hint::spin_loop();
+        }
+        #[cfg(debug_assertions)]
+        crate::katerm::process_input();
+    }
 
-    // ---- Phase 3: broadcast first SIPI ----
+    // Phase 3: first SIPI.
     log::info!("SMP: sending SIPI[0] to all APs (vector=0x08)");
     crate::arch::apic::send_sipi_all(0x08);
-    delay_ms(1);
+    // ~1ms delay, polling katerm once.
+    for _ in 0..crate::consts::BUSY_LOOP_PER_MS {
+        core::hint::spin_loop();
+    }
+    #[cfg(debug_assertions)]
+    crate::katerm::process_input();
 
-    // ---- Phase 4: broadcast second SIPI ----
+    // Phase 4: second SIPI.
     log::info!("SMP: sending SIPI[1] to all APs (vector=0x08)");
     crate::arch::apic::send_sipi_all(0x08);
 
-    // ---- Phase 5: poll all APs in parallel ----
-    for i in 0..count {
-        let apic_id = boot_info.ap_apic_ids[i];
-        let slot = ap_slots[i];
-        log::info!("SMP: waiting for AP[{}] (slot {})...", i, slot);
-        if poll_ap_slot(slot) {
-            log::info!("SMP: AP[{}] ready (apic_id={})", i, apic_id);
-        } else {
-            log::error!("SMP: AP[{}] (apic_id={}) did not respond", i, apic_id);
+    AP_BOOT_STATE.store(1, Ordering::Release);
+    log::info!("SMP: IPIs sent, polling from idle loop");
+}
+
+/// Cooperative poll: check all AP status bytes once, return true when all
+/// ready.  Call from the idle loop on each timer tick.
+pub fn poll_aps_ready() -> bool {
+    let state = AP_BOOT_STATE.load(Ordering::Acquire);
+    if state == 2 { return true; }  // already done
+    if state != 1 { return false; } // not started or error
+
+    let total = AP_BOOT_TOTAL.load(Ordering::Relaxed);
+
+    // Re-count from scratch each time (status bytes are sticky).
+    let mut ready = 0usize;
+    for i in 0..total {
+        let slot = unsafe { AP_BOOT_SLOTS[i] };
+        if check_ap_slot(slot) {
+            ready += 1;
         }
     }
 
+    if ready >= total {
+        AP_BOOT_STATE.store(2, Ordering::Release);
+        for i in 0..total {
+            let apic_id = unsafe { AP_BOOT_APIC_IDS[i] };
+            log::info!("SMP: AP[{}] (apic_id={}) ready", i, apic_id);
+        }
+        log::info!("SMP: all {} AP(s) online", total);
+        return true;
+    }
+    false
+}
+
+/// Legacy synchronous wrapper: send IPIs and busy-wait for all APs.
+/// Used by the old boot path; new code should use send_ipis + poll_aps_ready.
+pub fn start_aps(boot_info: &BootInfo, ap_stacks: &[u64], ap_slots: &[usize]) {
+    send_ipis(boot_info, ap_stacks, ap_slots);
+    // Busy-wait (fallback for pre-interrupt context).
+    for _ in 0..10000 {
+        if poll_aps_ready() { return; }
+        for _ in 0..1000000 { core::hint::spin_loop(); }
+    }
+    log::error!("SMP: timed out waiting for APs");
 }
 
 /// Reserve the trampoline page and load the trampoline code.

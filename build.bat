@@ -17,12 +17,12 @@ cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zjson-target
 if errorlevel 1 exit /b 1
 
 echo === Extracting kernel symbols ===
-python kernel\gensymtab.py "target\target\debug\lodaxos-kernel" kernel\src\arch\symtab.rs
+python kernel\gensymtab.py "target\target\debug\lodaxos-kernel" kernel/src/arch/symtab.rs
 if errorlevel 1 (
     echo WARNING: symbol extraction failed, using empty symtab
 )
 
-echo === Building lodaxos-kernel (pass 2 — with symbols) ===
+echo === Building lodaxos-kernel (pass 2 with symbols) ===
 cargo +nightly build -p lodaxos-kernel --target kernel/target.json -Zjson-target-spec "-Zbuild-std=core,alloc" "-Zbuild-std-features=compiler-builtins-mem"
 if errorlevel 1 exit /b 1
 
@@ -50,22 +50,12 @@ if errorlevel 1 exit /b 1
 cargo +nightly build -p lodaxos-drivers --bin ide --target drivers/target.json %DRIVER_FLAGS%
 if errorlevel 1 exit /b 1
 
-echo === Generating driver symbols ===
-python kernel\gensym.py "target\target\debug\framebuffer" "target\target\debug\framebuffer.sym"
-python kernel\gensym.py "target\target\debug\ahci" "target\target\debug\ahci.sym"
-python kernel\gensym.py "target\target\debug\ext4" "target\target\debug\ext4.sym"
-python kernel\gensym.py "target\target\debug\ide" "target\target\debug\ide.sym"
-
 echo === Packaging drivers.elf ===
 python drivers\pkg.py drivers.elf ^
     framebuffer:0:target\target\debug\framebuffer ^
-    framebuffer.sym:2:target\target\debug\framebuffer.sym ^
     ahci:0:target\target\debug\ahci ^
-    ahci.sym:2:target\target\debug\ahci.sym ^
     ext4:1:target\target\debug\ext4 ^
-    ext4.sym:2:target\target\debug\ext4.sym ^
-    ide:0:target\target\debug\ide ^
-    ide.sym:2:target\target\debug\ide.sym
+    ide:0:target\target\debug\ide
 if errorlevel 1 exit /b 1
 
 echo === Copying kernel binary ===

@@ -146,7 +146,7 @@ impl KmemCache {
         }
         // Slow path: need a new slab. Release the per-cache lock before
         // calling into `phys::` to avoid the wrong-direction lock order
-        // (`heap → phys`). Re-acquire the lock to install the slab.
+        // (`heap -> phys`). Re-acquire the lock to install the slab.
         let phys_addr = match phys::alloc_order(self.slab_order as usize) {
             Some(p) => p,
             None => return ptr::null_mut(),
@@ -174,7 +174,7 @@ impl KmemCache {
         let _g = CACHE_LOCKS[cache_idx].lock();
         // Double-check: another thread may have added a slab while we
         // were allocating. So if used, and free our
-        // redundant pages after dropping the cache lock (avoid heap→phys lock order).
+        // redundant pages after dropping the cache lock (avoid heap->phys lock order).
         if !self.partial.is_null() {
             let existing = self.partial;
             let real_obj = (*existing).alloc_obj();
@@ -221,38 +221,47 @@ impl KmemCache {
     }
 
     unsafe fn free(&mut self, obj: *mut u8, cache_idx: usize) {
-        let _g = CACHE_LOCKS[cache_idx].lock();
+        // Collect info for deferred physical page release (must happen
+        // outside CACHE_LOCKS to avoid lock-order inversion with the
+        // physical allocator's per-order locks).
+        let mut reclaim_phys: Option<(u64, u64)> = None; // (phys_addr, num_pages)
 
-        // Find slab via raw pointer to avoid borrow conflicts
-        let slab_ptr = self.find_slab_ptr(obj);
-        if slab_ptr.is_null() {
-            return;
-        }
+        {
+            let _g = CACHE_LOCKS[cache_idx].lock();
 
-        let was_full = (*slab_ptr).is_full();
-        (*slab_ptr).free_obj(obj);
-        let now_empty = (*slab_ptr).is_empty();
-
-        if was_full && !now_empty {
-            // Full -> Partial: move from full list to partial list
-            Self::remove_full_ptr(self, slab_ptr);
-            Self::push_partial_ptr(self, slab_ptr);
-        }
-        if now_empty {
-            Self::remove_from_any_list(self, slab_ptr);
-            // Reclaim: return empty slab pages to the physical allocator
-            let slab_base = (*slab_ptr).slab_base as u64;
-            let order = (*slab_ptr).order;
-            let num_pages = 1usize << order;
-            let phys_addr = slab_base - virt::HIGHER_HALF;
-            // Pass the virtual address to virt::unmap (Bug 5 fix:
-            // previously passed phys_addr = slab_base - HIGHER_HALF,
-            // which is a physical address — virt::unmap expects a
-            // virtual address).
-            for p in 0..num_pages {
-                virt::unmap(slab_base + (p as u64) * phys::PAGE_SIZE);
+            // Find slab via raw pointer to avoid borrow conflicts
+            let slab_ptr = self.find_slab_ptr(obj);
+            if slab_ptr.is_null() {
+                return;
             }
-            phys::free_pages(phys_addr, num_pages as u64);
+
+            let was_full = (*slab_ptr).is_full();
+            (*slab_ptr).free_obj(obj);
+            let now_empty = (*slab_ptr).is_empty();
+
+            if was_full && !now_empty {
+                // Full -> Partial: move from full list to partial list
+                Self::remove_full_ptr(self, slab_ptr);
+                Self::push_partial_ptr(self, slab_ptr);
+            }
+            if now_empty {
+                Self::remove_from_any_list(self, slab_ptr);
+                // Reclaim: return empty slab pages to the physical allocator
+                let slab_base = (*slab_ptr).slab_base as u64;
+                let order = (*slab_ptr).order;
+                let num_pages = 1u64 << order;
+                let phys_addr = slab_base - virt::HIGHER_HALF;
+                for p in 0..num_pages as u64 {
+                    virt::unmap(slab_base + p * phys::PAGE_SIZE);
+                }
+                reclaim_phys = Some((phys_addr, num_pages));
+            }
+        } // CACHE_LOCKS[cache_idx] released here
+
+        // Free physical pages outside the lock to maintain consistent
+        // lock ordering: CACHE_LOCKS -> (released) -> phys locks.
+        if let Some((phys_addr, num_pages)) = reclaim_phys {
+            phys::free_pages(phys_addr, num_pages);
         }
     }
 
@@ -501,17 +510,26 @@ impl CacheAllocator {
         match idx {
             Some(i) => self.caches[i].free(ptr, i),
             None => {
+                // Must compute the allocation order the same way kmalloc_aligned
+                // does to free the full buddy block (not just ceil(size/PAGE_SIZE)
+                // pages, which would leak the remainder).
                 let pages = (size + phys::PAGE_SIZE as usize - 1) / phys::PAGE_SIZE as usize;
+                let order = {
+                    let mut o = 0usize;
+                    while (1usize << o) < pages { o += 1; }
+                    if o > 10 { return; }
+                    o
+                };
+                let alloc_count = 1usize << order;
                 let virt_base = ptr as u64;
+                // Unmap all mapped pages (pages count, which may be < alloc_count).
                 for i in 0..pages {
                     let addr = virt_base + (i as u64) * phys::PAGE_SIZE;
-                    let phys_addr = addr - virt::HIGHER_HALF;
-                    // Unmap the virtual mapping before freeing the physical
-                    // page (Bug 6 fix: previously only freed physical pages,
-                    // leaving stale PTEs pointing to now-free memory).
                     virt::unmap(addr);
-                    phys::free_page(phys_addr);
                 }
+                // Free the full buddy block (alloc_count pages).
+                let phys_addr = virt_base - virt::HIGHER_HALF;
+                phys::free_pages(phys_addr, alloc_count as u64);
             }
         }
     }
@@ -556,4 +574,62 @@ unsafe impl GlobalAlloc for GlobalAllocator {
         }
         unsafe { (*a).kfree(ptr, layout.size()) };
     }
+}
+
+/// Per-cache slab statistics.
+#[derive(Copy, Clone)]
+pub struct SlabCacheStat {
+    pub obj_size: usize,
+    pub slab_count: [usize; 3], // [partial, full, free]
+    pub total_objs: usize,
+    pub free_objs: usize,
+}
+
+/// Collect stats for all slab caches. Returns array of 9 entries (one per cache size).
+pub fn slab_stats() -> [SlabCacheStat; 9] {
+    let mut result = [SlabCacheStat {
+        obj_size: 0,
+        slab_count: [0usize; 3],
+        total_objs: 0,
+        free_objs: 0,
+    }; 9];
+
+    let a = unsafe { &*allocator_ptr() };
+    if !a.initialized.load(Ordering::Acquire) {
+        return result;
+    }
+
+    let sizes = [32usize, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+
+    for (i, cache) in a.caches.iter().enumerate() {
+        let _g = CACHE_LOCKS[i].lock();
+        result[i].obj_size = sizes[i];
+
+        // Walk partial list
+        let mut cur = cache.partial;
+        while !cur.is_null() {
+            result[i].slab_count[0] += 1;
+            result[i].total_objs += unsafe { (*cur).total_objs } as usize;
+            result[i].free_objs += unsafe { (*cur).free_objs } as usize;
+            cur = unsafe { (*cur).next };
+        }
+        // Walk full list
+        let mut cur = cache.full;
+        while !cur.is_null() {
+            result[i].slab_count[1] += 1;
+            result[i].total_objs += unsafe { (*cur).total_objs } as usize;
+            result[i].free_objs += unsafe { (*cur).free_objs } as usize;
+            cur = unsafe { (*cur).next };
+        }
+        // Walk free list
+        let mut cur = cache.free;
+        while !cur.is_null() {
+            result[i].slab_count[2] += 1;
+            result[i].total_objs += unsafe { (*cur).total_objs } as usize;
+            result[i].free_objs += unsafe { (*cur).free_objs } as usize;
+            cur = unsafe { (*cur).next };
+        }
+    }
+
+    result
 }

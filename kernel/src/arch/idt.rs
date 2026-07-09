@@ -8,7 +8,7 @@ use crate::sync::SyncUnsafeCell;
 
 const KERNEL_CODE_SEL: u16 = super::gdt::KERNEL_CODE_SEL;
 
-/// IDTR register value — 10 bytes: 2-byte limit + 8-byte base.
+/// IDTR register value -- 10 bytes: 2-byte limit + 8-byte base.
 /// Must remain packed to match the CPU's `lidt` operand format.
 #[repr(C, packed)]
 struct Idtr {
@@ -16,7 +16,7 @@ struct Idtr {
     base: u64,
 }
 
-/// 64-bit IDT gate descriptor — 16 bytes.
+/// 64-bit IDT gate descriptor -- 16 bytes.
 /// Must remain packed to match the CPU's interrupt gate descriptor format.
 #[repr(C, packed)]
 struct IdtEntry {
@@ -58,7 +58,7 @@ impl IdtEntry {
 
 /// Full register state saved by exception/IRQ stubs.
 ///
-/// Stack layout after stub pushes (low address → high):
+/// Stack layout after stub pushes (low address -> high):
 ///   [rsp+0x00] r15          ← TrapFrame base (passed as &TrapFrame)
 ///   [rsp+0x08] r14
 ///   [rsp+0x10] r13
@@ -295,7 +295,7 @@ use lodaxos_system::MAX_CPUS;
 
 /// Per-CPU IDTR. Although the IDT contents are shared (handlers are
 /// CPU-agnostic), the IDTR register itself must be loaded by each CPU.
-/// On x86, the IDTR is a CPU-local register — every CPU can have a
+/// On x86, the IDTR is a CPU-local register -- every CPU can have a
 /// different IDT base.  We share the IDT contents but give each CPU
 /// its own IDTR slot so the SMP trampoline can `lidt` to a per-CPU
 /// pointer (the trampoline mailbox stores the IDT pointer directly,
@@ -316,15 +316,26 @@ pub fn idt_ptr_limit_base(slot: usize) -> (u16, u64) {
     unsafe { ((*IDTR_TABLE.get())[slot].limit, (*IDTR_TABLE.get())[slot].base) }
 }
 
-/// Backwards-compat alias (returns the BSP's IDTR pointer address).
-/// TODO: remove once all call sites use `idt_pointer_for_slot` directly.
-pub fn idt_pointer_address() -> u64 {
-    idt_pointer_for_slot(0)
-}
-
 // ---- Tick counter ----
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-vector interrupt count. 256 vectors (0-255) for x86 IDT.
+static IRQ_COUNTS: [AtomicU64; 256] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; 256]
+};
+
+/// Increment the count for a given interrupt vector.
+#[inline]
+pub fn count_irq(vector: u8) {
+    IRQ_COUNTS[vector as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Read the count for a given interrupt vector.
+pub fn read_irq_count(vector: u8) -> u64 {
+    IRQ_COUNTS[vector as usize].load(Ordering::Relaxed)
+}
 static PIT_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Debug counter for verifying the timer ISR fires after context switches.
@@ -360,7 +371,7 @@ pub fn disable_interrupts() {
 }
 
 /// Mask all 8259 PIC interrupts.
-/// Writes 0xFF to the OCW1 (IMR) registers — no ICW init needed since we
+/// Writes 0xFF to the OCW1 (IMR) registers -- no ICW init needed since we
 /// use the IOAPIC exclusively and never want a PIC interrupt to fire.
 pub fn mask_pic() {
     use x86_64::instructions::port::Port;
@@ -380,7 +391,7 @@ pub fn init() {
             (*IDTR_TABLE.get())[slot].base = idt_base;
         }
 
-        // Wire exception vectors 0–31
+        // Wire exception vectors 0--31
         set_gate(0, stub_de as *const () as u64, 0);
         set_gate(1, stub_db as *const () as u64, 0);
         set_gate(2, stub_nmi as *const () as u64, 3); // IST3 for NMI (Bug 33)
@@ -413,8 +424,8 @@ pub fn init() {
         set_gate(30, stub_exc_30 as *const () as u64, 0);
         set_gate(31, stub_exc_31 as *const () as u64, 0);
 
-        // Wire IRQ vectors 32–63
-        set_gate(32, stub_irq0 as *const () as u64, 2); // IST2
+        // Wire IRQ vectors 32--63
+        set_gate(32, stub_irq0 as *const () as u64, 0); // no IST — frame on kernel stack so we can recover pre-interrupt RSP
         set_gate(33, stub_irq1 as *const () as u64, 2);
         set_gate(34, stub_irq2 as *const () as u64, 2);
         set_gate(35, stub_irq3 as *const () as u64, 2);
@@ -494,7 +505,7 @@ extern "C" fn interrupt_dispatcher(frame: &mut TrapFrame) {
     let pending = crate::percpu::PERCPU[cpu_slot].pending_tlb_flush.swap(0, Ordering::Acquire);
     if pending == u64::MAX {
         // Full TLB flush was requested (multiple addresses were pending
-        // and at least one was overwritten — Bug 12 fix).
+        // and at least one was overwritten -- Bug 12 fix).
         unsafe { core::arch::asm!("mov rax, cr3; mov cr3, rax") };
     } else if pending != 0 {
         unsafe { core::arch::asm!("invlpg [{}]", in(reg) pending) };
@@ -502,7 +513,12 @@ extern "C" fn interrupt_dispatcher(frame: &mut TrapFrame) {
 
     let vector = frame.vector;
 
-    // NMI (vector 2) must be handled with minimal, lock‑free code
+    // Count every interrupt/exception for irqstat
+    if vector < 256 {
+        count_irq(vector as u8);
+    }
+
+    // NMI (vector 2) must be handled with minimal, lock-free code
     // because it can fire during any critical section (Bug 33).
     if vector == 2 {
         nmi_counter();
@@ -518,6 +534,21 @@ extern "C" fn interrupt_dispatcher(frame: &mut TrapFrame) {
     }
 }
 
+// Null writer used to compute instruction lengths without output.
+struct NullWrite;
+impl core::fmt::Write for NullWrite {
+    fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }
+}
+
+/// Wait loop entered after a breakpoint or single-step halts the vCPU.
+/// Timer interrupts will fire, the ISR polls katerm, and the user can
+/// inspect state and type `cont()` to resume.
+extern "C" fn katerm_breakpoint_wait() {
+    loop {
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    }
+}
+
 fn exception_handler(frame: &mut TrapFrame, vector: u64) {
     let rip = frame.rip;
     let error = frame.error_code;
@@ -528,22 +559,111 @@ fn exception_handler(frame: &mut TrapFrame, vector: u64) {
 
     match vector {
         0 => log::error!("#DE Divide Error"),
-        1 => log::error!("#DB Debug Exception"),
+        1 => {
+            log::error!("#DB Debug Exception at RIP={:#x}", rip);
+            let dr6: u64;
+            unsafe { core::arch::asm!("mov {}, dr6", out(reg) dr6) };
+            // Single-step (TF)
+            if dr6 & 0x4000 != 0 {
+                let cpu = crate::scheduler::current_cpu_slot();
+                let vcpu_id = crate::percpu::current_vcpu(cpu) as u32;
+                let step_id = crate::katerm::termcmds::STEP_VCPU.load(core::sync::atomic::Ordering::SeqCst);
+                if vcpu_id as i32 == step_id {
+                    let idle_id = crate::percpu::idle_vcpu(cpu);
+                    frame.rflags &= !0x100;
+                    crate::katerm::termcmds::BP_HIT_VCPU.store(vcpu_id as i32, core::sync::atomic::Ordering::SeqCst);
+                    crate::katerm::termcmds::BP_HIT_RIP.store(rip, core::sync::atomic::Ordering::SeqCst);
+                    crate::katerm::termcmds::BP_HIT_VECTOR.store(1, core::sync::atomic::Ordering::SeqCst);
+                    crate::katerm::termcmds::STEP_VCPU.store(-1, core::sync::atomic::Ordering::SeqCst);
+                    crate::vcpu::with_mut(vcpu_id, |v| {
+                        if let Some(vcpu) = v {
+                            vcpu.saved_frame = *frame;
+                            vcpu.state = crate::vcpu::VcpuState::Halted;
+                        }
+                    });
+                    crate::percpu::set_current_vcpu(cpu, idle_id as usize);
+                    frame.rip = katerm_breakpoint_wait as *const () as u64;
+                    frame.cs = 0x08;
+                    frame.rflags = 0x202;
+                    log::warn!("katerm: single-step complete, vCPU {} halted", vcpu_id);
+                    return;
+                }
+            }
+            // Watchpoint (DR0 match)
+            if dr6 & 1 != 0 {
+                let cpu = crate::scheduler::current_cpu_slot();
+                let vcpu_id = crate::percpu::current_vcpu(cpu) as u32;
+                let idle_id = crate::percpu::idle_vcpu(cpu);
+                unsafe { core::arch::asm!("mov dr6, {val}", val = in(reg) (dr6 & !1u64)) };
+                crate::katerm::termcmds::BP_HIT_VCPU.store(vcpu_id as i32, core::sync::atomic::Ordering::SeqCst);
+                crate::katerm::termcmds::BP_HIT_RIP.store(rip, core::sync::atomic::Ordering::SeqCst);
+                crate::katerm::termcmds::BP_HIT_VECTOR.store(1, core::sync::atomic::Ordering::SeqCst);
+                crate::vcpu::with_mut(vcpu_id, |v| {
+                    if let Some(vcpu) = v {
+                        vcpu.saved_frame = *frame;
+                        vcpu.state = crate::vcpu::VcpuState::Halted;
+                    }
+                });
+                crate::percpu::set_current_vcpu(cpu, idle_id as usize);
+                frame.rip = katerm_breakpoint_wait as *const () as u64;
+                frame.cs = 0x08;
+                frame.rflags = 0x202;
+                log::warn!("katerm: watchpoint hit, vCPU {} halted", vcpu_id);
+                return;
+            }
+            resolved = true;
+        }
         2 => log::error!("NMI"),
-        3 => log::info!("#BP Breakpoint at RIP={:#x}", rip),
+        3 => {
+            let bp_addr = rip.wrapping_sub(1);
+            log::info!("#BP Breakpoint at RIP={:#x} (addr={:#x})", rip, bp_addr);
+            for bp in crate::katerm::termcmds::BREAKPOINTS.iter() {
+                let baddr = bp.addr.load(core::sync::atomic::Ordering::SeqCst);
+                if baddr == bp_addr {
+                    let original = bp.original_byte.load(core::sync::atomic::Ordering::SeqCst);
+                    unsafe { core::ptr::write_volatile(baddr as *mut u8, original); }
+                    break;
+                }
+            }
+            let cpu = crate::scheduler::current_cpu_slot();
+            let vcpu_id = crate::percpu::current_vcpu(cpu) as u32;
+            let idle_id = crate::percpu::idle_vcpu(cpu);
+            crate::katerm::termcmds::BP_HIT_VCPU.store(vcpu_id as i32, core::sync::atomic::Ordering::SeqCst);
+            crate::katerm::termcmds::BP_HIT_RIP.store(bp_addr, core::sync::atomic::Ordering::SeqCst);
+            crate::katerm::termcmds::BP_HIT_VECTOR.store(3, core::sync::atomic::Ordering::SeqCst);
+            crate::vcpu::with_mut(vcpu_id, |v| {
+                if let Some(vcpu) = v {
+                    vcpu.saved_frame = *frame;
+                    vcpu.state = crate::vcpu::VcpuState::Halted;
+                }
+            });
+            crate::percpu::set_current_vcpu(cpu, idle_id as usize);
+            frame.rip = katerm_breakpoint_wait as *const () as u64;
+            frame.cs = 0x08;
+            frame.rflags = 0x202;
+            log::warn!("katerm: breakpoint hit, vCPU {} halted at {:#x}", vcpu_id, bp_addr);
+            return;
+        }
         4 => log::error!("#OF Overflow"),
         5 => log::error!("#BR Bound Range Exceeded"),
         6 => log::error!("#UD Invalid Opcode"),
         7 => log::error!("#NM Device Not Available"),
+        8 => {
+            log::error!("#DF Double Fault err={:#x}", error);
+            log::error!("  The CPU was unable to invoke a double-fault handler.");
+            log::error!("  This typically indicates a corrupted kernel stack or IDT.");
+        }
         10 => log::error!("#TS Invalid TSS err={:#x}", error),
         11 => log::error!("#NP Segment Not Present err={:#x}", error),
         12 => log::error!("#SS Stack Segment Fault err={:#x}", error),
         13 => {
             log::error!("#GP General Protection Fault err={:#x}", error);
             if error != 0 {
-                let index = (error >> 3) & 0xFFFF;
-                let ti = (error >> 1) & 1;
-                log::error!("  selector index={} TI={}", index, ti);
+                let ext = error & 1;
+                let idt = (error >> 1) & 1;
+                let ti  = (error >> 2) & 1;
+                let index = (error >> 3) & 0x1FFF;
+                log::error!("  selector index={} TI={} IDT={} EXT={}", index, ti, idt, ext);
             }
         }
         14 => {
@@ -572,18 +692,80 @@ fn exception_handler(frame: &mut TrapFrame, vector: u64) {
         _ => log::error!("Unknown exception #{}", vector),
     }
 
-    if !resolved && vector != 3 {
-        // Check if the faulting vCPU belongs to a GDF service
-        let vcpu_id = crate::scheduler::current_vcpu_id();
-        let vcpu_type = crate::vcpu::get_vcpu_type(vcpu_id);
-        if vcpu_type == VcpuType::HardwareDriver || vcpu_type == VcpuType::AbstractionDriver {
-            log::warn!("GDF service crashed — attempting restart");
-            crate::gdf::handle_crash(vcpu_id);
-            crate::gdf::switch_frame_to_idle(frame);
-            // frame is now the idle vCPU's frame — iretq goes to idle loop
+    if !resolved {
+        // Katerm fault recovery: if a katerm operation armed the recovery
+        // flag, skip past the faulting instruction instead of halting.
+        if (vector == 13 || vector == 14)
+            && crate::arch::dump::KATERM_RECOVERY.load(Ordering::SeqCst)
+        {
+            crate::arch::dump::KATERM_RECOVERY.store(false, Ordering::SeqCst);
+
+            // Read instruction bytes at faulting RIP to compute length
+            let rip = frame.rip;
+            let mut buf = [0u8; 15];
+            let mut n = 0usize;
+            while n < 15 {
+                let addr = rip + n as u64;
+                if crate::mm::virt::translate(addr).is_none() { break; }
+                buf[n] = unsafe { core::ptr::read_volatile(addr as *const u8) };
+                n += 1;
+            }
+            let mut nw = NullWrite;
+            if let Some(len) = crate::arch::disasm::disasm_one(rip, &buf[..n], &mut nw) {
+                frame.rip += len as u64;
+            } else {
+                frame.rip += 1; // fallback: skip 1 byte
+            }
+            log::warn!(
+                "katerm: skipped fault #{} at RIP={:#x} (+{:#x})",
+                vector, rip, frame.rip - rip
+            );
             return;
         }
+
+        // Determine whether the fault is recoverable.  Double faults,
+        // machine checks, and any kernel-space fault are always fatal --
+        // attempting GDF service recovery on a corrupted kernel state
+        // makes things worse.
+        let is_kernel_fault = frame.rip >= crate::mm::virt::HIGHER_HALF;
+        let is_fatal = vector == 8 || vector == 18 || is_kernel_fault;
+
+        if !is_fatal {
+            // Check if the faulting vCPU belongs to a GDF service
+            let vcpu_id = crate::scheduler::current_vcpu_id();
+            let vcpu_type = crate::vcpu::get_vcpu_type(vcpu_id);
+            if vcpu_type == VcpuType::HardwareDriver || vcpu_type == VcpuType::AbstractionDriver {
+                log::warn!("GDF service crashed -- attempting restart + recover to next driver");
+                crate::gdf::handle_crash(vcpu_id);
+                // Try to switch to the next ready driver vCPU; fall back to idle
+                if let Some((new_pml4, new_kstack_top)) = crate::gdf::switch_frame_to_next_driver(frame) {
+                    // Switch CR3 to the new driver's page table.  All PML4s
+                    // share the higher-half entries, so the current stack
+                    // remains accessible after the switch.
+                    unsafe {
+                        core::arch::asm!("mfence", "mov cr3, {}", in(reg) new_pml4);
+                    }
+                    // Update TSS.rsp0 so the next interrupt enters the new
+                    // driver's kernel stack, not the crashed driver's.
+                    let cpu = crate::scheduler::current_cpu_slot();
+                    unsafe {
+                        crate::arch::gdt::tss_set_rsp0_for_slot(
+                            cpu % MAX_CPUS,
+                            new_kstack_top,
+                        );
+                    }
+                    crate::percpu::PERCPU[cpu % MAX_CPUS]
+                        .kernel_stack_top
+                        .store(new_kstack_top, core::sync::atomic::Ordering::Release);
+                } else {
+                    crate::gdf::switch_frame_to_idle(frame);
+                }
+                // frame is now the next vCPU's frame -- iretq resumes it
+                return;
+            }
+        }
         super::dump::dump_full_fault(frame, vector);
+        super::dump::save_rescue_state(frame, vector);
         super::dump::halt_loop();
     }
 }
@@ -601,7 +783,19 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
 
     match vector {
             32 => {
-            // LAPIC timer — scheduler heartbeat
+            // In halt mode (after a fatal fault) the scheduler must not
+            // run -- state may be corrupted.  Only service katerm input
+            // and return immediately.
+            if crate::arch::dump::HALT_MODE.load(Ordering::Acquire) {
+                if super::apic::is_initialized() {
+                    super::apic::send_eoi();
+                }
+                #[cfg(debug_assertions)]
+                crate::katerm::process_input();
+                return;
+            }
+
+            // LAPIC timer -- scheduler heartbeat
             let t = crate::percpu::tick();
             let cpu = crate::percpu::apic_id_to_slot(crate::percpu::current_apic_id());
             // Per-CPU rate-limited timer log.  Each CPU logs every
@@ -614,10 +808,10 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                 );
             }
 
-            // Preemptive context switch — every CPU runs the scheduler
+            // Preemptive context switch -- every CPU runs the scheduler
             // on each timer tick.
             if crate::scheduler::is_initialized() {
-                // FPU buffer owned by this scope — fixes Bug: dangling pointer
+                // FPU buffer owned by this scope -- fixes Bug: dangling pointer
                 // when schedule() returned a pointer to its own local.
                 let mut fpu_buf = crate::arch::FpuState([0u8; 512]);
                 // Initialise with a clean FPU state so idle gets sane defaults.
@@ -628,14 +822,21 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                 if super::apic::is_initialized() {
                     super::apic::send_eoi();
                 }
+                // Poll katerm COM2 input on every timer tick.  This ensures the
+                // pre-boot "bootkaterm" handshake is processed even when driver
+                // VCPUs are always runnable and the idle VCPU never gets CPU time.
+                #[cfg(debug_assertions)]
+                crate::katerm::process_input();
                 if switched {
-                    log::info!("sched: switch RSP={:#x} RIP={:#x} CS={:#x}", frame.rsp, frame.rip, frame.cs);
+                    if fires % 50 == 1 {
+                        log::info!("sched: switch RSP={:#x} RIP={:#x} CS={:#x}", frame.rsp, frame.rip, frame.cs);
+                    }
                     unsafe { crate::arch::context_switch(frame, next_pml4, &fpu_buf); }
                 }
             }
         }
         _ => {
-            // Device IRQs — look up by vector to find ISA source
+            // Device IRQs -- look up by vector to find ISA source
             if let Some(isa_source) = crate::intr::lookup_vector_isa(vector as u8) {
                 match isa_source {
                     0 => {
@@ -650,36 +851,44 @@ fn irq_handler(frame: &mut TrapFrame, vector: u64) {
                     _ => {}
                 }
             }
+            // Check for runtime-registered IRQ handlers (drivers).
+            // If a driver registered this vector, wake it so it can process the IRQ.
+            let driver_vcpu = crate::intr::lookup_vector_driver(vector as u8);
+            if driver_vcpu != 0 {
+                crate::scheduler::wake(driver_vcpu as u64);
+            }
         }
     }
 }
 
-// ---- Syscall dispatcher ───────────────────────────────────────────
+// ---- Syscall dispatcher -------------------------------------------
 //
 // Entry via `syscall` instruction.  IA32_LSTAR points here.
 // Syscall numbers and access by VcpuType:
 //
-//  Nr │ Name             │ N  HW  AB  │ Description
-// ─────┼──────────────────┼────────────┼─────────────────────────
-//   0  │ yield            │ ✓  ✓  ✓   │ Yield vCPU
-//   1  │ exit             │ ✓  ✓  ✓   │ Halt vCPU
-//   2  │ get_vcpu_id      │ ✓  ✓  ✓   │ Return VcpuId
-//   3  │ wake             │ ✓  ✓  ✓   │ Wake another vCPU
-//   4  │ get_ticks        │ ✓  ✓  ✓   │ Uptime ticks
-//   5  │ mmap             │ ✓  ✓  ✓   │ Allocate + map pages
-//   6  │ munmap           │ ✓  ✓  ✓   │ Unmap + free pages
-//   7  │ create_gang      │ ✓  ✓  ✓   │ Spawn new vCPU gang
-// ─────┼──────────────────┼────────────┼─────────────────────────
-//  10  │ mmap_phys        │    ✓      │ Map MMIO, always UC
-//  11  │ register_intr    │    ✓      │ Register IRQ handler
-//  12  │ intr_ack         │    ✓      │ EOI
-//  13  │ dma_alloc        │    ✓      │ Allocate DMA buffer
-//  14  │ dma_free         │    ✓      │ Free DMA buffer
-//  15  │ pci_config       │    ✓      │ PCI config space R/W
-// ─────┼──────────────────┼────────────┼─────────────────────────
-//  20  │ driver_recv      │       ✓  ✓│ Read kernel→driver mailbox
-//  21  │ driver_send      │       ✓  ✓│ Write driver→kernel response
-//  30  │ gdf_register     │       ✓  ✓│ Register driver name
+//  Nr | Name             | N  HW  AB  | Description
+// -----+------------------+------------+-------------------------
+//   0  | yield            | y  y  y   | Yield vCPU
+//   1  | exit             | y  y  y   | Halt vCPU
+//   2  | get_vcpu_id      | y  y  y   | Return VcpuId
+//   3  | wake             | y  y  y   | Wake another vCPU
+//   4  | get_ticks        | y  y  y   | Uptime ticks
+//   5  | mmap             | y  y  y   | Allocate + map pages
+//   6  | munmap           | y  y  y   | Unmap + free pages
+//   7  | create_gang      | y  y  y   | Spawn new vCPU gang
+// -----+------------------+------------+-------------------------
+//  10  | mmap_phys        |    y      | Map MMIO, always UC
+//  11  | register_intr    |    y      | Register IRQ handler
+//  12  | intr_ack         |    y      | EOI
+//  13  | dma_alloc        |    y      | Allocate DMA buffer
+//  14  | dma_free         |    y      | Free DMA buffer
+//  15  | pci_config       |    y      | PCI config space R/W
+// -----+------------------+------------+-------------------------
+//  20  | driver_recv      |       y  y| Read kernel->driver mailbox
+//  21  | driver_send      |       y  y| Write driver->kernel response
+//  22  | driver_recv_block|       y  y| Blocking read from mailbox
+//  30  | gdf_register     |       y  y| Register driver name
+//  31  | driver_call      |       y  y| Synchronous driver RPC
 
 use crate::vcpu::VcpuType;
 
@@ -717,18 +926,23 @@ fn copy_to_user(src: &[u64], dst: u64) -> Result<(), ()> {
         return Err(());
     }
     // Probe each 4 KB page for writability by checking the PTE.
+    // Accept COW pages (WRITABLE=0, COW=1) since the page fault handler
+    // will resolve them on write.
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
     let mut addr = dst;
     while addr < end {
-        if let Some(pte) = crate::mm::virt::read_pte(cr3 & !0xFFF, addr) {
-            if pte & 1 == 0 || pte & 2 == 0 {
-                return Err(());  // not present or not writable
+        if let Some(pte) = crate::mm::virt::read_pte(cr3 & 0x000F_FFFF_FFFF_F000, addr) {
+            let present = pte & 1 != 0;
+            let writable = pte & 2 != 0;
+            let cow = pte & crate::mm::virt::COW != 0;
+            if !present || (!writable && !cow) {
+                return Err(());  // not present, or not writable and not COW
             }
         } else {
             return Err(());
         }
-        addr = (addr & !0xFFF) + 0x1000;
+        addr = (addr & 0x000F_FFFF_FFFF_F000) + 0x1000;
     }
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u64, src.len());
@@ -742,7 +956,7 @@ pub extern "C" fn syscall_entry() {
         // RCX = return RIP, R11 = saved RFLAGS (set by SYSCALL instruction)
         //
         // IMPORTANT: SYSCALL does NOT change RSP.  If we came from user
-        // mode (CPL3), RSP is the user stack — we must switch to the
+        // mode (CPL3), RSP is the user stack -- we must switch to the
         // per-CPU kernel stack.  If we came from kernel code (CPL0,
         // e.g. `yield_now` from the syscall handler itself), RSP is
         // already the kernel stack.
@@ -754,10 +968,17 @@ pub extern "C" fn syscall_entry() {
         "shr rax, 47",
         "test rax, rax",
         "jnz 1f",
-        // User-mode: switch to per-CPU kernel stack (GS:[kernel_stack_top])
+        // User-mode path: swapgs to kernel GS base, then switch to the
+        // per-CPU kernel stack via gs:[8] (== kernel_stack_top).
+        "swapgs",
         "mov rsp, gs:[8]",
         "test rsp, rsp",
-        "cmovz rsp, r10",
+        "jnz 1f",
+        // kernel_stack_top is 0 -- per-CPU stack not set up.  Halt
+        // rather than silently using the user stack (exploit vector).
+        "3:",
+        "hlt",
+        "jmp 3b",
         "1:",
         "and rsp, -16",
         // Push TrapFrame in reverse field order (ss..r15) so that RSP
@@ -810,6 +1031,11 @@ pub extern "C" fn syscall_entry() {
         "pop rsi",
         "pop rdi",
         "add rsp, 16",
+        // If returning to user mode (CS == 0x1B), swapgs back to user GS.
+        "cmp qword ptr [rsp + 8], 0x1B",
+        "jne 2f",
+        "swapgs",
+        "2:",
         "iretq",
         handler = sym syscall_handler,
     );
@@ -837,7 +1063,7 @@ fn syscall_handler(frame: &mut TrapFrame) {
     let nr = frame.rax;
     let vcpu_type = current_vcpu_type();
 
-    // ── Access control by (VcpuType, syscall_nr) ──
+    // -- Access control by (VcpuType, syscall_nr) --
     let allowed = match (vcpu_type, nr) {
         // Idle vCPU should never syscall
         (VcpuType::Idle, _) => false,
@@ -898,7 +1124,7 @@ fn syscall_handler(frame: &mut TrapFrame) {
     }
 }
 
-// ── Universal syscalls (0-7) ──────────────────────────────────────
+// -- Universal syscalls (0-7) --------------------------------------
 
 fn sys_yield(frame: &mut TrapFrame) {
     if crate::scheduler::is_initialized() {
@@ -927,12 +1153,21 @@ fn sys_get_ticks(frame: &mut TrapFrame) {
     frame.rax = TICKS.load(Ordering::Relaxed);
 }
 
+/// mmap syscall: map anonymous memory into the current address space.
+///
+/// Arguments:
+///   `hint`  — preferred virtual address (0 = kernel picks).
+///   `size`  — requested size in bytes (rounded up to page).
+///             Bit 0 used as flags: bit 0 = MAP_FIXED (unmap first).
+///
+/// Returns the mapped virtual address, or `u64::MAX` on failure.
 fn sys_mmap(frame: &mut TrapFrame, hint: u64, size: u64) {
     if !crate::scheduler::is_initialized() {
         frame.rax = u64::MAX;
         return;
     }
-    let size = size.max(0x1000);
+    let map_fixed = size & 1 != 0;
+    let size = (size & !1).max(0x1000); // strip flags bit, enforce minimum
     let pages = (size + 0xFFF) / 0x1000;
     let phys = match crate::mm::phys::alloc_pages(pages) {
         Some(p) => p,
@@ -940,18 +1175,82 @@ fn sys_mmap(frame: &mut TrapFrame, hint: u64, size: u64) {
     };
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+    let pml4 = cr3 & 0x000F_FFFF_FFFF_F000;
+
     let virt = if hint != 0 {
         if hint >= crate::mm::virt::HIGHER_HALF {
             crate::mm::phys::free_pages(phys, pages);
             frame.rax = u64::MAX;
             return;
         }
+        // Validate hint is page-aligned.
+        if hint & 0xFFF != 0 {
+            crate::mm::phys::free_pages(phys, pages);
+            frame.rax = u64::MAX;
+            return;
+        }
+        // Validate no VMA overlap at the hint address.
+        let vcpu_id = crate::scheduler::current_vcpu_id();
+        let has_overlap = crate::vcpu::with(vcpu_id, |v| {
+            v.map_or(false, |vcpu| {
+                if vcpu.process_mem.0.is_null() {
+                    false
+                } else {
+                    unsafe { (*vcpu.process_mem.0).vma_tree.has_overlap(hint, hint + pages * 0x1000) }
+                }
+            })
+        });
+        if has_overlap {
+            crate::mm::phys::free_pages(phys, pages);
+            frame.rax = u64::MAX;
+            return;
+        }
         hint
     } else {
-        crate::mm::virt::HIGHER_HALF + phys
+        // No hint: bump-allocate from user VA space.
+        let vcpu_id = crate::scheduler::current_vcpu_id();
+        let allocated = crate::vcpu::with(vcpu_id, |v| {
+            v.and_then(|vcpu| {
+                if vcpu.process_mem.0.is_null() {
+                    None
+                } else {
+                    unsafe { (*vcpu.process_mem.0).alloc_user_vaddr(pages * 0x1000) }
+                }
+            })
+        });
+        match allocated {
+            Some(a) => a,
+            None => {
+                crate::mm::phys::free_pages(phys, pages);
+                frame.rax = u64::MAX;
+                return;
+            }
+        }
     };
+
+    // MAP_FIXED: unmap any existing pages in the range before mapping.
+    if map_fixed {
+        for p in 0..pages {
+            let v = virt + p * 0x1000;
+            crate::mm::virt::unmap(v);
+        }
+    }
+
     let map_flags = crate::mm::virt::DATA | crate::mm::virt::USER;
-    unsafe { crate::mm::virt::map_contiguous(cr3 & !0xFFF, virt, phys, pages, map_flags) };
+    unsafe { crate::mm::virt::map_contiguous(pml4, virt, phys, pages, map_flags) };
+
+    // Register VMA in the current vCPU's ProcessMemory for demand paging.
+    let vcpu_id = crate::scheduler::current_vcpu_id();
+    crate::vcpu::with(vcpu_id, |v| {
+        if let Some(vcpu) = v {
+            if !vcpu.process_mem.0.is_null() {
+                unsafe {
+                    (*vcpu.process_mem.0).add_vma(virt, virt + pages * 0x1000, crate::mm::vma::VmaPerm::ReadWrite);
+                }
+            }
+        }
+    });
+
     frame.rax = virt;
 }
 
@@ -966,16 +1265,42 @@ fn sys_munmap(frame: &mut TrapFrame, addr: u64, size: u64) {
     }
     let size = size.max(0x1000);
     let pages = (size + 0xFFF) / 0x1000;
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+    let pml4 = cr3 & !0xFFF;
     for p in 0..pages {
         let virt = addr + p * 0x1000;
+        // Read the PTE before unmapping to check the COW bit.
+        let is_cow = if let Some(pte) = crate::mm::virt::read_pte(pml4, virt) {
+            pte & crate::mm::virt::COW != 0
+        } else {
+            false
+        };
         if let Some(phys) = crate::mm::virt::translate(virt) {
-            let phys_page = phys & !0xFFF;
+            let phys_page = phys & 0x000F_FFFF_FFFF_F000;
             crate::mm::virt::unmap(virt);
-            crate::mm::phys::free_page(phys_page);
+            // Only free the physical page if it is NOT a COW page.
+            // COW pages are shared with another process's PML4;
+            // freeing them here would cause use-after-free in the parent.
+            if !is_cow {
+                crate::mm::phys::free_page(phys_page);
+            }
         } else {
             crate::mm::virt::unmap(virt);
         }
     }
+
+    // Remove the VMA from the current vCPU's ProcessMemory so that
+    // find_covering won't return stale entries for unmapped addresses.
+    let vcpu_id = crate::scheduler::current_vcpu_id();
+    crate::vcpu::with(vcpu_id, |v| {
+        if let Some(vcpu) = v {
+            if !vcpu.process_mem.0.is_null() {
+                unsafe { (*vcpu.process_mem.0).vma_tree.remove(addr); }
+            }
+        }
+    });
+
     frame.rax = 0;
 }
 
@@ -998,7 +1323,7 @@ fn sys_create_gang(frame: &mut TrapFrame, entry: u64, n_vcpus: u64, name_ptr: u6
         .unwrap_or(u64::MAX);
 }
 
-// ── Hardware driver syscalls (10-15) ──────────────────────────────
+// -- Hardware driver syscalls (10-15) ------------------------------
 
 #[inline(never)]
 fn sys_mmap_phys(frame: &mut TrapFrame, phys: u64, size: u64) {
@@ -1007,7 +1332,16 @@ fn sys_mmap_phys(frame: &mut TrapFrame, phys: u64, size: u64) {
         Some(vcpu) => vcpu.pml4,
         None => { frame.rax = u64::MAX; return; }
     };
+    // Reject physical address 0 (null mapping) and prevent wrap-around.
+    if phys == 0 || size == 0 {
+        frame.rax = u64::MAX;
+        return;
+    }
     let pages = size.max(0x1000).saturating_add(0xFFF) / 0x1000;
+    if phys.checked_add(pages * 0x1000).is_none() {
+        frame.rax = u64::MAX;
+        return;
+    }
     let flags = crate::mm::virt::PRESENT
         | crate::mm::virt::WRITABLE
         | crate::mm::virt::CACHE_DISABLE
@@ -1020,11 +1354,17 @@ fn sys_mmap_phys(frame: &mut TrapFrame, phys: u64, size: u64) {
     frame.rax = phys;
 }
 
-fn sys_register_intr(frame: &mut TrapFrame, vector: u64, _handler_vaddr: u64) {
-    // Stub — interrupt routing will be implemented with the IOAPIC driver.
-    // For now, reserve the vector and acknowledge.
-    log::warn!("sys_register_intr: not yet implemented (vector={})", vector);
-    frame.rax = u64::MAX;
+fn sys_register_intr(frame: &mut TrapFrame, gsi: u64, _handler_vaddr: u64) {
+    let vcpu_id = crate::scheduler::current_vcpu_id();
+    match crate::intr::register_irq(gsi as u32, vcpu_id) {
+        Some(vector) => {
+            frame.rax = vector as u64;
+        }
+        None => {
+            log::warn!("sys_register_intr: failed to register IRQ gsi={}", gsi);
+            frame.rax = u64::MAX;
+        }
+    }
 }
 
 fn sys_intr_ack(frame: &mut TrapFrame, _vector: u64) {
@@ -1037,6 +1377,21 @@ fn sys_dma_alloc(frame: &mut TrapFrame, size: u64) {
     let pages = size.max(0x1000).saturating_add(0xFFF) / 0x1000;
     match crate::mm::phys::alloc_pages(pages) {
         Some(phys) => {
+            let user_dma_flags = crate::mm::virt::DATA | crate::mm::virt::USER;
+            unsafe {
+                crate::mm::virt::map_contiguous(
+                    crate::mm::virt::kernel_pml4(),
+                    crate::mm::virt::HIGHER_HALF + phys,
+                    phys,
+                    pages,
+                    user_dma_flags,
+                );
+            }
+            for page in 0..pages {
+                crate::mm::virt::flush_page_all(
+                    crate::mm::virt::HIGHER_HALF + phys + page * 0x1000,
+                );
+            }
             unsafe {
                 core::ptr::write_bytes(
                     (crate::mm::virt::HIGHER_HALF + phys) as *mut u8,
@@ -1044,7 +1399,25 @@ fn sys_dma_alloc(frame: &mut TrapFrame, size: u64) {
                     (pages * 0x1000) as usize,
                 );
             }
-            crate::gdf::track_service_dma(vcpu_id, phys, pages);
+            if !crate::gdf::track_service_dma(vcpu_id, phys, pages) {
+                unsafe {
+                    crate::mm::virt::map_contiguous(
+                        crate::mm::virt::kernel_pml4(),
+                        crate::mm::virt::HIGHER_HALF + phys,
+                        phys,
+                        pages,
+                        crate::mm::virt::DATA,
+                    );
+                }
+                for page in 0..pages {
+                    crate::mm::virt::flush_page_all(
+                        crate::mm::virt::HIGHER_HALF + phys + page * 0x1000,
+                    );
+                }
+                crate::mm::phys::free_pages(phys, pages);
+                frame.rax = u64::MAX;
+                return;
+            }
             frame.rax = phys;
         }
         None => {
@@ -1053,10 +1426,29 @@ fn sys_dma_alloc(frame: &mut TrapFrame, size: u64) {
     }
 }
 
-fn sys_dma_free(frame: &mut TrapFrame, phys: u64, size: u64) {
+fn sys_dma_free(frame: &mut TrapFrame, phys: u64, _size: u64) {
     let vcpu_id = crate::scheduler::current_vcpu_id();
-    let pages = size.max(0x1000).saturating_add(0xFFF) / 0x1000;
-    crate::gdf::untrack_service_dma(vcpu_id, phys);
+    // Only free if the address was actually allocated by this service;
+    // reject arbitrary physical address frees (privilege escalation).
+    let Some(pages) = crate::gdf::untrack_service_dma(vcpu_id, phys) else {
+        log::error!("sys_dma_free: {:#x} not tracked by service", phys);
+        frame.rax = u64::MAX;
+        return;
+    };
+    unsafe {
+        crate::mm::virt::map_contiguous(
+            crate::mm::virt::kernel_pml4(),
+            crate::mm::virt::HIGHER_HALF + phys,
+            phys,
+            pages,
+            crate::mm::virt::DATA,
+        );
+    }
+    for page in 0..pages {
+        crate::mm::virt::flush_page_all(
+            crate::mm::virt::HIGHER_HALF + phys + page * 0x1000,
+        );
+    }
     crate::mm::phys::free_pages(phys, pages);
     frame.rax = 0;
 }
@@ -1120,7 +1512,7 @@ fn sys_pci_config(
     }
 }
 
-// ── Driver IPC syscalls (20-21, 30) ───────────────────────────────
+// -- Driver IPC syscalls (20-21, 30) -------------------------------
 
 fn sys_driver_recv(frame: &mut TrapFrame, buf_ptr: u64) {
     let vcpu_id = crate::scheduler::current_vcpu_id();
@@ -1174,7 +1566,7 @@ fn sys_driver_recv_block(frame: &mut TrapFrame, buf_ptr: u64) {
     frame.rax = 0;
     crate::scheduler::block_current(frame);
 
-    // On wake — read the pending message from the mailbox.
+    // On wake -- read the pending message from the mailbox.
     if let Some((cmd, arg0, arg1, arg2)) = crate::gdf::recv(vcpu_id) {
         let out = [cmd as u64, arg0, arg1, arg2];
         if copy_to_user(&out, buf_ptr).is_ok() {
@@ -1231,7 +1623,7 @@ pub const IPI_VECTOR: u8 = 0x81;
 /// whether to reschedule after an IPI wake.
 pub(crate) static IPI_PENDING: AtomicU64 = AtomicU64::new(0);
 
-fn ipi_handler(_frame: &mut TrapFrame) {
+fn ipi_handler(frame: &mut TrapFrame) {
     // Mark that an IPI was received so the next timer tick knows to
     // re-evaluate the runqueue.  We don't reschedule *here* because
     // the IPI may have interrupted a critical section.
@@ -1248,15 +1640,30 @@ fn ipi_handler(_frame: &mut TrapFrame) {
         crate::mm::virt::TLB_ACK[slot].store(1, Ordering::Release);
     }
 
-    // Send EOI — this handler is dispatched directly (not via irq_handler)
+    // Remote register-dump request (set via dumpremote / dumpall katerm command).
+    let req_slot = crate::arch::dump::DUMP_REQ_SLOT.swap(u64::MAX, Ordering::Acquire);
+    if req_slot != u64::MAX {
+        // dump_full_fault acquires DumpWriter (COM1 serial lock) internally.
+        crate::arch::dump::dump_full_fault(frame, 0xFF);
+        crate::arch::dump::DUMP_ACK.store(1, Ordering::Release);
+    }
+
+    // Send EOI -- this handler is dispatched directly (not via irq_handler)
     // so we must ack the LAPIC ourselves.
     super::apic::send_eoi();
     log::trace!("IPI received");
 }
 
-/// Lock‑free NMI handler — just acknowledges the interrupt and returns
-/// (Bug 33).  No logging, no locks.
+/// Lock-free NMI handler -- just acknowledges the interrupt and returns
+/// (Bug 33).  When FREEZE_ALL_CPUS is set (from a katerm "freeze" command),
+/// the CPU enters a holding loop.
 fn nmi_counter() {
+    if crate::arch::dump::FREEZE_ALL_CPUS.load(Ordering::Acquire) {
+        // Holding loop: spin forever until reboot.
+        loop {
+            unsafe { core::arch::asm!("pause"); }
+        }
+    }
     unsafe { core::arch::asm!("xchg eax, eax"); } // NOP / debugger hint
     super::apic::send_eoi();
 }

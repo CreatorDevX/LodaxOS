@@ -37,7 +37,7 @@ impl Log for SerialLogger {
         let cpu = if BSP_PERCPU_READY.load(Ordering::Relaxed) {
             crate::percpu::current_apic_id()
         } else {
-            0 // BSP before per-CPU init — only one CPU running
+            0 // BSP before per-CPU init -- only one CPU running
         };
         let level_padded = match record.level() {
             Level::Error => "ERROR",

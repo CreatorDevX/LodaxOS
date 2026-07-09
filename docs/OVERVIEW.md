@@ -1,4 +1,4 @@
-# LodaxOS Architecture Overview
+# LodaxOS Microkernel Architecture
 
 > A from-scratch x86-64 hobby OS written in Rust. UEFI-booted, no legacy BIOS support.
 
@@ -6,10 +6,10 @@
 
 ## 1. System Architecture Overview
 
-LodaxOS is a microkernel-inspired operating system for x86-64. The kernel provides minimal services (scheduling, physical/virtual memory, interrupts, GDF IPC) while hardware and filesystem logic runs in **driver services** — user-space processes that share the kernel's address space but use separate page tables.
+LodaxOS is a microkernel operating system for x86-64. The kernel provides minimal services (scheduling, physical/virtual memory, interrupts, GDF IPC) while hardware and filesystem logic runs in **driver services** — user-space processes isolated by separate page tables.
 
 **Design philosophy:**
-- **Monolithic-ish microkernel**: The kernel handles scheduling, memory, and IPC. Drivers are isolated processes (separate PML4) but run in ring 0 with GDF mailbox IPC.
+- **Microkernel**: The kernel handles only scheduling, memory, and IPC. Drivers are isolated processes (separate PML4) communicating via GDF mailbox IPC.
 - **Gang scheduling (SEDS)**: vCPUs are grouped into gangs; the scheduler picks the gang with the lowest vruntime and runs its vCPUs across idle cores.
 - **Buddy allocator** for physical memory (order 0–10, max 4 MB blocks).
 - **4-level page tables** with a `0xFFFF_8000_0000_0000` higher-half and identity-mapped low 4 GB.

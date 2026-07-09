@@ -9,7 +9,7 @@ use crate::sync::IrqSaveSpinLock;
 
 const PAGE_SHIFT: u64 = 12;
 
-/// Radix tree: 4 levels × 10 bits (bits 12–51) = 1 TB addressable per tree.
+/// Radix tree: 4 levels × 10 bits (bits 12--51) = 1 TB addressable per tree.
 const RADIX_BITS: u64 = 10;
 const RADIX_SIZE: usize = 1 << RADIX_BITS;
 const RADIX_MASK: u64 = (RADIX_SIZE - 1) as u64;
@@ -68,6 +68,14 @@ pub struct VmaTree {
 
 // Required for `IrqSaveSpinLock<VmaTree>` to be `Sync`.
 unsafe impl Send for VmaTree {}
+
+impl Drop for VmaTree {
+    fn drop(&mut self) {
+        if !self.root.is_null() {
+            unsafe { self.free_tree(self.root, RADIX_LEVELS); }
+        }
+    }
+}
 
 fn radix_shift(level: usize) -> u64 {
     PAGE_SHIFT + (level as u64) * RADIX_BITS
@@ -244,6 +252,17 @@ impl VmaTree {
         unsafe { self.visit_node(self.root, 4, &mut f) }
     }
 
+    /// Check if any VMA in the tree overlaps the range [start, end).
+    pub fn has_overlap(&mut self, start: u64, end: u64) -> bool {
+        self.visit_all(|vma| {
+            if vma.start < end && vma.end > start {
+                Some(())
+            } else {
+                None
+            }
+        }).is_some()
+    }
+
     unsafe fn visit_node<F, R>(
         &mut self,
         node: *mut RadixNode,
@@ -275,12 +294,35 @@ impl VmaTree {
             None
         }
     }
+
+    /// Recursively free all nodes and VMAs in the tree.
+    unsafe fn free_tree(&mut self, node: *mut RadixNode, level: usize) {
+        if level == 0 {
+            for i in 0..RADIX_SIZE {
+                let vma_ptr = (*node).entries[i].vma;
+                if !vma_ptr.is_null() {
+                    drop(Box::from_raw(vma_ptr));
+                }
+            }
+        } else {
+            for i in 0..RADIX_SIZE {
+                let child = (*node).entries[i].child;
+                if !child.is_null() {
+                    self.free_tree(child, level - 1);
+                }
+            }
+        }
+        RadixNode::free_node(node);
+    }
 }
 
-/// Process memory descriptor — holds the VMA tree for one process.
+/// Process memory descriptor -- holds the VMA tree for one process.
 pub struct ProcessMemory {
     pub vma_tree: VmaTree,
     pub pml4_phys: u64,
+    /// Bump pointer for user virtual address allocation (hint=0 in mmap).
+    /// Starts above the ELF load region and grows upward.
+    pub next_free_vaddr: u64,
 }
 
 impl ProcessMemory {
@@ -288,7 +330,33 @@ impl ProcessMemory {
         Self {
             vma_tree: VmaTree::new(),
             pml4_phys,
+            // Start above typical ELF load region (0x400000) and stack region.
+            next_free_vaddr: 0x0000_0040_0000,
         }
+    }
+
+    /// Allocate a user virtual address range of `size` bytes (page-aligned).
+    /// Uses bump allocation from `next_free_vaddr`, skipping any existing VMAs.
+    /// Returns the allocated virtual address, or None if no space found.
+    pub fn alloc_user_vaddr(&mut self, size: u64) -> Option<u64> {
+        let pages = (size + 0xFFF) / 0x1000;
+        let alloc_size = pages * 0x1000;
+        // Scan up to 1024 times to find a non-overlapping gap.
+        for _ in 0..1024 {
+            let addr = self.next_free_vaddr;
+            // Align to page boundary
+            let addr = (addr + 0xFFF) & !0xFFF;
+            let end = addr.checked_add(alloc_size)?;
+            // Don't allocate into the higher half
+            if end >= crate::mm::virt::HIGHER_HALF {
+                return None;
+            }
+            self.next_free_vaddr = end;
+            if !self.vma_tree.has_overlap(addr, end) {
+                return Some(addr);
+            }
+        }
+        None
     }
 
     /// Add a VMA covering [start, end) with given permissions.
@@ -309,14 +377,14 @@ impl ProcessMemory {
     /// Handle a page fault. Returns true if the fault was handled (page mapped).
     pub fn handle_page_fault(&mut self, fault_addr: u64, write: bool) -> bool {
         if write {
-        if let Some(pte) = super::virt::read_pte(self.pml4_phys, fault_addr) {
-            if pte & super::virt::COW != 0 {
-                return self.handle_cow_fault(fault_addr);
+            if let Some(pte) = super::virt::read_pte(self.pml4_phys, fault_addr) {
+                if pte & super::virt::COW != 0 {
+                    return self.handle_cow_fault(fault_addr);
+                }
             }
         }
-    }
 
-    let vma = match self.vma_tree.find_covering(fault_addr) {
+        let vma = match self.vma_tree.find_covering(fault_addr) {
             Some(v) => v,
             None => return false,
         };
@@ -331,11 +399,29 @@ impl ProcessMemory {
             None => return false,
         };
 
+        // Zero the page before mapping to prevent information leaks from
+        // previously-used physical pages.
+        unsafe {
+            core::ptr::write_bytes(
+                (super::virt::HIGHER_HALF + phys_page) as *mut u8,
+                0,
+                phys::PAGE_SIZE as usize,
+            );
+        }
+
+        // Translate VMA permissions to page table flags so that
+        // executable VMAs are not mapped NX (which would cause an
+        // instruction-fetch fault on first use).
+        let mut flags = super::virt::PRESENT | super::virt::WRITABLE;
+        if vma.perm as u64 & VmaPerm::Execute as u64 == 0 {
+            flags |= super::virt::NO_EXECUTE;
+        }
+
         super::virt::map_page_explicit(
             self.pml4_phys,
             page_addr,
             phys_page,
-            super::virt::DATA,
+            flags,
         );
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
 
@@ -370,9 +456,17 @@ fn resolve_cow(pml4_phys: u64, page_addr: u64, old_pte: u64) -> bool {
     }
     let new_pte = new_phys | ((old_pte & 0xFFF) & !super::virt::COW) | super::virt::WRITABLE;
     super::virt::write_pte(pml4_phys, page_addr, new_pte);
-    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
-    // Note: the old physical page is NOT freed here — it may still be
-    // mapped in the parent process's PML4 (with COW+RO).
+    // Remote TLB shootdown -- other CPUs may have cached the old COW PTE.
+    // Without this, a CPU that still holds the stale read-only mapping can
+    // fault again or (worse) read the old page after it is freed by the
+    // parent.
+    super::virt::flush_page_all(page_addr);
+    // Decrement the old page's reference count. If it reaches zero,
+    // no process maps it anymore and it can be freed.
+    let old_pn = old_phys / phys::PAGE_SIZE;
+    if phys::unref_page(old_pn) {
+        phys::free_page(old_phys);
+    }
     true
 }
 
@@ -436,21 +530,38 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
         return false;
     }
 
+    // User-mode non-present fault: look up the current vCPU's ProcessMemory
+    // and delegate to it.  The VMA tree validates the fault address.
     if is_user {
-        return false;
+        let vcpu_id = crate::scheduler::current_vcpu_id();
+        let mut handled = false;
+        crate::vcpu::with(vcpu_id, |v| {
+            if let Some(vcpu) = v {
+                if !vcpu.process_mem.0.is_null() {
+                    handled = unsafe { (*vcpu.process_mem.0).handle_page_fault(fault_addr, is_write) };
+                }
+            }
+        });
+        return handled;
     }
 
-    // Kernel-mode fault — check kernel VMA tree.
-    let found = with_kernel_vma_tree(|tree| {
-        tree.find_covering(fault_addr).is_some()
+    // Kernel-mode fault -- check kernel VMA tree.
+    let vma_perm = with_kernel_vma_tree(|tree| {
+        tree.find_covering(fault_addr).map(|vma| vma.perm)
     });
 
-    if found {
+    if let Some(perm) = vma_perm {
         let page_addr = fault_addr & !0xFFF;
         let phys_page = match phys::alloc_page() {
             Some(p) => p,
             None => return false,
         };
+        // Translate VMA permissions to page table flags so that future
+        // executions from executable VMAs aren't mapped NX.
+        let mut flags = super::virt::PRESENT | super::virt::WRITABLE;
+        if perm as u64 & VmaPerm::Execute as u64 == 0 {
+            flags |= super::virt::NO_EXECUTE;
+        }
         unsafe {
             core::ptr::write_bytes((super::virt::HIGHER_HALF + phys_page) as *mut u8, 0, phys::PAGE_SIZE as usize);
             let cr3: u64;
@@ -459,7 +570,7 @@ pub fn handle_page_fault(fault_addr: u64, error_code: u64) -> bool {
                 cr3 & !0xFFF,
                 page_addr,
                 phys_page,
-                super::virt::DATA,
+                flags,
             );
         }
         log::trace!("Demand-paged: {:#x} -> {:#x}", page_addr, phys_page);

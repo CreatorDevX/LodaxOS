@@ -41,7 +41,9 @@ fn pop_ring() -> Option<u8> {
 
 // ---- Initialisation ----
 
-pub fn init() {
+/// Initialize COM2 UART registers (no IOAPIC dependency).
+/// Safe to call very early, before page tables or heap.
+pub fn init_port() {
     unsafe {
         Port::<u8>::new(COM2 + 3).write(0x80u8);
         Port::<u8>::new(COM2).write(0x01u8);
@@ -51,10 +53,14 @@ pub fn init() {
         Port::<u8>::new(COM2 + 4).write(0x0Bu8);
         Port::<u8>::new(COM2 + 1).write(0x05u8);
     }
+}
 
+/// Enable IOAPIC route for COM2 IRQ 3.
+/// Must be called after IOAPIC is initialized.
+pub fn init_irq() {
     if let Some(route) = crate::intr::lookup_isa(3) {
         log::info!(
-            "COM2: ISA IRQ 3 → GSI {} → IOAPIC[{}] pin {} vector {}",
+            "COM2: ISA IRQ 3 -> GSI {} -> IOAPIC[{}] pin {} vector {}",
             route.gsi, route.ioapic_index, route.ioapic_pin, route.vector,
         );
         crate::intr::enable_route(route);
@@ -100,8 +106,21 @@ pub fn write_str_unlocked(s: &str) {
     write_str_inner(s);
 }
 
-// ---- Read path (interrupt-driven, ring buffer) ----
+// ---- Read path ----
 
+/// Polled read: directly check the UART's Line Status Register
+/// for incoming data.  Works before interrupts are enabled and
+/// does not touch the ring buffer at all.
+pub fn poll_read_byte() -> Option<u8> {
+    let lsr: u8 = unsafe { Port::<u8>::new(COM2 + 5).read() };
+    if lsr & 1 != 0 {
+        Some(unsafe { Port::<u8>::new(COM2).read() })
+    } else {
+        None
+    }
+}
+
+/// Interrupt-driven read from the ring buffer.
 pub fn read_byte() -> Option<u8> {
     let _guard = SERIAL2_LOCK.lock();
     pop_ring()
@@ -120,6 +139,7 @@ pub fn data_available() -> bool {
 // ---- Interrupt handler ----
 
 pub fn irq_handler() {
+    let _guard = SERIAL2_LOCK.lock();
     let lsr: u8 = unsafe { Port::<u8>::new(COM2 + 5).read() };
     if lsr & 1 != 0 {
         loop {

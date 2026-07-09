@@ -88,7 +88,7 @@ pub fn init(madt: &MadtInfo) {
             return;
         }
 
-        // Track GSIs claimed by ISO routes — an ISO may remap a different ISA IRQ
+        // Track GSIs claimed by ISO routes -- an ISO may remap a different ISA IRQ
         // to a GSI that another ISA IRQ's identity mapping would claim, causing
         // two routes to the same IOAPIC pin (the second overwrites the first).
         let mut gsi_claimed = [false; 256];
@@ -107,7 +107,7 @@ pub fn init(madt: &MadtInfo) {
             if let Some(r) = route {
                 if table.count < MAX_ROUTES {
                     log::info!(
-                        "IRQ route: ISA IRQ {} → GSI {} → IOAPIC[{}] pin {} vector {} (flags={:#x})",
+                        "IRQ route: ISA IRQ {} -> GSI {} -> IOAPIC[{}] pin {} vector {} (flags={:#x})",
                         iso.source,
                         gsi,
                         r.ioapic_index,
@@ -134,7 +134,7 @@ pub fn init(madt: &MadtInfo) {
             if let Some(r) = route {
                 if table.count < MAX_ROUTES {
                     log::info!(
-                        "IRQ route: ISA IRQ {} → GSI {} (identity) → IOAPIC[{}] pin {} vector {}",
+                        "IRQ route: ISA IRQ {} -> GSI {} (identity) -> IOAPIC[{}] pin {} vector {}",
                         isa_irq,
                         gsi,
                         r.ioapic_index,
@@ -220,8 +220,24 @@ pub fn install_route(route: &IrqRoute) {
     if let Some(ioapic) = ioapic::get(route.ioapic_index) {
         let low = ioapic::IoApic::make_redir_low(route.vector, route.flags, true);
         // Distribute IRQs across online APs via round-robin.
-        let target_cpu = IRQ_CPU_NEXT.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
-        let target_apic_id = crate::percpu::PERCPU[target_cpu].apic_id.load(Ordering::Relaxed) as u8;
+        // Skip offline CPUs to avoid delivering to a non-existent APIC ID.
+        let n = IRQ_CPU_NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut target_apic_id: u8 = 0; // fallback to BSP
+        let mut found = false;
+        for i in 0..MAX_CPUS {
+            let cpu = (n + i) % MAX_CPUS;
+            if crate::percpu::PERCPU[cpu].online.load(Ordering::Acquire) {
+                target_apic_id = crate::percpu::PERCPU[cpu].apic_id.load(Ordering::Relaxed) as u8;
+                if target_apic_id != u8::MAX {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            log::warn!("install_route: no online CPU with valid APIC ID, using BSP");
+            target_apic_id = 0;
+        }
         let high = ioapic::IoApic::make_redir_high(target_apic_id);
         ioapic.set_entry(route.ioapic_pin, low, high);
         log::debug!(
@@ -271,4 +287,88 @@ pub fn install_all_masked() -> usize {
         }
     }
     count
+}
+
+// ---- Runtime IRQ registration for drivers ----
+
+use crate::vcpu::VcpuId;
+
+/// Maximum number of runtime-registered IRQ handlers.
+const MAX_RUNTIME_IRQS: usize = 32;
+
+/// A runtime-registered IRQ handler: maps a vector to a driver vCPU.
+#[derive(Clone, Copy)]
+struct RuntimeIrq {
+    vector: u8,
+    gsi: u32,
+    driver_vcpu: VcpuId,
+    used: bool,
+}
+
+struct RuntimeIrqTable {
+    entries: [RuntimeIrq; MAX_RUNTIME_IRQS],
+    count: usize,
+}
+
+struct SyncRuntimeTable(UnsafeCell<RuntimeIrqTable>);
+unsafe impl Sync for SyncRuntimeTable {}
+
+static RUNTIME_IRQS: SyncRuntimeTable = SyncRuntimeTable(UnsafeCell::new(RuntimeIrqTable {
+    entries: [RuntimeIrq { vector: 0, gsi: 0, driver_vcpu: 0, used: false }; MAX_RUNTIME_IRQS],
+    count: 0,
+}));
+
+/// Register a runtime IRQ handler. The driver requests a GSI (or 0 for any
+/// free vector) and provides its vCPU ID. Returns the assigned vector on
+/// success, or None on failure.
+pub fn register_irq(gsi: u32, driver_vcpu: VcpuId) -> Option<u8> {
+    let table = unsafe { &mut *RUNTIME_IRQS.0.get() };
+
+    // Find the GSI route to determine the IOAPIC pin and vector.
+    let route = lookup_gsi(gsi)?;
+
+    // Check for duplicate registration
+    for i in 0..table.count {
+        if table.entries[i].used && table.entries[i].driver_vcpu == driver_vcpu {
+            log::warn!("intr: driver vcpu {} already has a registered IRQ", driver_vcpu);
+            return None;
+        }
+    }
+
+    if table.count >= MAX_RUNTIME_IRQS {
+        log::error!("intr: runtime IRQ table full");
+        return None;
+    }
+
+    let vector = route.vector;
+
+    // Program the IOAPIC to deliver this GSI to the driver's CPU.
+    // We use the existing install_route + enable_route path.
+    install_route(route);
+    enable_route(route);
+
+    // Store the registration
+    let idx = table.count;
+    table.entries[idx] = RuntimeIrq {
+        vector,
+        gsi,
+        driver_vcpu,
+        used: true,
+    };
+    table.count += 1;
+
+    log::info!("intr: registered runtime IRQ vector={} gsi={} for driver vcpu={}", vector, gsi, driver_vcpu);
+    Some(vector)
+}
+
+/// Look up the driver vCPU for a given vector. Returns the vCPU ID if
+/// a runtime handler is registered for this vector, or 0 if none.
+pub fn lookup_vector_driver(vector: u8) -> VcpuId {
+    let table = unsafe { &*RUNTIME_IRQS.0.get() };
+    for i in 0..table.count {
+        if table.entries[i].used && table.entries[i].vector == vector {
+            return table.entries[i].driver_vcpu;
+        }
+    }
+    0
 }

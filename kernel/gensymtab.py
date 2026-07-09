@@ -172,19 +172,27 @@ def generate_rs(out_path: str, symbols: list[tuple[int, str]], rows: list[tuple[
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        print("usage: gensymtab.py <kernel.elf> <output.rs>", file=sys.stderr)
-        raise SystemExit(2)
+    import argparse
 
-    elf_path, out_path = sys.argv[1], sys.argv[2]
+    parser = argparse.ArgumentParser(
+        description="Extract symbols from kernel ELF and generate symtab.rs"
+    )
+    parser.add_argument("elf", help="Path to kernel ELF")
+    parser.add_argument("output", help="Output .rs path")
+    parser.add_argument(
+        "--dwarf", action="store_true",
+        help="Include DWARF file/line info (slow for large ELFs)"
+    )
+    args = parser.parse_args()
 
-    with open(elf_path, "rb") as f:
+    with open(args.elf, "rb") as f:
         elffile = ELFFile(f)
         symbols = load_symbols(elffile)
-        rows = load_line_rows(elffile)
+        rows = load_line_rows(elffile) if args.dwarf else []
 
-    generate_rs(out_path, symbols, rows)
-    print(f"wrote {len(symbols)} symbols to {out_path}")
+    generate_rs(args.output, symbols, rows)
+    print(f"wrote {len(symbols)} symbols to {args.output}"
+          + (" (with DWARF line info)" if rows else " (no DWARF)"))
 
 
 if __name__ == "__main__":

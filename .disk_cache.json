@@ -1,6 +1,6 @@
 {
-  "ext4:kernel.elf": "dc4f246ffe0477d8058ad97474980a84",
-  "ext4:drivers.elf": "4305fc2cce0dc78a809cfe651b68d3e4",
-  "esp:kernel.elf": "dc4f246ffe0477d8058ad97474980a84",
+  "ext4:kernel.elf": "77fae3c49c2364a2618d2fe9dc72a425",
+  "ext4:drivers.elf": "c91525db7c6b25f74e03d78855072632",
+  "esp:kernel.elf": "77fae3c49c2364a2618d2fe9dc72a425",
   "esp:BOOTX64.EFI": "aa4f9136c4c2d816ff93ee57dc12c37a"
 }

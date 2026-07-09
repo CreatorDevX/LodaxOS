@@ -1,7 +1,7 @@
 //! Tiny x86-64 disassembler for fault dumps.
 //!
 //! Decodes common instructions into Intel-syntax assembly.
-//! Outputs directly to a `core::fmt::Write` — no allocation.
+//! Outputs directly to a `core::fmt::Write` -- no allocation.
 //! Unknown opcodes fall back to printing the raw bytes.
 
 use core::fmt::Write;
@@ -251,7 +251,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
     let rest = &bytes[pos..];
 
     match op {
-        // ── ALU (ModRM forms): 0x00-0x3B step 8, 4 each ──
+        // -- ALU (ModRM forms): 0x00-0x3B step 8, 4 each --
         b @ 0x00..=0x03 | b @ 0x08..=0x0B | b @ 0x10..=0x13
         | b @ 0x18..=0x1B | b @ 0x20..=0x23 | b @ 0x28..=0x2B
         | b @ 0x30..=0x33 | b @ 0x38..=0x3B => {
@@ -264,7 +264,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── ALU AL/EAX, imm8 ──
+        // -- ALU AL/EAX, imm8 --
         b @ 0x04 | b @ 0x0C | b @ 0x14 | b @ 0x1C
         | b @ 0x24 | b @ 0x2C | b @ 0x34 | b @ 0x3C => {
             let grp = ((b >> 3) & 7) as usize;
@@ -272,7 +272,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "{:#x}", v); }
         }
 
-        // ── ALU EAX/RAX, imm32 ──
+        // -- ALU EAX/RAX, imm32 --
         b @ 0x05 | b @ 0x0D | b @ 0x15 | b @ 0x1D
         | b @ 0x25 | b @ 0x2D | b @ 0x35 | b @ 0x3D => {
             let grp = ((b >> 3) & 7) as usize;
@@ -285,7 +285,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── invalid in 64-bit mode ──
+        // -- invalid in 64-bit mode --
         0x06 | 0x07 | 0x0E | 0x16 | 0x17 | 0x1E | 0x1F
         | 0x27 | 0x2F | 0x37 | 0x3F | 0x60 | 0x61
         | 0x62 | 0x9A | 0xC4 | 0xC5 | 0xCE | 0xD4
@@ -293,11 +293,11 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             let _ = write!(w, "db {:#x}", op);
         }
 
-        // ── PUSH reg / POP reg ──
+        // -- PUSH reg / POP reg --
         0x50..=0x57 => { let _ = write!(w, "push {}", reg64(op - 0x50, ext_b)); }
         0x58..=0x5F => { let _ = write!(w, "pop {}", reg64(op - 0x58, ext_b)); }
 
-        // ── MOVSXD ──
+        // -- MOVSXD --
         0x63 => {
             if rest.is_empty() { return Some(pos); }
             let modrm = rest[0];
@@ -308,7 +308,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── PUSH imm32 / imm8, IMUL ──
+        // -- PUSH imm32 / imm8, IMUL --
         0x68 => {
             if pos + 4 <= bytes.len() {
                 let v = i32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
@@ -343,7 +343,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── Jcc rel8 ──
+        // -- Jcc rel8 --
         0x70..=0x7F => {
             let cc = (op & 0xF) as usize;
             if pos < bytes.len() {
@@ -354,7 +354,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── Group 1 immediate (0x80-0x83) ──
+        // -- Group 1 immediate (0x80-0x83) --
         0x80 | 0x81 | 0x82 | 0x83 => {
             let byte_sz = op == 0x80 || op == 0x82;
             let byte_imm = op == 0x80 || op == 0x82;
@@ -388,7 +388,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── TEST r/m, r ──
+        // -- TEST r/m, r --
         0x84 | 0x85 => {
             let byte_sz = op == 0x84;
             let _ = write!(w, "test ");
@@ -401,7 +401,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             write_reg(w, reg, byte_sz, wide, has_rex, ext_r, opsz16);
         }
 
-        // ── XCHG r/m, r ──
+        // -- XCHG r/m, r --
         0x86 | 0x87 => {
             let byte_sz = op == 0x86;
             let _ = write!(w, "xchg ");
@@ -414,7 +414,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             write_reg(w, reg, byte_sz, wide, has_rex, ext_r, opsz16);
         }
 
-        // ── MOV r/m, r  /  MOV r, r/m ──
+        // -- MOV r/m, r  /  MOV r, r/m --
         0x88 | 0x89 | 0x8A | 0x8B => {
             let to_reg = op == 0x8A || op == 0x8B;
             let byte_sz = op == 0x88 || op == 0x8A;
@@ -424,7 +424,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── MOV r/m, sreg ──
+        // -- MOV r/m, sreg --
         0x8C => {
             let _ = write!(w, "mov ");
             if rest.is_empty() { return Some(pos); }
@@ -436,7 +436,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             let _ = write!(w, ",{}", sreg_name);
         }
 
-        // ── LEA ──
+        // -- LEA --
         0x8D => {
             let _ = write!(w, "lea ");
             if rest.is_empty() { return Some(pos); }
@@ -449,7 +449,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── MOV sreg, r/m ──
+        // -- MOV sreg, r/m --
         0x8E => {
             let _ = write!(w, "mov ");
             if rest.is_empty() { return Some(pos); }
@@ -462,7 +462,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── POP r/m ──
+        // -- POP r/m --
         0x8F => {
             let _ = write!(w, "pop ");
             if rest.is_empty() { return Some(pos); }
@@ -471,7 +471,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── NOP ──
+        // -- NOP --
         0x90 => {
             if has_rex {
                 // With REX prefix, 0x90 is still NOP (REX doesn't change it)
@@ -479,25 +479,25 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             let _ = write!(w, "nop");
         }
 
-        // ── XCHG reg, EAX/RAX ──
+        // -- XCHG reg, EAX/RAX --
         0x91..=0x97 => {
             let r = op - 0x91;
             if wide { let _ = write!(w, "xchg rax,{}", reg64(r, ext_b)); }
             else { let _ = write!(w, "xchg eax,{}", reg32(r, ext_b)); }
         }
 
-        // ── CWDE / CDQE / CWD / CDQ / CQO ──
+        // -- CWDE / CDQE / CWD / CDQ / CQO --
         0x98 => { if wide { let _ = write!(w, "cdqe"); } else { let _ = write!(w, "cwde"); } }
         0x99 => { if wide { let _ = write!(w, "cqo"); } else { let _ = write!(w, "cdq"); } }
 
-        // ── FWAIT, PUSHF/POPF, SAHF, LAHF ──
+        // -- FWAIT, PUSHF/POPF, SAHF, LAHF --
         0x9B => { let _ = write!(w, "fwait"); }
         0x9C => { let _ = write!(w, "pushfq"); }
         0x9D => { let _ = write!(w, "popfq"); }
         0x9E => { let _ = write!(w, "sahf"); }
         0x9F => { let _ = write!(w, "lahf"); }
 
-        // ── MOV AL/EAX/RAX, moffs ──
+        // -- MOV AL/EAX/RAX, moffs --
         0xA0 => {
             if pos + 8 <= bytes.len() {
                 let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
@@ -529,7 +529,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── MOVS, CMPS, STOS, LODS, SCAS ──
+        // -- MOVS, CMPS, STOS, LODS, SCAS --
         0xA4 => { let _ = write!(w, "movsb"); }
         0xA5 => { if wide { let _ = write!(w, "movsq"); } else { let _ = write!(w, "movsd"); } }
         0xA6 => { let _ = write!(w, "cmpsb"); }
@@ -541,7 +541,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
         0xAE => { let _ = write!(w, "scasb"); }
         0xAF => { if wide { let _ = write!(w, "scasq"); } else { let _ = write!(w, "scasd"); } }
 
-        // ── TEST AL/EAX, imm ──
+        // -- TEST AL/EAX, imm --
         0xA8 => {
             if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "test al,{:#x}", v); }
         }
@@ -554,7 +554,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── MOV r8, imm8 ──
+        // -- MOV r8, imm8 --
         0xB0..=0xB7 => {
             let r = op - 0xB0;
             if pos < bytes.len() { let v = bytes[pos]; pos += 1;
@@ -562,7 +562,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── MOV r64, imm64 ──
+        // -- MOV r64, imm64 --
         0xB8..=0xBF => {
             let r = op - 0xB8;
             if wide {
@@ -586,7 +586,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── Group 2 shift/rotate r/m, imm8 ──
+        // -- Group 2 shift/rotate r/m, imm8 --
         0xC0 | 0xC1 => {
             let byte_sz = op == 0xC0;
             if rest.is_empty() { return Some(pos); }
@@ -599,7 +599,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "{:#x}", v); }
         }
 
-        // ── RET ──
+        // -- RET --
         0xC2 => {
             if pos + 2 <= bytes.len() {
                 let v = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
@@ -617,7 +617,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
         }
         0xCB => { let _ = write!(w, "retf"); }
 
-        // ── MOV r/m, imm ──
+        // -- MOV r/m, imm --
         0xC6 => {
             let _ = write!(w, "mov byte ");
             if rest.is_empty() { return Some(pos); }
@@ -639,7 +639,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── ENTER, LEAVE ──
+        // -- ENTER, LEAVE --
         0xC8 => {
             if pos + 4 <= bytes.len() {
                 let alloc = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
@@ -650,14 +650,14 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
         }
         0xC9 => { let _ = write!(w, "leave"); }
 
-        // ── INT3, INT imm8, IRETQ ──
+        // -- INT3, INT imm8, IRETQ --
         0xCC => { let _ = write!(w, "int3"); }
         0xCD => {
             if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "int {:#x}", v); }
         }
         0xCF => { let _ = write!(w, "iretq"); }
 
-        // ── Group 2 shift/rotate r/m, 1 ──
+        // -- Group 2 shift/rotate r/m, 1 --
         0xD0 | 0xD1 => {
             let byte_sz = op == 0xD0;
             if rest.is_empty() { return Some(pos); }
@@ -669,7 +669,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             let _ = write!(w, ",1");
         }
 
-        // ── Group 2 shift/rotate r/m, CL ──
+        // -- Group 2 shift/rotate r/m, CL --
         0xD2 | 0xD3 => {
             let byte_sz = op == 0xD2;
             if rest.is_empty() { return Some(pos); }
@@ -681,10 +681,10 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             let _ = write!(w, ",cl");
         }
 
-        // ── XLAT ──
+        // -- XLAT --
         0xD7 => { let _ = write!(w, "xlat"); }
 
-        // ── LOOPNE/LOOPE/LOOP/JRCXZ ──
+        // -- LOOPNE/LOOPE/LOOP/JRCXZ --
         0xE0 => {
             if pos < bytes.len() { let off = bytes[pos] as i8 as i64; pos += 1;
                 let t = addr.wrapping_add(pos as u64).wrapping_add(off as u64);
@@ -711,7 +711,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── IN/OUT ──
+        // -- IN/OUT --
         0xE4 => {
             if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "in al,{:#x}", v); }
         }
@@ -729,7 +729,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
         0xEE => { let _ = write!(w, "out dx,al"); }
         0xEF => { let _ = write!(w, "out dx,eax"); }
 
-        // ── CALL rel32, JMP rel32/rel8 ──
+        // -- CALL rel32, JMP rel32/rel8 --
         0xE8 => {
             if pos + 4 <= bytes.len() {
                 let off = i32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as i64;
@@ -755,18 +755,18 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── HLT, CMC ──
+        // -- HLT, CMC --
         0xF4 => { let _ = write!(w, "hlt"); }
         0xF5 => { let _ = write!(w, "cmc"); }
 
-        // ── Group 3 unary (TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) ──
+        // -- Group 3 unary (TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) --
         0xF6 | 0xF7 => {
             let byte_sz = op == 0xF6;
             if rest.is_empty() { return Some(pos); }
             let modrm = rest[0];
             let grp = (modrm >> 3) & 7;
             if grp == 0 || grp == 1 {
-                // TEST r/m, imm — the /0 and /1 forms of Group 3 are TEST
+                // TEST r/m, imm -- the /0 and /1 forms of Group 3 are TEST
                 let _ = write!(w, "test ");
                 let c = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16)?;
                 pos += c;
@@ -788,7 +788,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── CLC, STC, CLI, STI, CLD, STD ──
+        // -- CLC, STC, CLI, STI, CLD, STD --
         0xF8 => { let _ = write!(w, "clc"); }
         0xF9 => { let _ = write!(w, "stc"); }
         0xFA => { let _ = write!(w, "cli"); }
@@ -796,7 +796,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
         0xFC => { let _ = write!(w, "cld"); }
         0xFD => { let _ = write!(w, "std"); }
 
-        // ── Group 4 (INC/DEC r/m8) ──
+        // -- Group 4 (INC/DEC r/m8) --
         0xFE => {
             let byte_sz = true;
             if rest.is_empty() { return Some(pos); }
@@ -810,7 +810,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ── Group 5 (INC/DEC/CALL/JMP/PUSH r/m) ──
+        // -- Group 5 (INC/DEC/CALL/JMP/PUSH r/m) --
         0xFF => {
             if rest.is_empty() { return Some(pos); }
             let modrm = rest[0];
@@ -830,22 +830,22 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
+        // ===========================================================
         // Two-byte opcodes (0x0F prefix)
-        // ═══════════════════════════════════════════════════════════
+        // ===========================================================
         0x0F => {
             if pos >= bytes.len() { return Some(pos); }
             let ext = bytes[pos]; pos += 1;
             let rest = &bytes[pos..];
 
             match ext {
-                // ── System instructions ──
+                // -- System instructions --
                 0x01 => {
                     if rest.is_empty() { return Some(pos); }
                     let modrm = rest[0];
                     let reg = (modrm >> 3) & 7;
                     if (modrm >> 6) == 3 {
-                        // Register form — in mod=3, opcodes like sgdt/sidt/lgdt/lidt
+                        // Register form -- in mod=3, opcodes like sgdt/sidt/lgdt/lidt
                         // become VMX/SVM instructions. Print correct mnemonics.
                         match (reg, modrm & 7) {
                             (0, _) => { let _ = write!(w, "vmrun"); pos += 1; }
@@ -875,7 +875,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                 0x0D => { let _ = write!(w, "prefetch"); if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; } }
                 0x0E => { let _ = write!(w, "femms"); }
 
-                // ── 0x0F 0x1F: NOP (multi-byte) ──
+                // -- 0x0F 0x1F: NOP (multi-byte) --
                 0x1F => {
                     let _ = write!(w, "nop");
                     if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) {
@@ -883,7 +883,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── MOV CR/DR ──
+                // -- MOV CR/DR --
                 0x20 => {
                     if rest.is_empty() { return Some(pos); }
                     let modrm = rest[0];
@@ -917,17 +917,17 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     pos += 1;
                 }
 
-                // ── WRMSR / RDTSC / RDMSR / RDPMC ──
+                // -- WRMSR / RDTSC / RDMSR / RDPMC --
                 0x30 => { let _ = write!(w, "wrmsr"); }
                 0x31 => { let _ = write!(w, "rdtsc"); }
                 0x32 => { let _ = write!(w, "rdmsr"); }
                 0x33 => { let _ = write!(w, "rdpmc"); }
 
-                // ── SYSENTER / SYSEXIT ──
+                // -- SYSENTER / SYSEXIT --
                 0x34 => { let _ = write!(w, "sysenter"); }
                 0x35 => { let _ = write!(w, "sysexit"); }
 
-                // ── CMOVcc ──
+                // -- CMOVcc --
                 0x40..=0x4F => {
                     let cc = (ext & 0xF) as usize;
                     let _ = write!(w, "{} ", CMOVCC[cc]);
@@ -941,7 +941,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── MOVAPS / MOVAPD ──
+                // -- MOVAPS / MOVAPD --
                 0x28 | 0x29 => {
                     let to_reg = ext == 0x28;
                     let mnem = if wide { "movapd" } else { "movaps" };
@@ -959,7 +959,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── SIMD / SSE (0x50-0x5F) ──
+                // -- SIMD / SSE (0x50-0x5F) --
                 0x50..=0x5F => {
                     let simd = match ext {
                         0x50 => "movmskpd", 0x51 => "sqrt",   0x52 => "rsqrt", 0x53 => "rcp",
@@ -979,7 +979,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── Jcc rel32 ──
+                // -- Jcc rel32 --
                 0x80..=0x8F => {
                     let cc = (ext & 0xF) as usize;
                     if pos + 4 <= bytes.len() {
@@ -990,7 +990,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── SETcc ──
+                // -- SETcc --
                 0x90..=0x9F => {
                     let byte_sz = true;
                     let cc = (ext & 0xF) as usize;
@@ -1002,7 +1002,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── PUSH/POP FS/GS ──
+                // -- PUSH/POP FS/GS --
                 0xA0 => { let _ = write!(w, "push fs"); }
                 0xA1 => { let _ = write!(w, "pop fs"); }
                 0xA8 => { let _ = write!(w, "push gs"); }
@@ -1010,7 +1010,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                 0xA2 => { let _ = write!(w, "cpuid"); }
                 0xAA => { let _ = write!(w, "rsm"); }
 
-                // ── BT / BTS ──
+                // -- BT / BTS --
                 0xA3 => {
                     let _ = write!(w, "bt ");
                     if !rest.is_empty() {
@@ -1036,7 +1036,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── SHLD / SHRD ──
+                // -- SHLD / SHRD --
                 0xA5 => {
                     let _ = write!(w, "shld ");
                     if rest.is_empty() { return Some(pos); }
@@ -1056,7 +1056,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     let _ = write!(w, ",{},cl", reg64(reg, ext_r));
                 }
 
-                // ── IMUL r, r/m ──
+                // -- IMUL r, r/m --
                 0xAF => {
                     let _ = write!(w, "imul ");
                     if rest.is_empty() { return Some(pos); }
@@ -1069,7 +1069,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── CMPXCHG ──
+                // -- CMPXCHG --
                 0xB0 | 0xB1 => {
                     let byte_sz = ext == 0xB0;
                     let _ = write!(w, "cmpxchg ");
@@ -1084,7 +1084,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── LSS, LFS, LGS, BTR, BTC ──
+                // -- LSS, LFS, LGS, BTR, BTC --
                 0xB2 => {
                     let _ = write!(w, "lss ");
                     if rest.is_empty() { return Some(pos); }
@@ -1113,7 +1113,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; }
                 }
 
-                // ── MOVZX ──
+                // -- MOVZX --
                 0xB6 => {
                     let _ = write!(w, "movzx ");
                     if rest.is_empty() { return Some(pos); }
@@ -1133,7 +1133,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, false, wide, has_rex, true) { pos += c; }
                 }
 
-                // ── Group 8 (BT/BTS/BTR/BTC with imm8) ──
+                // -- Group 8 (BT/BTS/BTR/BTC with imm8) --
                 0xBA => {
                     if rest.is_empty() { return Some(pos); }
                     let modrm = rest[0];
@@ -1149,7 +1149,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     if pos < bytes.len() { let v = bytes[pos]; pos += 1; let _ = write!(w, "{:#x}", v); }
                 }
 
-                // ── BSF / BSR ──
+                // -- BSF / BSR --
                 0xBC => {
                     let _ = write!(w, "bsf ");
                     if !rest.is_empty() {
@@ -1175,7 +1175,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── MOVSX ──
+                // -- MOVSX --
                 0xBE => {
                     let _ = write!(w, "movsx ");
                     if rest.is_empty() { return Some(pos); }
@@ -1195,7 +1195,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, false, wide, has_rex, true) { pos += c; }
                 }
 
-                // ── XADD ──
+                // -- XADD --
                 0xC0 | 0xC1 => {
                     let byte_sz = ext == 0xC0;
                     let _ = write!(w, "xadd ");
@@ -1210,7 +1210,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── MOVNTI ──
+                // -- MOVNTI --
                 0xC3 => {
                     let _ = write!(w, "movnti ");
                     if rest.is_empty() { return Some(pos); }
@@ -1221,7 +1221,7 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     let _ = write!(w, ",{}", reg64(reg, ext_r));
                 }
 
-                // ── CMPXCHG8B / CMPXCHG16B ──
+                // -- CMPXCHG8B / CMPXCHG16B --
                 0xC7 => {
                     if rest.is_empty() { return Some(pos); }
                     let modrm = rest[0];
@@ -1238,13 +1238,13 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                     }
                 }
 
-                // ── BSWAP ──
+                // -- BSWAP --
                 0xC8..=0xCF => {
                     let r = ext - 0xC8;
                     let _ = write!(w, "bswap {}", reg64(r, ext_b));
                 }
 
-                // ── Unknown two-byte opcode ──
+                // -- Unknown two-byte opcode --
                 _ => {
                     let _ = write!(w, "db {:02x} {:02x}", 0x0F, ext);
                     // Try to consume the ModRM byte: most two-byte opcodes
@@ -1256,9 +1256,9 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
+        // ===========================================================
         // Unknown single-byte opcode
-        // ═══════════════════════════════════════════════════════════
+        // ===========================================================
         _ => {}
     }
 

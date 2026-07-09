@@ -191,7 +191,7 @@ pub fn init(ioapic_infos: &[crate::acpi::madt::IoApicInfo]) {
 
             // Program all redirection entries to a safe vector (spurious 0xFF)
             // and mask them.  The reset / UEFI state may leave unused pins with
-            // vector 0 and unmasked — if any device asserts such a pin, the
+            // vector 0 and unmasked -- if any device asserts such a pin, the
             // IOAPIC delivers an interrupt with vector 0, which QEMU prints as
             // a warning and the CPU ignores (but the LAPIC may also fire its
             // uninitialised Error LVT).

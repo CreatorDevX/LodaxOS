@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::mm::virt;
 use crate::sync::SyncUnsafeCell;
 
-/// IA32_APIC_BASE MSR — bits 12–35 are the LAPIC base, bit 11 is global enable.
+/// IA32_APIC_BASE MSR -- bits 12--35 are the LAPIC base, bit 11 is global enable.
 const IA32_APIC_BASE: u32 = 0x1B;
 
 /// LAPIC MMIO register offsets.
@@ -40,7 +40,7 @@ const ICR_ASSERT: u32 = 1 << 14;
 const ICR_LEVEL: u32 = 1 << 15;   // level-triggered (vs edge)
 const ICR_EDGE: u32 = 0;
 
-/// Spurious vector — bit 8 enables LAPIC software, bits 0–7 = vector.
+/// Spurious vector -- bit 8 enables LAPIC software, bits 0--7 = vector.
 const APIC_SVR_ENABLE: u32 = 1 << 8;
 
 /// LVT timer mode bits.
@@ -106,7 +106,7 @@ pub fn read_apic_base() -> u64 {
 /// Must be called after page tables are initialized (uses phys::alloc_page
 /// internally via the page table walkers).
 ///
-/// No segment registers involved — pure memory mapping, so this is safe to
+/// No segment registers involved -- pure memory mapping, so this is safe to
 /// call before loading our own GDT.
 pub fn init_mmio() {
     if INITIALIZED.load(Ordering::SeqCst) {
@@ -120,7 +120,7 @@ pub fn init_mmio() {
     // MMIO: present, writable, no-execute + cache-disable.
     // Without CACHE_DISABLE (PCD), the CPU may cache LAPIC register writes
     // (e.g. EOI, timer count) and reads (e.g. CCR), returning stale values.
-    // Use higher-half-only mapping — the identity map already covers this
+    // Use higher-half-only mapping -- the identity map already covers this
     // physical range via 2MB huge pages, and creating 4KB entries at the
     // same PD level would conflict with the huge page entry.
     let flags = virt::PRESENT | virt::WRITABLE | virt::NO_EXECUTE | virt::CACHE_DISABLE;
@@ -169,23 +169,23 @@ pub fn read_lapic_id() -> u32 {
 
 /// Enable the LAPIC and mask LINT0/LINT1 (required in symmetric mode).
 ///
-/// The legacy 8259 PIC is masked separately by `arch::idt::mask_pic` —
+/// The legacy 8259 PIC is masked separately by `arch::idt::mask_pic` --
 /// callers should invoke that once before configuring the IOAPIC, so we
 /// do not repeat the I/O here.
 pub fn enable() {
     unsafe {
-        // Mask LINT0 and LINT1 — prevents spurious vector delivery issues
+        // Mask LINT0 and LINT1 -- prevents spurious vector delivery issues
         // when the LAPIC is not yet fully configured for external interrupts.
         write32(APIC_LVT_LINT0, APIC_LVT_MASKED);
         write32(APIC_LVT_LINT1, APIC_LVT_MASKED);
 
         // Initialize LVT Error with a valid vector (0xFF = spurious vector) and
-        // mask it.  The reset default is vector 0, unmasked — if the LAPIC
+        // mask it.  The reset default is vector 0, unmasked -- if the LAPIC
         // detects any internal error (illegal APIC-bus message, etc.) it would
         // fire on vector 0, which QEMU prints as a warning and the CPU ignores.
         write32(APIC_LVT_ERROR, APIC_LVT_MASKED | 0xFF);
 
-        // Set Task Priority to 0 — accept all interrupts.
+        // Set Task Priority to 0 -- accept all interrupts.
         write32(APIC_TPR, 0);
 
         // Enable the LAPIC via the Spurious Interrupt Vector Register.
@@ -203,7 +203,7 @@ pub fn enable() {
 /// - `periodic`: true for periodic mode, false for one-shot
 pub fn configure_timer(divisor: u32, vector: u8, periodic: bool) {
     unsafe {
-        // Divide Configuration Register — bits [3:0] = divisor encoding.
+        // Divide Configuration Register -- bits [3:0] = divisor encoding.
         // Encoding: 0b0000=2, 0b0001=4, 0b0010=8, ... 0b1010=128, 0b1011=reserved.
         let dcr = match divisor {
             1 => 0b1011,
@@ -241,7 +241,7 @@ pub fn configure_timer(divisor: u32, vector: u8, periodic: bool) {
 /// Calibrate the LAPIC timer against the PIT channel 0.
 ///
 /// Programs the LAPIC timer with a large one-shot count, then waits 20 ms
-/// by polling the PIT counter (Mode 0, 16‑bit, no reload). Reads the LAPIC
+/// by polling the PIT counter (Mode 0, 16-bit, no reload). Reads the LAPIC
 /// Current Count Register to derive ticks per millisecond.
 ///
 /// Interrupts must be disabled for the entire measurement window (the caller
@@ -295,7 +295,7 @@ pub fn calibrate_pit() {
         TICKS_PER_MS.store(tpm, Ordering::Release);
 
         log::info!(
-            "LAPIC timer calibration: {} ticks in {}ms → {} ticks/ms",
+            "LAPIC timer calibration: {} ticks in {}ms -> {} ticks/ms",
             elapsed,
             ms,
             tpm,
@@ -337,7 +337,7 @@ pub fn ap_enable_timer(_apic_id: u32) {
 
         // Each AP must enable its own LAPIC (the BSP's enable() only
         // affects the BSP's LAPIC).  Use the physical / identity-mapped
-        // address directly — the AP's page tables may lack the higher-half
+        // address directly -- the AP's page tables may lack the higher-half
         // LAPIC mapping created by init_mmio() on the BSP.
         ap_write32!(APIC_LVT_LINT0, APIC_LVT_MASKED);
         ap_write32!(APIC_LVT_LINT1, APIC_LVT_MASKED);
@@ -441,6 +441,27 @@ pub fn send_sipi_all(vector: u8) {
             if timeout == 0 { break; }
         }
         write32(APIC_ICR_LOW, (vector as u32) | ICR_ALL_EXCLUDING_SELF | ICR_STARTUP | ICR_EDGE);
+        timeout = 1_000_000;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+    }
+}
+
+/// Broadcast NMI to all other CPUs (excluding self).
+/// Used by the katerm "freeze" command to halt other CPUs before debugging.
+pub fn send_nmi_all_excluding_self() {
+    unsafe {
+        let mut timeout = 1_000_000u32;
+        while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 { break; }
+        }
+        // NMI delivery mode = 4 (bits 10:8), All-Excluding-Self, edge-triggered.
+        write32(APIC_ICR_LOW, ICR_ALL_EXCLUDING_SELF | (4 << 8) | ICR_EDGE);
         timeout = 1_000_000;
         while read32(APIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();

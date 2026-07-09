@@ -75,6 +75,7 @@ impl Fs {
         r == dst
     }
 
+    #[allow(dead_code)]
     fn write_via(&self, name: &[u8], sector: u64, count: u64, src: u64) -> bool {
         let r = sys_driver_call(name, 11, sector, count, src);
         r == 0
@@ -86,29 +87,41 @@ impl Fs {
     }
 
     fn mount() -> Option<Self> {
-        // Probe AHCI first
-        let sb = sys_driver_call(b"ahci", 10, PART_LBA + 2, 2, 0);
-        let (use_ide, sb_phys) = if sb != 0 && sb != !0u64 && r16(sb, 56) == EXT4_MAGIC {
-            (false, sb)
-        } else {
-            // Fall back to IDE
-            let sb = sys_driver_call(b"ide", 10, PART_LBA + 2, 2, 0);
-            if sb == 0 || sb == !0u64 { return None; }
-            if r16(sb, 56) != EXT4_MAGIC { return None; }
-            (true, sb)
-        };
+        // Retry mount: ahci/ide may not have registered yet when ext4 starts.
+        // Spin up to ~500ms (500 iterations × ~1ms each via syscall overhead).
+        for attempt in 0..500 {
+            // Probe AHCI first
+            let sb = sys_driver_call(b"ahci", 10, PART_LBA + 2, 2, 0);
+            let (use_ide, sb_phys) = if sb != 0 && sb != !0u64 && r16(sb, 56) == EXT4_MAGIC {
+                (false, sb)
+            } else {
+                // Fall back to IDE
+                let sb = sys_driver_call(b"ide", 10, PART_LBA + 2, 2, 0);
+                if sb == 0 || sb == !0u64 {
+                    // Neither ahci nor ide responded yet — retry
+                    if attempt < 499 {
+                        for _ in 0..10000 { core::hint::spin_loop(); }
+                        continue;
+                    }
+                    return None;
+                }
+                if r16(sb, 56) != EXT4_MAGIC { return None; }
+                (true, sb)
+            };
 
-        let lbs = r32(sb_phys, 24) as u64;
-        let bs = 1024u64 << lbs;
-        Some(Fs {
-            use_ide,
-            part_lba: PART_LBA,
-            block_size: bs,
-            sec_per_blk: bs / 512,
-            inodes_per_g: r32(sb_phys, 40),
-            inode_size: r16(sb_phys, 88),
-            bg_blk: if bs > 1024 { 1 } else { 2 },
-        })
+            let lbs = r32(sb_phys, 24) as u64;
+            let bs = 1024u64 << lbs;
+            return Some(Fs {
+                use_ide,
+                part_lba: PART_LBA,
+                block_size: bs,
+                sec_per_blk: bs / 512,
+                inodes_per_g: r32(sb_phys, 40),
+                inode_size: r16(sb_phys, 88),
+                bg_blk: if bs > 1024 { 1 } else { 2 },
+            });
+        }
+        None
     }
 
     fn alloc_buf(&self, size: u64) -> u64 {
@@ -120,6 +133,7 @@ impl Fs {
         self.read_via(self.drv(), lba, self.sec_per_blk, dst)
     }
 
+    #[allow(dead_code)]
     fn write_blk(&self, block: u64, src: u64) -> bool {
         let lba = self.part_lba + block * self.sec_per_blk;
         self.write_via(self.drv(), lba, self.sec_per_blk, src)
@@ -159,7 +173,8 @@ impl Fs {
     // ── Ext4 Write support (minimal) ──────────────────────────────────
     
     // Note: Does not support resizing files (no inode/extent updates)
-    fn write_file_data(&self, ino: u32, offset: u64, data: &[u8], scratch: u64) -> bool {
+    #[allow(dead_code)]
+    fn write_file_data(&self, ino: u32, _offset: u64, _data: &[u8], _scratch: u64) -> bool {
         let inode = self.alloc_buf(self.block_size);
         if inode == !0 || !self.read_inode(ino, inode) { return false; }
         

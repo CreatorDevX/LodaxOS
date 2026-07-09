@@ -9,7 +9,7 @@ static SERIAL_LOCK: IrqSaveSpinLock<()> = IrqSaveSpinLock::new(());
 
 pub fn init() {
     // UART 16550 already initialized by bootloader.
-    // Re-initializing would drop FIFO contents and add ~200 µs delay.
+    // Re-initializing would drop FIFO contents and add ~200 us delay.
 }
 
 fn write_byte_raw(byte: u8) {
@@ -54,7 +54,7 @@ pub fn write_str_unlocked(s: &str) {
 
 /// A RAII guard that holds the serial lock for the duration of a multi-line
 /// dump.  Each line is written directly to COM1 *without* the usual
-/// `[CPU] [LEVEL] module:` prefix — the caller prints a single header line
+/// `[CPU] [LEVEL] module:` prefix -- the caller prints a single header line
 /// with CPU info at the top and raw lines afterwards.
 pub struct DumpWriter {
     _guard: crate::sync::IrqSaveGuard<'static, ()>,

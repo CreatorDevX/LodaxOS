@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use lodaxos_system::MAX_CPUS;
 
@@ -6,9 +6,9 @@ use crate::arch::idt::TrapFrame;
 use crate::mm::{phys, virt};
 use crate::sync::IrqSaveSpinLock;
 use crate::consts;
-use crate::vcpu::{self, VcpuId, VcpuType, VcpuState, GANG_UNSCHEDULED};
+use crate::vcpu::{self, VcpuId, VcpuType, VcpuState, GANG_UNSCHEDULED, FRAME_MAGIC};
 
-// ── Constants ────────────────────────────────────────────────────────
+// -- Constants --------------------------------------------------------
 
 const VRUNTIME_TICK: u64 = 20;
 const VRUNTIME_BIAS: u64 = 8;
@@ -19,7 +19,7 @@ const RFLAGS_IF: u64 = 0x202;
 const MAX_GANGS: usize = 32;
 const MAX_VCPUS_PER_GANG: usize = 8;
 
-// ── Types ────────────────────────────────────────────────────────────
+// -- Types ------------------------------------------------------------
 
 pub type GangId = u32;
 
@@ -35,6 +35,7 @@ pub struct Gang {
     pub name: [u8; 32],
     pub symtab_phys: u64,
     pub symtab_size: u64,
+    pub strtab_phys: u64,
     pub vcpu_ids: [Option<VcpuId>; MAX_VCPUS_PER_GANG],
     pub vcpu_count: u32,
     pub vruntime: u64,
@@ -58,13 +59,13 @@ fn lock_gangs() -> crate::sync::IrqSaveGuard<'static, GangTable> {
     GANG_TABLE.lock()
 }
 
-// ── CPU helpers ──────────────────────────────────────────────────────
+// -- CPU helpers ------------------------------------------------------
 
 pub fn current_cpu_slot() -> usize {
     crate::percpu::apic_id_to_slot(crate::percpu::current_apic_id())
 }
 
-// ── Public API ───────────────────────────────────────────────────────
+// -- Public API -------------------------------------------------------
 
 pub fn init() {
     let mut gt = GANG_TABLE.lock();
@@ -74,18 +75,28 @@ pub fn init() {
 }
 
 pub fn is_initialized() -> bool {
-    unsafe { GANG_TABLE.unsafe_get().initialized }
+    GANG_TABLE.lock().initialized
 }
 
 /// Create the idle Vcpu for the current CPU.
 /// Called once per CPU during boot (BSP and each AP).
+/// Idle loop entry point: spins in a HLT loop forever.
+/// This is used as the idle vCPU's saved RIP so that after an exception
+/// handler switches to idle (via `switch_frame_to_idle`), the `iretq`
+/// lands here instead of at address 0 (which would #PF and loop forever).
+fn idle_hlt_entry() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 pub fn init_idle_vcpu() {
     let cpu_slot = current_cpu_slot();
     let pml4 = crate::mm::virt::pml4_address();
     let current_rsp: u64;
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) current_rsp) };
 
-    // Allocate an idle Vcpu (gang_id = GANG_UNSCHEDULED → not part of any gang).
+    // Allocate an idle Vcpu (gang_id = GANG_UNSCHEDULED -> not part of any gang).
     let vcpu_id = vcpu::alloc(GANG_UNSCHEDULED, pml4, 1 << cpu_slot, VcpuType::Idle)
         .expect("seds: failed to allocate idle Vcpu");
 
@@ -98,7 +109,11 @@ pub fn init_idle_vcpu() {
                 rax: 0, rbx: 0, rcx: 0, rdx: 0,
                 rbp: 0, rsi: 0, rdi: 0,
                 vector: 0, error_code: 0,
-                rip: 0, cs: 0x08, rflags: 0x202,
+                // RIP must be a valid kernel address.  Pointing to a
+                // HLT loop prevents #PF cascades when switch_frame_to_idle
+                // copies this frame into the exception return.
+                rip: idle_hlt_entry as *const () as u64,
+                cs: 0x08, rflags: 0x202,
                 rsp: current_rsp, ss: 0x10,
             };
         }
@@ -133,7 +148,7 @@ pub fn yield_now() {
     unsafe { core::arch::asm!("syscall", in("rax") 0u64, lateout("rcx") _, lateout("r11") _) };
 }
 
-// ── Gang creation ────────────────────────────────────────────────────
+// -- Gang creation ----------------------------------------------------
 
 /// Create a gang and its vCPUs. Each vCPU gets a dedicated kernel stack.
 pub fn create_gang(n_vcpus: u32, entry: u64, arg: u64, name: &[u8], syms: Option<crate::exec::LoadResult>) -> Option<GangId> {
@@ -154,7 +169,7 @@ pub fn create_gang(n_vcpus: u32, entry: u64, arg: u64, name: &[u8], syms: Option
     let len = name.len().min(32);
     gang_name[..len].copy_from_slice(&name[..len]);
     
-    let (symtab_phys, symtab_size, _strtab_phys) = if let Some(s) = syms {
+    let (symtab_phys, symtab_size, strtab_phys) = if let Some(s) = syms {
         (s.symtab_phys, s.symtab_size, s.strtab_phys)
     } else {
         (0, 0, 0)
@@ -181,6 +196,7 @@ pub fn create_gang(n_vcpus: u32, entry: u64, arg: u64, name: &[u8], syms: Option
                 Some(p) => p,
                 None => {
                     log::error!("seds: out of memory for gang {} vCPU {} stack", gang_id, i);
+                    vcpu::free(vcpu_id);
                     for j in 0..i {
                         if let Some(id) = vcpu_ids[j] {
                             vcpu::free(id);
@@ -255,6 +271,7 @@ pub fn create_gang(n_vcpus: u32, entry: u64, arg: u64, name: &[u8], syms: Option
         name: gang_name,
         symtab_phys,
         symtab_size,
+        strtab_phys,
         vcpu_ids,
         vcpu_count: n_vcpus,
         vruntime: min_v.saturating_sub(VRUNTIME_BIAS * n_vcpus as u64),
@@ -275,7 +292,11 @@ pub fn create_gang(n_vcpus: u32, entry: u64, arg: u64, name: &[u8], syms: Option
 /// dedicated gang so the scheduler will pick this VCPU.
 pub fn register_driver_vcpu(vcpu_id: VcpuId) -> bool {
     // 1. Allocate kernel stack outside the lock (heavy operation).
-    let pages = match phys::alloc_pages(3) {
+    //    Layout: [guard page] [stack pages × (KERNEL_STACK_SIZE / PAGE_SIZE)]
+    //    The guard page is left unmapped so stack overflows #PF cleanly.
+    let stack_pages = (KERNEL_STACK_SIZE / consts::PAGE_SIZE) as usize;
+    let total_pages = stack_pages + 1; // +1 for guard
+    let pages = match phys::alloc_pages(total_pages as u64) {
         Some(p) => p,
         None => {
             log::error!("seds: OOM for driver Vcpu {} kernel stack", vcpu_id);
@@ -283,25 +304,27 @@ pub fn register_driver_vcpu(vcpu_id: VcpuId) -> bool {
         }
     };
         let alloc_base = virt::HIGHER_HALF + pages;
-        let stack_base = alloc_base + consts::PAGE_SIZE;
+        let stack_base = alloc_base + consts::PAGE_SIZE; // skip guard page
         let stack_top = stack_base + KERNEL_STACK_SIZE;
 
         unsafe {
-            core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE as usize);
+            // Driver address spaces share the kernel higher-half PML4 entries,
+            // so one kernel mapping is visible under every service CR3.
             virt::map_contiguous(
                 virt::kernel_pml4(),
                 stack_base,
                 pages + consts::PAGE_SIZE,
-                2,
+                stack_pages as u64,
                 virt::DATA,
             );
+            core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE as usize);
         }
 
 
     // 2. Lock only for the table update
     let mut gt = GANG_TABLE.lock();
 
-    // Gang 0 is reserved for GANG_UNSCHEDULED — make sure we start at 1.
+    // Gang 0 is reserved for GANG_UNSCHEDULED -- make sure we start at 1.
     if gt.count == 0 {
         gt.count = 1;
     }
@@ -309,10 +332,11 @@ pub fn register_driver_vcpu(vcpu_id: VcpuId) -> bool {
     if gt.count >= MAX_GANGS {
         log::error!("seds: gang table exhausted registering driver Vcpu {}", vcpu_id);
         // Clean up allocated memory if we failed here
-        for p in 0..3 {
+        let total = ((consts::KERNEL_STACK_SIZE / consts::PAGE_SIZE) + 1) as u64;
+        for p in 0..total {
             virt::unmap(alloc_base + p * consts::PAGE_SIZE);
         }
-        phys::free_pages(pages, 3);
+        phys::free_pages(pages, total);
         return false;
     }
 
@@ -331,6 +355,7 @@ pub fn register_driver_vcpu(vcpu_id: VcpuId) -> bool {
         name: *b"driver_vcpu                     ",
         symtab_phys: 0,
         symtab_size: 0,
+        strtab_phys: 0,
         vcpu_count: 1,
         running_count: 0,
         vruntime: 0,
@@ -345,7 +370,7 @@ pub fn register_driver_vcpu(vcpu_id: VcpuId) -> bool {
     true
 }
 
-// ── Core scheduler ───────────────────────────────────────────────────
+// -- Core scheduler ---------------------------------------------------
 
 /// Main schedule entry point. Called from the timer ISR on every tick.
 /// `fpu_out` receives the next vCPU's FPU state when `switched == true`.
@@ -362,18 +387,72 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
         return (false, 0);
     }
 
+    // -- 0. Clean up Terminated vCPUs (deferred free, Bug 25). --
+    for i in 1..gt.count {
+        let mut all_empty = true;
+        if let Some(ref mut gang) = gt.gangs[i] {
+            for slot in gang.vcpu_ids.iter_mut() {
+                if let Some(vid) = *slot {
+                    let (is_terminated, pml4) = vcpu::with_mut(vid, |v| {
+                        if let Some(vcpu) = v {
+                            (vcpu.state == VcpuState::Terminated, vcpu.pml4)
+                        } else {
+                            (false, 0)
+                        }
+                    });
+                    if is_terminated {
+                        *slot = None;
+                        gang.vcpu_count = gang.vcpu_count.saturating_sub(1);
+                        vcpu::free(vid);
+                        if pml4 != 0 {
+                            virt::free_pml4(pml4);
+                        }
+                        continue;
+                    }
+                }
+                if slot.is_some() {
+                    all_empty = false;
+                }
+            }
+        }
+        if all_empty {
+            gt.gangs[i] = None;
+        }
+    }
+
     let idle_id = crate::percpu::idle_vcpu(cpu_id);
     let cur_vcpu = crate::percpu::current_vcpu(cpu_id) as VcpuId;
 
-    // ── 1. Save current vCPU state ──
+    // -- 1. Save current vCPU state --
     if cur_vcpu != idle_id {
         vcpu::with_mut(cur_vcpu, |maybe_vcpu| {
             if let Some(vcpu) = maybe_vcpu {
+                // Always save the frame and stamp the canary so the next
+                // load can restore it.  block_current() already decremented
+                // running_count and set state = Halted, so only touch the
+                // frame/canary/FPU here — skip vruntime and state changes
+                // for the Halted case.
                 vcpu.saved_frame = *frame;
                 if (frame.cs & 3) != 0 {
                     vcpu.saved_frame.rsp = frame.rsp;
+                } else {
+                    // Ring-0 kernel preemption: CPU does not push SS:RSP for
+                    // same-privilege interrupts (even without IST2), so
+                    // frame.rsp and frame.ss are garbage.  Compute the
+                    // pre-interrupt kernel RSP from the frame address:
+                    //   15 GPRs(120) + vector(8) + error_code(8) + rip/cs/rflags(24) = 160
+                    vcpu.saved_frame.rsp = (frame as *const TrapFrame as u64) + 160;
+                    vcpu.saved_frame.ss = 0x10; // kernel data segment
                 }
+                // Stamp the canary so the load path can detect corruption.
+                vcpu.frame_magic = FRAME_MAGIC;
                 unsafe { crate::arch::fxsave(&mut vcpu.fpu_state); }
+
+                if vcpu.state == VcpuState::Halted {
+                    // block_current() already set state and decremented
+                    // running_count.  Nothing more to do here.
+                    return;
+                }
 
                 let gid = vcpu.gang_id as usize;
                 if gid > 0 && gid < MAX_GANGS {
@@ -382,13 +461,14 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
                         gang.vruntime = gang.vruntime.saturating_add(VRUNTIME_TICK * 100 / w);
                         vcpu.vruntime = vcpu.vruntime.saturating_add(VRUNTIME_TICK);
                         gang.running_count = gang.running_count.saturating_sub(1);
+                        vcpu.state = VcpuState::Ready;
                     }
                 }
             }
         });
     }
 
-    // ── 2. Find best gang ──
+    // -- 2. Find best gang --
     let mut best_gang_idx = None;
     let mut best_vruntime = u64::MAX;
     for i in 1..gt.count {
@@ -413,8 +493,8 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
     };
     let demand = gang.vcpu_count.saturating_sub(gang.running_count);
 
-    // ── 3. Count free cores for escalation ──
-    let free_cores = count_free_cores(idle_id);
+    // -- 3. Count free cores for escalation --
+    let free_cores = count_free_cores();
     let per_core = if free_cores >= demand {
         1 // HARD: each free core gets 1 vCPU (we are one of them)
     } else if free_cores > 0 {
@@ -423,7 +503,7 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
         1 // SEQUENTIAL: just run 1
     };
 
-    // ── 4. Pick the next vCPU from this gang ──
+    // -- 4. Pick the next vCPU from this gang --
     let next_id = match pick_vcpu(gang) {
         Some(id) => id,
         None => {
@@ -434,7 +514,7 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
 
     gang.running_count += 1;
 
-    // ── 5. Emulated: push extra vCPUs onto this CPU's ready queue ──
+    // -- 5. Emulated: push extra vCPUs onto this CPU's ready queue --
     if per_core > 1 {
         let extra = (per_core - 1).min(gang.vcpu_count.saturating_sub(gang.running_count));
         for _ in 0..extra {
@@ -445,11 +525,11 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
         }
     }
 
-    // ── 6. Load next vCPU context ──
-    let (next_pml4, next_stack_top, valid) = vcpu::with_mut(next_id, |maybe_vcpu| {
+    // -- 6. Load next vCPU context --
+    let (next_pml4, next_stack_top, valid, magic_ok) = vcpu::with_mut(next_id, |maybe_vcpu| {
         let vcpu = match maybe_vcpu {
             Some(v) => v,
-            None => return (0u64, 0u64, false),
+            None => return (0u64, 0u64, false, false),
         };
 
         vcpu.state = VcpuState::Running;
@@ -458,12 +538,101 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
 
         let pml4 = vcpu.pml4;
         let st = vcpu.kernel_stack_top;
-        (pml4, st, true)
+        let magic_ok = vcpu.frame_magic == FRAME_MAGIC;
+        // Clear the canary so a double-load (stale copy) is caught.
+        vcpu.frame_magic = 0;
+        (pml4, st, true, magic_ok)
     });
 
     if !valid {
         crate::percpu::set_current_vcpu(cpu_id, idle_id as usize);
         return (false, 0);
+    }
+
+    // Reject vCPUs whose frame was never properly saved (frame_magic != FRAME_MAGIC).
+    // This catches corrupted TrapFrame data from stale memory or a bug in the
+    // save path.  Idle vCPUs are exempt because they are never "saved".
+    let vtype = vcpu::get_vcpu_type(next_id);
+    if vtype != VcpuType::Idle && !magic_ok {
+        log::error!(
+            "scheduler: frame canary mismatch for vCPU {} (type={:?}): expected {:#x}",
+            next_id, vtype, FRAME_MAGIC
+        );
+        crate::percpu::set_current_vcpu(cpu_id, idle_id as usize);
+        return (false, 0);
+    }
+    // Validate the loaded frame before context switch.
+    // Non-idle vCPUs must have a valid (non-zero) stack pointer.
+    // Ring-3 frames need CS.RPL=3 with non-zero RSP.
+    // Ring-0 frames need non-zero RSP (computed from frame pointer
+    // in the save path; zero means uninitialized vcpu::alloc defaults).
+    let vtype = vcpu::get_vcpu_type(next_id);
+    if vtype != VcpuType::Idle {
+        let cs_ring = frame.cs & 3;
+        let mut frame_ok = frame.rsp != 0 && (cs_ring == 3 || cs_ring == 0);
+
+        // Validate CS is a known kernel/user code selector.
+        // Corrupted CS values would cause #GP on iretq.
+        let cs_valid = frame.cs == 0x08 || frame.cs == 0x1B;
+        if !cs_valid {
+            log::error!(
+                "scheduler: invalid CS for vCPU {} (type={:?}): CS={:#x}",
+                next_id, vtype, frame.cs
+            );
+            frame_ok = false;
+        }
+
+        // Validate RIP points to a mapped, canonical address.
+        // Corrupted RIP (e.g. pointing to string data) causes #PF → #DF → triple fault.
+        if frame.rip != 0 {
+            let rip_canonical = (frame.rip as i64 >> 47) == -1 || (frame.rip >> 47) == 0;
+            if !rip_canonical {
+                log::error!(
+                    "scheduler: non-canonical RIP for vCPU {}: RIP={:#x}",
+                    next_id, frame.rip
+                );
+                frame_ok = false;
+            } else if frame.rip >= virt::HIGHER_HALF {
+                // Kernel RIP -- always mapped in the shared higher-half.
+                // No page walk needed; it's valid if canonical.
+            } else if frame.rip == 0 {
+                // Zero RIP -- freshly allocated vCPU, not yet started.
+                log::error!(
+                    "scheduler: zero RIP for vCPU {} (type={:?})",
+                    next_id, vtype
+                );
+                frame_ok = false;
+            }
+            // User RIP: allow -- the user page table will fault it in or
+            // the iretq will #PF and be handled by the exception path.
+        }
+
+        if !frame_ok {
+            log::error!(
+                "scheduler: invalid frame for vCPU {} (type={:?}): CS={:#x} RSP={:#x} RIP={:#x}",
+                next_id, vtype, frame.cs, frame.rsp, frame.rip
+            );
+            crate::percpu::set_current_vcpu(cpu_id, idle_id as usize);
+            return (false, 0);
+        }
+        // Ring-3 frames must have a valid user SS (0x23 or 0x2B).
+        // A corrupted SS (e.g. from a ring-0 save that leaked garbage)
+        // would cause #GP on iretq.  Fix it up rather than crash.
+        if cs_ring == 3 && frame.ss != 0x23 && frame.ss != 0x2B {
+            log::warn!(
+                "scheduler: fixing corrupted SS for vCPU {}: SS={:#x} -> 0x23",
+                next_id, frame.ss
+            );
+            frame.ss = 0x23;
+        }
+        // Ring-0 frames must have kernel SS (0x10 or 0x18).
+        if cs_ring == 0 && frame.ss != 0x10 && frame.ss != 0x18 {
+            log::warn!(
+                "scheduler: fixing corrupted SS for ring-0 vCPU {}: SS={:#x} -> 0x10",
+                next_id, frame.ss
+            );
+            frame.ss = 0x10;
+        }
     }
 
     crate::percpu::set_current_vcpu(cpu_id, next_id as usize);
@@ -477,16 +646,32 @@ fn schedule_inner(frame: &mut TrapFrame, cpu_id: usize, mut gt: crate::sync::Irq
         crate::percpu::PERCPU[slot].kernel_stack_top.store(next_stack_top, Ordering::Release);
     }
 
-    log::trace!(
-        "seds: CPU{} vcpu {} (gang {}) → vcpu {} (gang {}) vruntime={}",
-        cpu_id, cur_vcpu, get_gang_id(cur_vcpu),
-        next_id, get_gang_id(next_id), gang.vruntime
-    );
+    let rl = crate::percpu::PERCPU[cpu_id].timer_fires.load(Ordering::Relaxed);
+    if rl % 50 == 1 {
+        log::trace!(
+            "seds: CPU{} vcpu {} (gang {}) -> vcpu {} (gang {}) vruntime={}",
+            cpu_id, cur_vcpu, get_gang_id(cur_vcpu),
+            next_id, get_gang_id(next_id), gang.vruntime
+        );
+    }
+
+    // Final validation gate: reject if PML4 is out of range or if the
+    // frame still has issues that slipped through earlier checks.
+    // A corrupted PML4 would cause every subsequent memory access to fault.
+    const MAX_PML4_PHYS: u64 = 4 * 1024 * 1024 * 1024;
+    if need_switch && (next_pml4 >= MAX_PML4_PHYS || next_pml4 == 0) {
+        log::error!(
+            "scheduler: rejecting corrupted PML4 {:#x} for vCPU {}, falling back to idle",
+            next_pml4, next_id
+        );
+        crate::percpu::set_current_vcpu(cpu_id, idle_id as usize);
+        return (false, 0);
+    }
 
     (true, if need_switch { next_pml4 } else { 0 })
 }
 
-// ── Block / Wake ─────────────────────────────────────────────────────
+// -- Block / Wake -----------------------------------------------------
 
 pub fn block_current(frame: &mut TrapFrame) {
     let cpu_id = current_cpu_slot();
@@ -509,7 +694,14 @@ pub fn block_current(frame: &mut TrapFrame) {
                     gang.running_count = gang.running_count.saturating_sub(1);
                 }
             }
-            log::trace!("seds: vcpu {} blocked (gang {})", cur, vcpu.gang_id);
+            // Rate-limit: emit at most once per second (1000 ticks at 1ms/tick).
+            static LAST_BLOCKED_LOG: AtomicU64 = AtomicU64::new(0);
+            let now = crate::arch::idt::ticks();
+            let last = LAST_BLOCKED_LOG.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 1000 {
+                LAST_BLOCKED_LOG.store(now, Ordering::Relaxed);
+                log::trace!("seds: vcpu {} blocked (gang {})", cur, vcpu.gang_id);
+            }
         }
     });
 
@@ -521,7 +713,7 @@ pub fn block_current(frame: &mut TrapFrame) {
     let (switched, next_pml4) = schedule_inner(frame, cpu_id, gt, &mut dummy_fpu);
 
     if !switched {
-        // No new task to switch to — stay on current (idle).
+        // No new task to switch to -- stay on current (idle).
         return;
     }
 
@@ -541,8 +733,29 @@ pub fn wake(vcpu_id: u64) {
                 vcpu.vruntime = 0;
 
                 let target = crate::percpu::find_least_loaded();
+                if target >= MAX_CPUS {
+                    log::error!("seds: wake target {} out of bounds, dropping vcpu {}", target, vcpu_id);
+                    return;
+                }
                 crate::percpu::rq(target).push(vcpu_id as usize);
                 crate::percpu::add_task_count(target, 1);
+
+                // BUG 11 fix: send an IPI to the target CPU so it wakes
+                // from WFI immediately instead of waiting for the next
+                // timer tick to poll the run queue.
+                if crate::percpu::is_online(target) {
+                    let target_apic_id = crate::percpu::PERCPU[target].apic_id.load(
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    crate::percpu::PERCPU[target].need_resched.store(
+                        true,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    crate::arch::apic::send_ipi(
+                        target_apic_id,
+                        crate::arch::idt::IPI_VECTOR,
+                    );
+                }
 
                 log::trace!("seds: vcpu {} woken on CPU {}", vcpu_id, target);
             }
@@ -550,7 +763,7 @@ pub fn wake(vcpu_id: u64) {
     });
 }
 
-// ── Steal (load balancing) ──────────────────────────────────────────
+// -- Steal (load balancing) ------------------------------------------
 
 pub fn steal_task(hungry_cpu: usize) -> bool {
     // Forcefully prevent stealing work if interrupts are disabled
@@ -591,16 +804,17 @@ pub fn steal_task(hungry_cpu: usize) -> bool {
     true
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────
+// -- Internal helpers -------------------------------------------------
 
 /// Count how many pCPUs are currently running their idle Vcpu.
 /// Must be called under the GangTable lock.
-fn count_free_cores(idle_id: VcpuId) -> u32 {
+fn count_free_cores() -> u32 {
     let mut count = 0u32;
     for cpu in 0..MAX_CPUS {
         if crate::percpu::PERCPU[cpu].online.load(Ordering::Acquire) {
             let cur = crate::percpu::PERCPU[cpu].current_vcpu.load(Ordering::Relaxed) as u32;
-            if cur == idle_id {
+            let idle = crate::percpu::idle_vcpu(cpu);
+            if cur == idle {
                 count += 1;
             }
         }

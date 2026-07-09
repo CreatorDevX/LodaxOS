@@ -27,6 +27,7 @@ struct QueueInner {
     buf: [usize; QUEUE_CAPACITY],
     head: usize,
     tail: usize,
+    dropped: u64,
 }
 
 /// Per-CPU ready queue: fixed-size circular buffer of entity IDs.
@@ -44,6 +45,7 @@ impl ReadyQueue {
                 buf: [0; QUEUE_CAPACITY],
                 head: 0,
                 tail: 0,
+                dropped: 0,
             }),
         }
     }
@@ -52,6 +54,8 @@ impl ReadyQueue {
         let mut q = self.inner.lock();
         let next = q.tail.wrapping_sub(q.head);
         if next >= QUEUE_CAPACITY {
+            q.dropped += 1;
+            log::warn!("percpu: ready queue full, dropped vcpu {} (total drops={})", id, q.dropped);
             return false;
         }
         let idx = q.tail % QUEUE_CAPACITY;
@@ -78,6 +82,10 @@ impl ReadyQueue {
         }
         Some(q.buf[q.head % QUEUE_CAPACITY])
     }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.lock().dropped
+    }
 }
 
 /// Return a reference to the ready queue for `cpu`.
@@ -86,17 +94,17 @@ pub fn rq(cpu: usize) -> &'static ReadyQueue {
     &PERCPU[cpu % MAX_CPUS].ready_queue
 }
 
-/// IA32_GS_BASE MSR — base address of GS. Loading this with the address
+/// IA32_GS_BASE MSR -- base address of GS. Loading this with the address
 /// of our per-CPU slot is what gives us cheap per-CPU access (the
 /// kernel can use `%gs:offset` to reach its own state).
 const IA32_GS_BASE: u32 = 0xC000_0102;
 
-/// IA32_KERNEL_GS_BASE MSR — the value swapped in by `swapgs`.  We do not
-/// use `swapgs` in this kernel (we never run user code), but the MSR is
-/// defined for completeness.
+/// IA32_KERNEL_GS_BASE MSR -- the value swapped in by `swapgs`.  Used by
+/// `syscall_entry` to switch between the user TLS GS base (IA32_GS_BASE)
+/// and the kernel per-CPU GS base (IA32_KERNEL_GS_BASE).
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0101;
 
-/// IA32_TSC_AUX MSR — auxiliary value returned in ECX by `rdtscp`.
+/// IA32_TSC_AUX MSR -- auxiliary value returned in ECX by `rdtscp`.
 /// Linux uses this to cache the current CPU index / LAPIC ID, since
 /// `rdtscp` is faster than reading the LAPIC ID register (one
 /// instruction vs. an MMIO read).
@@ -113,17 +121,29 @@ pub const PER_CPU_STACK_PAGES: usize = 4; // 16 KiB
 /// One slot per LAPIC ID. `online` is `false` until the CPU's `ap_entry`
 /// sets it. `kernel_ready` is set by the BSP once the kernel is fully
 /// initialised and the AP may enter the scheduler.
+///
+/// # `#[repr(C)]` and field ordering
+///
+/// The assembly entry stubs (`syscall_entry`, interrupt stubs) read
+/// `gs:[8]` to obtain the per-CPU kernel stack top.  This requires
+/// `kernel_stack_top` to live at a *fixed* offset of 8 bytes from the
+/// start of `PerCpu`.  `#[repr(C)]` guarantees declaration-order layout
+/// with standard C alignment; the two leading `AtomicU32`/`AtomicBool`
+/// fields consume 4 + 1 + 1 = 6 bytes, followed by 2 bytes of padding
+/// to align `kernel_stack_top` (AtomicU64, 8-byte aligned) to offset 8.
+#[repr(C)]
 pub struct PerCpu {
     pub apic_id: AtomicU32,
     pub online: AtomicBool,
     pub kernel_ready: AtomicBool,
     /// Top of this CPU's kernel stack (set by boot for APs; BSP uses its
     /// own initial stack and updates this when task 0 is registered).
+    /// **MUST be at offset 8** -- the assembly stubs read `gs:[8]`.
     pub kernel_stack_top: AtomicU64,
     /// Per-CPU tick counter. Increments from the LAPIC timer ISR.
     pub ticks: AtomicU64,
     /// The currently-running task on this CPU. Index into the global
-    /// `TASKS` table (legacy — will be replaced by current_vcpu).
+    /// `TASKS` table (legacy -- will be replaced by current_vcpu).
     pub current_task: AtomicUsize,
     /// The currently-running vCPU on this CPU (replaces current_task in SEDS).
     pub current_vcpu: AtomicUsize,
@@ -151,6 +171,13 @@ pub struct PerCpu {
     /// page tables instead of the (possibly switched) current CR3.
     pub saved_cr3: AtomicU64,
 }
+
+// Compile-time assertion: kernel_stack_top must be at offset 8 to match
+// the `gs:[8]` loads in the assembly entry stubs.
+const _: () = assert!(
+    core::mem::offset_of!(PerCpu, kernel_stack_top) == 8,
+    "PerCpu::kernel_stack_top must be at offset 8 for gs:[8] assembly access"
+);
 
 impl PerCpu {
     pub const fn new() -> Self {
@@ -275,13 +302,13 @@ pub fn wait_for_kernel_ready(apic_id: u32) -> bool {
         }
         core::hint::spin_loop();
     }
-    log::error!("AP[lapic={}]: kernel_ready timeout — BSP may have crashed", apic_id);
+    log::error!("AP[lapic={}]: kernel_ready timeout -- BSP may have crashed", apic_id);
     false
 }
 
 /// Release all APs by setting `kernel_ready` for every slot, even those
 /// not yet online.  `smp_boot_aps()` runs *before* the APs have had time
-/// to boot through the SIPI trampoline and call `mark_online` — by the
+/// to boot through the SIPI trampoline and call `mark_online` -- by the
 /// time each AP reaches `wait_for_kernel_ready` its flag will already
 /// be `true`.
 pub fn release_all_aps() {
@@ -327,14 +354,37 @@ pub fn install_gs_base(slot: usize) {
     // Write GS base. After this, `%gs:0` resolves to `&PERCPU[slot]`.
     unsafe {
         wrmsr(IA32_GS_BASE, ptr);
-        // Mirror into kernel-GS-base too.  We never `swapgs` (no user
-        // mode), but writing both keeps the MSRs in a defined state
-        // and matches the Linux convention.
+        // Mirror into kernel-GS-base so SWAPGS can swap between user
+        // and kernel GS pointers.
         wrmsr(IA32_KERNEL_GS_BASE, ptr);
         // Cache the LAPIC ID in TSC_AUX for `rdtscp`-based lookups.
-        // Only write if the CPU supports RDTSCP — `qemu64` lacks it.
+        // Only write if the CPU supports RDTSCP -- `qemu64` lacks it.
         if has_rdtscp() {
             wrmsr(IA32_TSC_AUX, apic_id as u64);
+        }
+    }
+
+    // Verify gs:[8] reads kernel_stack_top -- catches layout mismatches
+    // early instead of silently crashing in the syscall entry stub.
+    let gs8_value: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {val}, gs:[8]",
+            val = out(reg) gs8_value,
+            options(nostack, preserves_flags),
+        );
+    }
+    let expected = PERCPU[slot].kernel_stack_top.load(Ordering::Relaxed);
+    if gs8_value != expected {
+        log::error!(
+            "gs:[8] layout mismatch: gs8=0x{:x} expected=0x{:x} (PerCpu size={})",
+            gs8_value,
+            expected,
+            core::mem::size_of::<PerCpu>(),
+        );
+        // Halt -- continuing with a wrong gs:[8] offset is unrecoverable.
+        loop {
+            core::hint::spin_loop();
         }
     }
 }
@@ -371,7 +421,7 @@ fn has_rdtscp() -> bool {
 }
 
 /// Read the current CPU's LAPIC ID via `rdtscp` (IA32_TSC_AUX) if supported,
-/// otherwise fall back to LAPIC MMIO (raw physical address 0xFEE00000).
+/// otherwise fall back to the shared higher-half LAPIC MMIO mapping.
 #[inline]
 pub fn current_apic_id() -> u32 {
     if has_rdtscp() {
@@ -385,12 +435,7 @@ pub fn current_apic_id() -> u32 {
         }
         aux
     } else {
-        let lapic_base = crate::arch::apic::read_apic_base();
-        unsafe {
-            let addr = (lapic_base + 0x20) as *const u32;
-            let raw = core::ptr::read_volatile(addr);
-            raw >> 24
-        }
+        current_apic_id_lapic()
     }
 }
 
@@ -463,7 +508,7 @@ pub fn set_bsp_apic_id(apic_id: u32) {
 pub fn is_bsp() -> bool {
     let bsp = BSP_APIC_ID.load(Ordering::Acquire);
     if bsp == u32::MAX {
-        // Not yet set — assume BSP (only CPU at this point).
+        // Not yet set -- assume BSP (only CPU at this point).
         return true;
     }
     current_apic_id() == bsp

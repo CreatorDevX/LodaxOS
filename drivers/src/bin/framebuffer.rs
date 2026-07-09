@@ -235,7 +235,9 @@ extern "C" fn _start() -> ! {
                 // arg0=fb_phys, arg1=fb_size, arg2=packed geometry
                 match Fb::acquire(arg0, arg1, arg2) {
                     Some(f) => {
-                        f.clear();
+                        unsafe {
+                            core::ptr::write_bytes(f.shadow, 0xFF, f.h * f.stride);
+                        }
                         f.present();
                         fb = Some(f);
                         sys_driver_send(0);
@@ -270,6 +272,7 @@ extern "C" fn _start() -> ! {
                         sys_driver_send(2);
                     } else {
                         f.draw_text(text_virt, text_len, start_x, start_y);
+                        f.present();
                         sys_driver_send(0);
                     }
                 } else { sys_driver_send(2); }

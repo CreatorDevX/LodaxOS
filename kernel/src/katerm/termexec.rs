@@ -35,11 +35,28 @@ pub fn execute(line: &str) {
         }
     };
 
+    if paren_open >= paren_close {
+        conn.write_str(vtparser::sgr_fg_red());
+        conn.write_str("error:");
+        conn.write_str(vtparser::sgr_reset());
+        conn.write_str(" mismatched parentheses: '(' must come before ')'\n");
+        return;
+    }
+
     let cmd_name = line[..paren_open].trim();
     let args_str = &line[paren_open + 1..paren_close];
 
     for cmd in termcmds::COMMANDS {
         if cmd.name == cmd_name {
+            if !termcmds::is_command_available(cmd_name, termcmds::current_mode()) {
+                conn.write_str(vtparser::sgr_fg_red());
+                conn.write_str("error:");
+                conn.write_str(vtparser::sgr_reset());
+                conn.write_str(" command '");
+                conn.write_str(cmd_name);
+                conn.write_str("' not available in current mode. Use cm() to switch.\n");
+                return;
+            }
             (cmd.exec)(args_str, conn);
             return;
         }
